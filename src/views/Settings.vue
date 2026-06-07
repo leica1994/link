@@ -136,9 +136,11 @@
             <Plug class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
             <div class="setting-copy">
               <div class="setting-title">检查 LLM 连接</div>
-              <div class="setting-subtitle">检查 API 连接是否正常，并获取模型列表</div>
+              <div class="setting-subtitle" :class="llmConnectionSubtitleClass">{{ llmConnectionSubtitle }}</div>
             </div>
-            <button class="settings-action" type="button" disabled>检查连接</button>
+            <button class="settings-action" type="button" :disabled="isCheckingLlmConnection" @click="checkLlmConnection">
+              {{ isCheckingLlmConnection ? '检查中' : '检查连接' }}
+            </button>
           </div>
         </div>
       </section>
@@ -683,6 +685,15 @@ type AppSettings = {
   targetLanguage: string
 }
 
+type LlmConnectionCheckResult = {
+  service: string
+  model: string
+  latencyMs: number
+  message: string
+}
+
+type LlmConnectionStatus = 'idle' | 'success' | 'error'
+
 const languageDisplayNames = new Intl.DisplayNames(['zh-Hans'], { type: 'language' })
 
 const targetLanguageLabelOverrides: Record<string, string> = {
@@ -1082,6 +1093,9 @@ const selectedLlmService = ref<LlmService>(LlmService.OpenAI)
 const isLlmServiceDialogOpen = ref(false)
 const isLlmApiKeyVisible = ref(false)
 const llmConfigs = ref<LlmConfigs>(createDefaultLlmConfigs())
+const isCheckingLlmConnection = ref(false)
+const llmConnectionStatus = ref<LlmConnectionStatus>('idle')
+const llmConnectionMessage = ref('')
 const isReasoningEffortDialogOpen = ref(false)
 const selectedTranslationService = ref<TranslationService>(TranslationService.Llm)
 const isTranslationServiceDialogOpen = ref(false)
@@ -1107,6 +1121,11 @@ const getCurrentLlmConfig = () => {
   return llmConfigs.value[selectedLlmService.value]
 }
 
+const resetLlmConnectionStatus = () => {
+  llmConnectionStatus.value = 'idle'
+  llmConnectionMessage.value = ''
+}
+
 const updateCurrentLlmConfig = (patch: Partial<LlmConfig>) => {
   const service = selectedLlmService.value
   llmConfigs.value = {
@@ -1116,6 +1135,7 @@ const updateCurrentLlmConfig = (patch: Partial<LlmConfig>) => {
       ...patch,
     },
   }
+  resetLlmConnectionStatus()
 }
 
 const llmBaseUrl = computed({
@@ -1150,6 +1170,19 @@ const transcriptionModelLabel = computed(() => {
 const llmServiceLabel = computed(() => {
   return llmServiceOptions.find((option) => option.value === selectedLlmService.value)?.label ?? ''
 })
+
+const llmConnectionSubtitle = computed(() => {
+  if (isCheckingLlmConnection.value) {
+    return '正在发送最小测试请求'
+  }
+
+  return llmConnectionMessage.value || '发送最小测试请求验证当前服务和模型'
+})
+
+const llmConnectionSubtitleClass = computed(() => ({
+  'setting-subtitle-success': llmConnectionStatus.value === 'success',
+  'setting-subtitle-error': llmConnectionStatus.value === 'error',
+}))
 
 const reasoningEffortLabel = computed(() => {
   return reasoningEffortOptions.find((option) => option.value === selectedReasoningEffort.value)?.label ?? ''
@@ -1221,6 +1254,7 @@ const applySettings = (settings: AppSettings) => {
   isSubtitleTranslationEnabled.value = settings.isSubtitleTranslationEnabled
   isPostTranslationOptimizationEnabled.value = settings.isPostTranslationOptimizationEnabled
   selectedTargetLanguage.value = settings.targetLanguage
+  resetLlmConnectionStatus()
 
   nextTick(() => {
     isApplyingStoredSettings = false
@@ -1239,6 +1273,15 @@ const saveSettingsNow = async () => {
   }
 }
 
+const flushPendingSave = async () => {
+  if (saveSettingsTimer !== undefined) {
+    window.clearTimeout(saveSettingsTimer)
+    saveSettingsTimer = undefined
+  }
+
+  await saveSettingsNow()
+}
+
 const scheduleSaveSettings = () => {
   if (!isSettingsLoaded.value || isApplyingStoredSettings) {
     return
@@ -1252,6 +1295,35 @@ const scheduleSaveSettings = () => {
     saveSettingsTimer = undefined
     void saveSettingsNow()
   }, 260)
+}
+
+const checkLlmConnection = async () => {
+  if (isCheckingLlmConnection.value) {
+    return
+  }
+
+  llmConnectionStatus.value = 'idle'
+  llmConnectionMessage.value = ''
+
+  if (!isTauriRuntime()) {
+    llmConnectionStatus.value = 'error'
+    llmConnectionMessage.value = '请在桌面应用中检查连接'
+    return
+  }
+
+  isCheckingLlmConnection.value = true
+
+  try {
+    await flushPendingSave()
+    const result = await invoke<LlmConnectionCheckResult>('check_llm_connection')
+    llmConnectionStatus.value = 'success'
+    llmConnectionMessage.value = `连接正常 · ${result.model} · ${result.latencyMs}ms`
+  } catch (error) {
+    llmConnectionStatus.value = 'error'
+    llmConnectionMessage.value = stringifyError(error)
+  } finally {
+    isCheckingLlmConnection.value = false
+  }
 }
 
 const loadStoredSettings = async () => {
@@ -1297,6 +1369,7 @@ const closeLlmServiceDialog = () => {
 
 const selectLlmService = (service: LlmService) => {
   selectedLlmService.value = service
+  resetLlmConnectionStatus()
   closeLlmServiceDialog()
 }
 
@@ -1362,6 +1435,18 @@ const handleKeydown = (event: KeyboardEvent) => {
     closeVideoContentTypeDialog()
     closeTargetLanguageDialog()
   }
+}
+
+const stringifyError = (error: unknown) => {
+  if (typeof error === 'string') {
+    return error
+  }
+
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  return '检查连接失败'
 }
 
 watch(createSettingsSnapshot, scheduleSaveSettings, { deep: true })

@@ -20,6 +20,15 @@ This project is a Tauri + Vue 3 + TypeScript app. Follow these defaults when add
   - `Anthropic`
 - The fields under LLM configuration (`Base URL`, `API Key`, model, reasoning effort, streaming) must switch with the selected LLM service and must not be shared across services.
 
+## AI Backend
+
+- Keep AI API calls in the Tauri backend. Do not call LLM APIs directly from Vue components.
+- Use `src-tauri/src/ai.rs` as the source of truth for shared LLM clients, connection checks, and AI request concurrency.
+- Reuse the managed `AiService` for translation, optimization, subtitle correction, smart segmentation, and connection checks instead of creating ad hoc HTTP clients in feature commands.
+- Keep the AI concurrency limit tied to `translation_thread_count`; saving settings must update this limit dynamically.
+- `translation_batch_size` controls work chunking only and must not change the AI concurrency limit.
+- Connection checks should use the currently saved LLM settings, send a minimal non-streaming test request, and never expose API keys in responses or logs.
+
 ## Visual Style
 
 - Use the existing CSS variables for theme colors, surfaces, text, borders, and accents.

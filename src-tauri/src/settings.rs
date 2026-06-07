@@ -5,6 +5,8 @@ use std::fs;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
+use crate::ai::AiService;
+
 const DATABASE_FILE_NAME: &str = "settings.db";
 const LLM_SERVICES: [&str; 3] = ["openai", "openai-responses", "anthropic"];
 
@@ -65,7 +67,7 @@ impl SettingsStore {
         })
     }
 
-    fn load(&self) -> Result<AppSettings, String> {
+    pub(crate) fn load(&self) -> Result<AppSettings, String> {
         let connection = self
             .connection
             .lock()
@@ -258,9 +260,11 @@ pub fn load_settings(store: tauri::State<'_, SettingsStore>) -> Result<AppSettin
 #[tauri::command]
 pub fn save_settings(
     store: tauri::State<'_, SettingsStore>,
+    ai_service: tauri::State<'_, AiService>,
     settings: AppSettings,
 ) -> Result<(), String> {
-    store.save(&settings)
+    store.save(&settings)?;
+    ai_service.update_thread_count(settings.translation_thread_count)
 }
 
 fn initialize_database(connection: &Connection) -> Result<(), String> {

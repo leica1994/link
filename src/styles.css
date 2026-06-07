@@ -239,6 +239,22 @@ select {
   line-height: 1.25;
 }
 
+.setting-subtitle-success {
+  color: #2f8a55;
+}
+
+.setting-subtitle-error {
+  color: #9f3030;
+}
+
+html[data-theme='dark'] .setting-subtitle-success {
+  color: #74c995;
+}
+
+html[data-theme='dark'] .setting-subtitle-error {
+  color: #f0a2a2;
+}
+
 .chevron-icon {
   width: 22px;
   height: 22px;
