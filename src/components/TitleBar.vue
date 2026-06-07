@@ -1,7 +1,7 @@
 <template>
   <div class="titlebar" data-tauri-drag-region>
     <div class="titlebar-logo">
-      <span class="titlebar-title">KVideo</span>
+      <span class="titlebar-title">Link</span>
     </div>
     <div class="titlebar-controls">
       <button class="ctrl-btn" @click="minimize">

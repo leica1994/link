@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "KVideo",
+  "productName": "Link",
   "version": "0.1.0",
-  "identifier": "com.leica.kvideo",
+  "identifier": "com.leica.link",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,10 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "KVideo",
+        "title": "Link",
         "width": 1280,
         "height": 800,
-        "decorations": false
+        "decorations": false,
+        "center": true
       }
     ],
     "security": {
