@@ -403,6 +403,36 @@ html[data-theme='dark'] .setting-toggle.active .setting-toggle-thumb {
   background: #18140f;
 }
 
+.setting-range-control {
+  justify-self: end;
+  width: min(300px, 36vw);
+  display: grid;
+  grid-template-columns: 42px minmax(150px, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.setting-range-value {
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.setting-range {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.setting-range:focus-visible {
+  outline: 3px solid var(--accent-soft);
+  outline-offset: 4px;
+  border-radius: 999px;
+}
+
 .theme-switch {
   display: inline-grid;
   grid-template-columns: 1fr 1fr;
@@ -569,6 +599,7 @@ html[data-theme='dark'] .theme-option.active {
   .setting-inline-action,
   .setting-control,
   .setting-toggle,
+  .setting-range-control,
   .settings-action,
   .chevron-icon {
     grid-column: 2;
@@ -577,6 +608,10 @@ html[data-theme='dark'] .theme-option.active {
 
   .setting-control {
     width: min(280px, 100%);
+  }
+
+  .setting-range-control {
+    width: min(300px, 100%);
   }
 
   .setting-inline-action {

@@ -143,6 +143,87 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="translation-settings-title">
+        <div id="translation-settings-title" class="section-heading">
+          <Languages aria-hidden="true" />
+          <span>翻译服务</span>
+        </div>
+
+        <div class="settings-panel">
+          <button class="setting-row setting-row-button" type="button" @click="openTranslationServiceDialog">
+            <Bot class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <span class="setting-copy">
+              <span class="setting-title">翻译服务</span>
+              <span class="setting-subtitle">选择翻译服务</span>
+            </span>
+            <span class="setting-inline-action">
+              <span class="setting-value">{{ translationServiceLabel }}</span>
+              <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+            </span>
+          </button>
+
+          <div class="setting-row">
+            <Pencil class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">需要反思翻译</div>
+              <div class="setting-subtitle">启用反思翻译可以提高翻译质量，但耗费更多时间和 token</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: needsReflectionTranslation }"
+              type="button"
+              :aria-pressed="needsReflectionTranslation"
+              @click="needsReflectionTranslation = !needsReflectionTranslation"
+            >
+              <span class="setting-toggle-label">{{ needsReflectionTranslation ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <ListChecks class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">批处理大小</div>
+              <div class="setting-subtitle">每批处理字幕的数量</div>
+            </div>
+            <div class="setting-range-control">
+              <span class="setting-range-value">{{ translationBatchSize }}</span>
+              <input
+                v-model.number="translationBatchSize"
+                class="setting-range"
+                type="range"
+                min="10"
+                max="100"
+                step="10"
+                aria-label="批处理大小"
+              />
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <Gauge class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">线程数</div>
+              <div class="setting-subtitle">请求并行处理的数量，数值越大速度越快</div>
+            </div>
+            <div class="setting-range-control">
+              <span class="setting-range-value">{{ translationThreadCount }}</span>
+              <input
+                v-model.number="translationThreadCount"
+                class="setting-range"
+                type="range"
+                min="1"
+                max="100"
+                step="1"
+                aria-label="线程数"
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="personalization-settings-title">
         <div id="personalization-settings-title" class="section-heading">
           <SlidersHorizontal aria-hidden="true" />
@@ -285,6 +366,37 @@
           </div>
         </section>
       </div>
+
+      <div
+        v-if="isTranslationServiceDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeTranslationServiceDialog"
+      >
+        <section
+          class="settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="translation-service-dialog-title"
+        >
+          <h2 id="translation-service-dialog-title" class="dialog-title">翻译服务</h2>
+          <div class="dialog-options" role="radiogroup" aria-label="翻译服务">
+            <button
+              v-for="option in translationServiceOptions"
+              :key="option.value"
+              class="dialog-option"
+              :class="{ active: selectedTranslationService === option.value }"
+              type="button"
+              role="radio"
+              :aria-checked="selectedTranslationService === option.value"
+              @click="selectTranslationService(option.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span>{{ option.label }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
     </Teleport>
   </div>
 </template>
@@ -301,8 +413,11 @@ import {
   EyeOff,
   Gauge,
   KeyRound,
+  Languages,
   Link as LinkIcon,
+  ListChecks,
   Moon,
+  Pencil,
   Plug,
   RefreshCw,
   Server,
@@ -335,6 +450,13 @@ enum ReasoningEffort {
   Off = 'off',
 }
 
+enum TranslationService {
+  Llm = 'llm',
+  DeepLx = 'deeplx',
+  Microsoft = 'microsoft',
+  Google = 'google',
+}
+
 const llmServiceOptions = [
   { value: LlmService.OpenAI, label: 'OpenAI' },
   { value: LlmService.OpenAIResponses, label: 'OpenAI Responses' },
@@ -349,6 +471,13 @@ const reasoningEffortOptions = [
   { value: ReasoningEffort.Off, label: '关闭' },
 ] as const
 
+const translationServiceOptions = [
+  { value: TranslationService.Llm, label: 'LLM 大模型翻译' },
+  { value: TranslationService.DeepLx, label: 'DeepLx 翻译' },
+  { value: TranslationService.Microsoft, label: '微软翻译' },
+  { value: TranslationService.Google, label: '谷歌翻译' },
+] as const
+
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
 const isTranscriptionModelDialogOpen = ref(false)
 const selectedLlmService = ref<LlmService>(LlmService.OpenAI)
@@ -360,6 +489,11 @@ const llmModel = ref('')
 const selectedReasoningEffort = ref<ReasoningEffort>(ReasoningEffort.Off)
 const isReasoningEffortDialogOpen = ref(false)
 const isLlmStreaming = ref(true)
+const selectedTranslationService = ref<TranslationService>(TranslationService.Llm)
+const isTranslationServiceDialogOpen = ref(false)
+const needsReflectionTranslation = ref(true)
+const translationBatchSize = ref(30)
+const translationThreadCount = ref(10)
 
 const transcriptionModelLabel = computed(() => {
   return transcriptionModelOptions.find((option) => option.value === selectedTranscriptionModel.value)?.label ?? ''
@@ -371,6 +505,10 @@ const llmServiceLabel = computed(() => {
 
 const reasoningEffortLabel = computed(() => {
   return reasoningEffortOptions.find((option) => option.value === selectedReasoningEffort.value)?.label ?? ''
+})
+
+const translationServiceLabel = computed(() => {
+  return translationServiceOptions.find((option) => option.value === selectedTranslationService.value)?.label ?? ''
 })
 
 const openTranscriptionModelDialog = () => {
@@ -412,11 +550,25 @@ const selectReasoningEffort = (effort: ReasoningEffort) => {
   closeReasoningEffortDialog()
 }
 
+const openTranslationServiceDialog = () => {
+  isTranslationServiceDialogOpen.value = true
+}
+
+const closeTranslationServiceDialog = () => {
+  isTranslationServiceDialogOpen.value = false
+}
+
+const selectTranslationService = (service: TranslationService) => {
+  selectedTranslationService.value = service
+  closeTranslationServiceDialog()
+}
+
 const handleKeydown = (event: KeyboardEvent) => {
   if (event.key === 'Escape') {
     closeTranscriptionModelDialog()
     closeLlmServiceDialog()
     closeReasoningEffortDialog()
+    closeTranslationServiceDialog()
   }
 }
 
