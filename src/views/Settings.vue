@@ -568,7 +568,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   AlignJustify,
   Bot,
@@ -597,6 +598,8 @@ import {
 import { useTheme } from '../composables/useTheme'
 
 const { currentTheme, setTheme, themeLabel } = useTheme()
+
+type ThemeMode = 'light' | 'dark'
 
 enum TranscriptionModel {
   Bilibili = 'bilibili',
@@ -635,6 +638,32 @@ enum VideoContentType {
 type TargetLanguageOption = {
   value: string
   label: string
+}
+
+type LlmConfig = {
+  baseUrl: string
+  apiKey: string
+  model: string
+  reasoningEffort: ReasoningEffort
+  isStreaming: boolean
+}
+
+type LlmConfigs = Record<LlmService, LlmConfig>
+
+type AppSettings = {
+  theme: ThemeMode
+  transcriptionModel: TranscriptionModel
+  selectedLlmService: LlmService
+  llmConfigs: LlmConfigs
+  translationService: TranslationService
+  needsReflectionTranslation: boolean
+  translationBatchSize: number
+  translationThreadCount: number
+  videoContentType: VideoContentType
+  isSubtitleCorrectionEnabled: boolean
+  isSubtitleTranslationEnabled: boolean
+  isPostTranslationOptimizationEnabled: boolean
+  targetLanguage: string
 }
 
 const languageDisplayNames = new Intl.DisplayNames(['zh-Hans'], { type: 'language' })
@@ -932,17 +961,89 @@ const targetLanguageOptions: TargetLanguageOption[] = [
     .sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans')),
 ]
 
+const createDefaultLlmConfig = (): LlmConfig => ({
+  baseUrl: '',
+  apiKey: '',
+  model: '',
+  reasoningEffort: ReasoningEffort.Off,
+  isStreaming: true,
+})
+
+const createDefaultLlmConfigs = (): LlmConfigs => ({
+  [LlmService.OpenAI]: createDefaultLlmConfig(),
+  [LlmService.OpenAIResponses]: createDefaultLlmConfig(),
+  [LlmService.Anthropic]: createDefaultLlmConfig(),
+})
+
+const readOptionValue = <T extends string>(
+  value: unknown,
+  options: readonly { readonly value: T }[],
+  fallback: T,
+) => {
+  return typeof value === 'string' && options.some((option) => option.value === value) ? (value as T) : fallback
+}
+
+const readTheme = (value: unknown): ThemeMode => {
+  return value === 'dark' || value === 'light' ? value : 'light'
+}
+
+const normalizeLlmConfig = (config?: Partial<LlmConfig>): LlmConfig => ({
+  baseUrl: typeof config?.baseUrl === 'string' ? config.baseUrl : '',
+  apiKey: typeof config?.apiKey === 'string' ? config.apiKey : '',
+  model: typeof config?.model === 'string' ? config.model : '',
+  reasoningEffort: readOptionValue(config?.reasoningEffort, reasoningEffortOptions, ReasoningEffort.Off),
+  isStreaming: typeof config?.isStreaming === 'boolean' ? config.isStreaming : true,
+})
+
+const normalizeLlmConfigs = (configs?: Partial<Record<LlmService, Partial<LlmConfig>>>): LlmConfigs => ({
+  [LlmService.OpenAI]: normalizeLlmConfig(configs?.[LlmService.OpenAI]),
+  [LlmService.OpenAIResponses]: normalizeLlmConfig(configs?.[LlmService.OpenAIResponses]),
+  [LlmService.Anthropic]: normalizeLlmConfig(configs?.[LlmService.Anthropic]),
+})
+
+const readNumberSetting = (value: unknown, fallback: number, min: number, max: number) => {
+  const numberValue = typeof value === 'number' && Number.isFinite(value) ? value : fallback
+
+  return Math.min(Math.max(numberValue, min), max)
+}
+
+const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
+  theme: readTheme(settings.theme),
+  transcriptionModel: readOptionValue(
+    settings.transcriptionModel,
+    transcriptionModelOptions,
+    TranscriptionModel.Bilibili,
+  ),
+  selectedLlmService: readOptionValue(settings.selectedLlmService, llmServiceOptions, LlmService.OpenAI),
+  llmConfigs: normalizeLlmConfigs(settings.llmConfigs),
+  translationService: readOptionValue(settings.translationService, translationServiceOptions, TranslationService.Llm),
+  needsReflectionTranslation:
+    typeof settings.needsReflectionTranslation === 'boolean' ? settings.needsReflectionTranslation : true,
+  translationBatchSize: readNumberSetting(settings.translationBatchSize, 30, 10, 100),
+  translationThreadCount: readNumberSetting(settings.translationThreadCount, 10, 1, 100),
+  videoContentType: readOptionValue(settings.videoContentType, videoContentTypeOptions, VideoContentType.General),
+  isSubtitleCorrectionEnabled:
+    typeof settings.isSubtitleCorrectionEnabled === 'boolean' ? settings.isSubtitleCorrectionEnabled : true,
+  isSubtitleTranslationEnabled:
+    typeof settings.isSubtitleTranslationEnabled === 'boolean' ? settings.isSubtitleTranslationEnabled : true,
+  isPostTranslationOptimizationEnabled:
+    typeof settings.isPostTranslationOptimizationEnabled === 'boolean'
+      ? settings.isPostTranslationOptimizationEnabled
+      : true,
+  targetLanguage:
+    typeof settings.targetLanguage === 'string' &&
+    targetLanguageOptions.some((option) => option.value === settings.targetLanguage)
+      ? settings.targetLanguage
+      : 'zh-Hans',
+})
+
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
 const isTranscriptionModelDialogOpen = ref(false)
 const selectedLlmService = ref<LlmService>(LlmService.OpenAI)
 const isLlmServiceDialogOpen = ref(false)
-const llmApiKey = ref('')
 const isLlmApiKeyVisible = ref(false)
-const llmBaseUrl = ref('')
-const llmModel = ref('')
-const selectedReasoningEffort = ref<ReasoningEffort>(ReasoningEffort.Off)
+const llmConfigs = ref<LlmConfigs>(createDefaultLlmConfigs())
 const isReasoningEffortDialogOpen = ref(false)
-const isLlmStreaming = ref(true)
 const selectedTranslationService = ref<TranslationService>(TranslationService.Llm)
 const isTranslationServiceDialogOpen = ref(false)
 const needsReflectionTranslation = ref(true)
@@ -956,6 +1057,49 @@ const isPostTranslationOptimizationEnabled = ref(true)
 const selectedTargetLanguage = ref('zh-Hans')
 const isTargetLanguageDialogOpen = ref(false)
 const targetLanguageSearch = ref('')
+const isSettingsLoaded = ref(false)
+let isApplyingStoredSettings = false
+let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
+
+const getCurrentLlmConfig = () => {
+  return llmConfigs.value[selectedLlmService.value]
+}
+
+const updateCurrentLlmConfig = (patch: Partial<LlmConfig>) => {
+  const service = selectedLlmService.value
+  llmConfigs.value = {
+    ...llmConfigs.value,
+    [service]: {
+      ...getCurrentLlmConfig(),
+      ...patch,
+    },
+  }
+}
+
+const llmBaseUrl = computed({
+  get: () => getCurrentLlmConfig().baseUrl,
+  set: (baseUrl: string) => updateCurrentLlmConfig({ baseUrl }),
+})
+
+const llmApiKey = computed({
+  get: () => getCurrentLlmConfig().apiKey,
+  set: (apiKey: string) => updateCurrentLlmConfig({ apiKey }),
+})
+
+const llmModel = computed({
+  get: () => getCurrentLlmConfig().model,
+  set: (model: string) => updateCurrentLlmConfig({ model }),
+})
+
+const selectedReasoningEffort = computed({
+  get: () => getCurrentLlmConfig().reasoningEffort,
+  set: (reasoningEffort: ReasoningEffort) => updateCurrentLlmConfig({ reasoningEffort }),
+})
+
+const isLlmStreaming = computed({
+  get: () => getCurrentLlmConfig().isStreaming,
+  set: (isStreaming: boolean) => updateCurrentLlmConfig({ isStreaming }),
+})
 
 const transcriptionModelLabel = computed(() => {
   return transcriptionModelOptions.find((option) => option.value === selectedTranscriptionModel.value)?.label ?? ''
@@ -992,6 +1136,80 @@ const filteredTargetLanguageOptions = computed(() => {
     return option.label.toLowerCase().includes(query) || option.value.toLowerCase().includes(query)
   })
 })
+
+const createSettingsSnapshot = (): AppSettings => ({
+  theme: currentTheme.value,
+  transcriptionModel: selectedTranscriptionModel.value,
+  selectedLlmService: selectedLlmService.value,
+  llmConfigs: llmConfigs.value,
+  translationService: selectedTranslationService.value,
+  needsReflectionTranslation: needsReflectionTranslation.value,
+  translationBatchSize: translationBatchSize.value,
+  translationThreadCount: translationThreadCount.value,
+  videoContentType: selectedVideoContentType.value,
+  isSubtitleCorrectionEnabled: isSubtitleCorrectionEnabled.value,
+  isSubtitleTranslationEnabled: isSubtitleTranslationEnabled.value,
+  isPostTranslationOptimizationEnabled: isPostTranslationOptimizationEnabled.value,
+  targetLanguage: selectedTargetLanguage.value,
+})
+
+const applySettings = (settings: AppSettings) => {
+  isApplyingStoredSettings = true
+
+  setTheme(settings.theme)
+  selectedTranscriptionModel.value = settings.transcriptionModel
+  selectedLlmService.value = settings.selectedLlmService
+  llmConfigs.value = settings.llmConfigs
+  selectedTranslationService.value = settings.translationService
+  needsReflectionTranslation.value = settings.needsReflectionTranslation
+  translationBatchSize.value = settings.translationBatchSize
+  translationThreadCount.value = settings.translationThreadCount
+  selectedVideoContentType.value = settings.videoContentType
+  isSubtitleCorrectionEnabled.value = settings.isSubtitleCorrectionEnabled
+  isSubtitleTranslationEnabled.value = settings.isSubtitleTranslationEnabled
+  isPostTranslationOptimizationEnabled.value = settings.isPostTranslationOptimizationEnabled
+  selectedTargetLanguage.value = settings.targetLanguage
+
+  nextTick(() => {
+    isApplyingStoredSettings = false
+  })
+}
+
+const saveSettingsNow = async () => {
+  try {
+    await invoke('save_settings', { settings: createSettingsSnapshot() })
+  } catch (error) {
+    console.error('保存设置失败', error)
+  }
+}
+
+const scheduleSaveSettings = () => {
+  if (!isSettingsLoaded.value || isApplyingStoredSettings) {
+    return
+  }
+
+  if (saveSettingsTimer !== undefined) {
+    window.clearTimeout(saveSettingsTimer)
+  }
+
+  saveSettingsTimer = window.setTimeout(() => {
+    saveSettingsTimer = undefined
+    void saveSettingsNow()
+  }, 260)
+}
+
+const loadStoredSettings = async () => {
+  try {
+    const storedSettings = await invoke<Partial<AppSettings>>('load_settings')
+    applySettings(normalizeSettings(storedSettings))
+  } catch (error) {
+    console.error('加载设置失败', error)
+  } finally {
+    await nextTick()
+    isSettingsLoaded.value = true
+    void saveSettingsNow()
+  }
+}
 
 const openTranscriptionModelDialog = () => {
   isTranscriptionModelDialogOpen.value = true
@@ -1083,9 +1301,21 @@ const handleKeydown = (event: KeyboardEvent) => {
   }
 }
 
+watch(createSettingsSnapshot, scheduleSaveSettings, { deep: true })
+
 window.addEventListener('keydown', handleKeydown)
+
+onMounted(() => {
+  void loadStoredSettings()
+})
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+
+  if (saveSettingsTimer !== undefined) {
+    window.clearTimeout(saveSettingsTimer)
+    saveSettingsTimer = undefined
+    void saveSettingsNow()
+  }
 })
 </script>

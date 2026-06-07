@@ -9,6 +9,17 @@ This project is a Tauri + Vue 3 + TypeScript app. Follow these defaults when add
 - Use Vue `<script setup lang="ts">` and typed enum-like values for fixed option sets.
 - After UI changes, run `npm run build`.
 
+## Settings Persistence
+
+- Store settings in the local SQLite database managed by the Tauri backend, not ad hoc frontend-only state.
+- Use `src-tauri/src/settings.rs` as the source of truth for the settings schema, defaults, load command, and save command.
+- When adding or changing a setting, update both the Rust `AppSettings`/database mapping and the Vue `AppSettings` type/load-save snapshot.
+- Keep LLM configuration as three independent service-specific records keyed by LLM service:
+  - `OpenAI`
+  - `OpenAI Responses`
+  - `Anthropic`
+- The fields under LLM configuration (`Base URL`, `API Key`, model, reasoning effort, streaming) must switch with the selected LLM service and must not be shared across services.
+
 ## Visual Style
 
 - Use the existing CSS variables for theme colors, surfaces, text, borders, and accents.
