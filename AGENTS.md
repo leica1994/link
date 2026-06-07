@@ -23,6 +23,7 @@ This project is a Tauri + Vue 3 + TypeScript app. Follow these defaults when add
 ## Visual Style
 
 - Use the existing CSS variables for theme colors, surfaces, text, borders, and accents.
+- Keep the app visual tone quiet, dense, and work-focused. Avoid marketing-style hero layouts, oversized decorative sections, floating page cards, nested cards, and purely decorative gradients.
 - Light theme panels and dialogs should use the existing warm beige surface palette:
   - panel/dialog background: `var(--bg-surface)` or `var(--dialog-bg)`
   - hover surface: `var(--bg-surface-hover)` or `var(--dialog-option-hover)`
@@ -37,6 +38,21 @@ This project is a Tauri + Vue 3 + TypeScript app. Follow these defaults when add
   - `.setting-title`
   - `.setting-subtitle`
 - Keep settings rows dense and consistent. Do not introduce card-in-card layouts.
+
+## Page Layout
+
+- Regular app pages should use the full-height `.page` shell and scroll internally when needed.
+- Page horizontal padding should follow the existing responsive pattern: `24px clamp(22px, 3vw, 56px) 44px` on desktop and `22px 24px 44px` on narrow screens.
+- Main page content should align to the same content track used by the translate page:
+  - desktop width: `width: min(100%, 1440px)`
+  - centered with `margin-left/right: auto`
+  - narrow screens: `width: 100%`
+- Top-level page titles must use `.page-title` and keep the existing `22px`, `750` weight, and `1.2` line-height.
+- Pages with a top title only, such as Settings, should give the title row the same visual height as `.translate-header` so the title text aligns vertically with the Translate page title.
+- The content below a top title/header should start at the same visual rhythm as Translate:
+  - desktop gap: `44px`
+  - narrow-screen gap: `34px`
+- Do not introduce page-specific max widths that make Settings, Translate, or similar full-page workflows visually inconsistent. If a page needs a constrained layout, first check whether it should share the translate/settings `1440px` track.
 
 ## Controls
 
