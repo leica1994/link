@@ -40,10 +40,18 @@
             </div>
 
             <div class="settings-panel translate-drop-panel">
-              <div class="translate-drop-zone">
+              <div
+                ref="videoDropZoneRef"
+                class="translate-drop-zone"
+                :class="{ 'drag-active': dragTarget === FileInputTarget.Video }"
+                @dragenter.prevent="dragTarget = FileInputTarget.Video"
+                @dragover.prevent
+                @dragleave.prevent="clearNativeDragTarget(FileInputTarget.Video)"
+                @drop.prevent="handleBrowserDrop(FileInputTarget.Video, $event)"
+              >
                 <UploadCloud class="translate-drop-icon" :stroke-width="2.1" aria-hidden="true" />
                 <div class="translate-drop-copy">
-                  <span class="translate-drop-title">选择需要转录的视频</span>
+                  <span class="translate-drop-title">选择或拖入需要转录的视频</span>
                   <span class="translate-drop-subtitle">支持本地视频和音频文件，转录完成后会自动保存字幕</span>
                 </div>
                 <button class="settings-action" type="button" :disabled="isTranscribing" @click="selectVideoFile">
@@ -205,18 +213,26 @@
             </div>
 
             <div class="settings-panel translate-drop-panel">
-              <div class="translate-drop-zone">
+              <div
+                ref="subtitleDropZoneRef"
+                class="translate-drop-zone"
+                :class="{ 'drag-active': dragTarget === FileInputTarget.Subtitle }"
+                @dragenter.prevent="dragTarget = FileInputTarget.Subtitle"
+                @dragover.prevent
+                @dragleave.prevent="clearNativeDragTarget(FileInputTarget.Subtitle)"
+                @drop.prevent="handleBrowserDrop(FileInputTarget.Subtitle, $event)"
+              >
                 <UploadCloud class="translate-drop-icon" :stroke-width="2.1" aria-hidden="true" />
                 <div class="translate-drop-copy">
-                  <span class="translate-drop-title">选择转录后的字幕</span>
-                  <span class="translate-drop-subtitle">支持 SRT、VTT、ASS，后续将接入字幕解析和预览</span>
+                  <span class="translate-drop-title">选择或拖入转录后的字幕</span>
+                  <span class="translate-drop-subtitle">支持 SRT、VTT、ASS，可直接导入已有字幕继续处理</span>
                 </div>
-                <button class="settings-action" type="button" disabled>选择字幕</button>
+                <button class="settings-action" type="button" @click="selectSubtitleFile">选择字幕</button>
               </div>
 
               <div class="translate-file-strip" aria-label="当前字幕">
                 <FileText :stroke-width="2.1" aria-hidden="true" />
-                <span>{{ lastOutputPath ? fileNameFromPath(lastOutputPath) : '尚未选择字幕' }}</span>
+                <span>{{ selectedSubtitleName }}</span>
               </div>
             </div>
           </section>
@@ -288,13 +304,25 @@
           <div class="settings-panel translate-result-panel">
             <div class="translate-status-bar">
               <div class="translate-status">
-                <span class="translate-status-dot" aria-hidden="true" />
-                <span>等待选择字幕</span>
+                <span class="translate-status-dot" :class="translationStatusClass" aria-hidden="true" />
+                <span>{{ translationStatusText }}</span>
               </div>
               <div class="translate-actions">
-                <button class="settings-action" type="button" disabled>开始处理</button>
+                <button
+                  class="settings-action"
+                  type="button"
+                  :disabled="!canStartTranslationProcessing"
+                  @click="startTranslationProcessing"
+                >
+                  开始处理
+                </button>
                 <button class="settings-action" type="button" disabled>导出结果</button>
               </div>
+            </div>
+
+            <div v-if="subtitleInputError" class="translate-alert" role="alert">
+              <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ subtitleInputError }}</span>
             </div>
 
             <div class="translate-compare">
@@ -364,6 +392,7 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { DragDropEvent } from '@tauri-apps/api/webview'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
@@ -416,6 +445,11 @@ enum TranslateDialog {
   TranslationFormat = 'translation-format',
 }
 
+enum FileInputTarget {
+  Video = 'video',
+  Subtitle = 'subtitle',
+}
+
 type DialogOption = {
   value: string
   label: string
@@ -457,7 +491,11 @@ const selectedOutputMode = ref<OutputMode>(OutputMode.Bilingual)
 const isSmartSegmentationEnabled = ref(true)
 const isSettingsLoaded = ref(false)
 const languageSearch = ref('')
+const videoDropZoneRef = ref<HTMLElement | null>(null)
+const subtitleDropZoneRef = ref<HTMLElement | null>(null)
+const dragTarget = ref<FileInputTarget | null>(null)
 const selectedVideoPath = ref('')
+const selectedSubtitlePath = ref('')
 const isTranscribing = ref(false)
 const transcriptionProgress = ref(0)
 const transcriptionMessage = ref('等待选择视频')
@@ -465,12 +503,17 @@ const transcriptionError = ref('')
 const transcriptionSegments = ref<TranscriptionSegment[]>([])
 const transcriptionText = ref('')
 const lastOutputPath = ref('')
+const subtitleInputError = ref('')
+const translationMessage = ref('等待选择字幕')
 let isApplyingStoredSettings = false
 let hasLoadedOnce = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 let unlistenTranscriptionProgress: UnlistenFn | undefined
+let unlistenDragDrop: UnlistenFn | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
+const mediaExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v', 'mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg']
+const subtitleExtensions = ['srt', 'vtt', 'ass']
 
 const transcriptionModelLabel = computed(() =>
   getOptionLabel(transcriptionModelOptions, selectedTranscriptionModel.value),
@@ -488,12 +531,17 @@ const outputModeLabel = computed(() => getOptionLabel(outputModeOptions, selecte
 const selectedVideoName = computed(() => {
   return selectedVideoPath.value ? fileNameFromPath(selectedVideoPath.value) : '尚未选择视频'
 })
+const activeSubtitlePath = computed(() => selectedSubtitlePath.value || lastOutputPath.value)
+const selectedSubtitleName = computed(() => {
+  return activeSubtitlePath.value ? fileNameFromPath(activeSubtitlePath.value) : '尚未选择字幕'
+})
 const canStartTranscription = computed(() => {
   return Boolean(selectedVideoPath.value) && !isTranscribing.value
 })
 const canExportTranscription = computed(() => {
   return Boolean(transcriptionText.value) && !isTranscribing.value
 })
+const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value)
 const transcriptionStatusText = computed(() => {
   if (transcriptionError.value) {
     return '转录失败'
@@ -505,6 +553,21 @@ const transcriptionStatusClass = computed(() => ({
   active: isTranscribing.value,
   success: !isTranscribing.value && transcriptionSegments.value.length > 0 && !transcriptionError.value,
   error: Boolean(transcriptionError.value),
+}))
+const translationStatusText = computed(() => {
+  if (subtitleInputError.value) {
+    return '字幕导入失败'
+  }
+
+  if (activeSubtitlePath.value && translationMessage.value === '等待选择字幕') {
+    return '已选择字幕'
+  }
+
+  return translationMessage.value
+})
+const translationStatusClass = computed(() => ({
+  success: Boolean(activeSubtitlePath.value) && !subtitleInputError.value,
+  error: Boolean(subtitleInputError.value),
 }))
 const isLanguageDialog = computed(() => {
   return activeDialog.value === TranslateDialog.SourceLanguage || activeDialog.value === TranslateDialog.TargetLanguage
@@ -724,15 +787,95 @@ const selectVideoFile = async () => {
       return
     }
 
-    selectedVideoPath.value = selected
-    transcriptionError.value = ''
-    transcriptionProgress.value = 0
-    transcriptionMessage.value = '已选择视频'
-    transcriptionSegments.value = []
-    transcriptionText.value = ''
-    lastOutputPath.value = ''
+    applyVideoFile(selected)
   } catch (error) {
     transcriptionError.value = stringifyError(error)
+  }
+}
+
+const selectSubtitleFile = async () => {
+  if (!isTauriRuntime()) {
+    subtitleInputError.value = '请在桌面应用中选择字幕文件'
+    return
+  }
+
+  try {
+    const selected = await open({
+      title: '选择需要处理的字幕',
+      multiple: false,
+      filters: [
+        {
+          name: '字幕文件',
+          extensions: subtitleExtensions,
+        },
+      ],
+    })
+
+    if (typeof selected !== 'string') {
+      return
+    }
+
+    applySubtitleFile(selected)
+  } catch (error) {
+    subtitleInputError.value = stringifyError(error)
+  }
+}
+
+const applyVideoFile = (path: string) => {
+  const extension = fileExtension(path)
+  if (!mediaExtensions.includes(extension)) {
+    transcriptionError.value = '请选择支持的视频或音频文件'
+    return
+  }
+
+  selectedVideoPath.value = path
+  transcriptionError.value = ''
+  transcriptionProgress.value = 0
+  transcriptionMessage.value = '已选择视频'
+  transcriptionSegments.value = []
+  transcriptionText.value = ''
+  lastOutputPath.value = ''
+}
+
+const applySubtitleFile = (path: string) => {
+  const extension = fileExtension(path)
+  if (!subtitleExtensions.includes(extension)) {
+    subtitleInputError.value = '请选择 SRT、VTT 或 ASS 字幕文件'
+    return
+  }
+
+  selectedSubtitlePath.value = path
+  subtitleInputError.value = ''
+  translationMessage.value = '已选择字幕'
+}
+
+const handleBrowserDrop = (target: FileInputTarget, event: DragEvent) => {
+  dragTarget.value = null
+
+  const file = Array.from(event.dataTransfer?.files ?? [])[0] as (File & { path?: string }) | undefined
+  if (!file?.path) {
+    return
+  }
+
+  applyDroppedPath(target, file.path)
+}
+
+const applyDroppedPath = (target: FileInputTarget, path: string) => {
+  if (target === FileInputTarget.Video) {
+    if (isTranscribing.value) {
+      return
+    }
+
+    applyVideoFile(path)
+    return
+  }
+
+  applySubtitleFile(path)
+}
+
+const clearNativeDragTarget = (target: FileInputTarget) => {
+  if (dragTarget.value === target) {
+    dragTarget.value = null
   }
 }
 
@@ -812,6 +955,14 @@ const exportTranscription = async () => {
   }
 }
 
+const startTranslationProcessing = () => {
+  if (!canStartTranslationProcessing.value) {
+    return
+  }
+
+  translationMessage.value = '已选择字幕，等待接入处理流程'
+}
+
 const openDialog = (dialog: TranslateDialog) => {
   languageSearch.value = ''
   activeDialog.value = dialog
@@ -866,9 +1017,86 @@ const registerProgressListener = async () => {
   })
 }
 
+const registerDragDropListener = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  const [{ getCurrentWebview }, { getCurrentWindow }] = await Promise.all([
+    import('@tauri-apps/api/webview'),
+    import('@tauri-apps/api/window'),
+  ])
+  const webview = getCurrentWebview()
+  const currentWindow = getCurrentWindow()
+
+  unlistenDragDrop = await webview.onDragDropEvent(async (event) => {
+    const payload = event.payload
+
+    if (payload.type === 'leave') {
+      dragTarget.value = null
+      return
+    }
+
+    if (payload.type === 'over') {
+      dragTarget.value = await resolveDropTarget(payload, await currentWindow.scaleFactor())
+      return
+    }
+
+    if (payload.type !== 'enter' && payload.type !== 'drop') {
+      return
+    }
+
+    const target = await resolveDropTarget(payload, await currentWindow.scaleFactor())
+    dragTarget.value = target
+
+    if (payload.type !== 'drop') {
+      return
+    }
+
+    dragTarget.value = null
+    const path = payload.paths[0]
+    if (target && path) {
+      applyDroppedPath(target, path)
+    }
+  })
+}
+
+const resolveDropTarget = (payload: Extract<DragDropEvent, { type: 'enter' | 'over' | 'drop' }>, scaleFactor: number) => {
+  const logicalPosition = payload.position.toLogical(scaleFactor)
+  const point = {
+    x: logicalPosition.x,
+    y: logicalPosition.y,
+  }
+
+  if (isPointInsideElement(point, videoDropZoneRef.value)) {
+    return FileInputTarget.Video
+  }
+
+  if (isPointInsideElement(point, subtitleDropZoneRef.value)) {
+    return FileInputTarget.Subtitle
+  }
+
+  return null
+}
+
+const isPointInsideElement = (point: { x: number; y: number }, element: HTMLElement | null) => {
+  if (!element) {
+    return false
+  }
+
+  const rect = element.getBoundingClientRect()
+  return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom
+}
+
 const fileNameFromPath = (path: string) => {
   const normalizedPath = path.replace(/\\/g, '/')
   return normalizedPath.split('/').filter(Boolean).pop() ?? path
+}
+
+const fileExtension = (path: string) => {
+  const fileName = fileNameFromPath(path)
+  const extension = fileName.split('.').pop()
+  return extension ? extension.toLowerCase() : ''
 }
 
 const buildExportPath = () => {
@@ -923,11 +1151,13 @@ window.addEventListener('keydown', handleKeydown)
 onMounted(() => {
   void loadStoredSettings()
   void registerProgressListener()
+  void registerDragDropListener()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   unlistenTranscriptionProgress?.()
+  unlistenDragDrop?.()
 
   if (saveSettingsTimer !== undefined) {
     window.clearTimeout(saveSettingsTimer)
