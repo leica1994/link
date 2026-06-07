@@ -44,14 +44,16 @@
                 <UploadCloud class="translate-drop-icon" :stroke-width="2.1" aria-hidden="true" />
                 <div class="translate-drop-copy">
                   <span class="translate-drop-title">选择需要转录的视频</span>
-                  <span class="translate-drop-subtitle">支持本地视频文件，后续将接入真实文件选择和任务队列</span>
+                  <span class="translate-drop-subtitle">支持本地视频和音频文件，转录完成后会自动保存字幕</span>
                 </div>
-                <button class="settings-action" type="button" disabled>选择视频</button>
+                <button class="settings-action" type="button" :disabled="isTranscribing" @click="selectVideoFile">
+                  选择视频
+                </button>
               </div>
 
               <div class="translate-file-strip" aria-label="当前视频">
                 <FileVideo :stroke-width="2.1" aria-hidden="true" />
-                <span>尚未选择视频</span>
+                <span>{{ selectedVideoName }}</span>
               </div>
             </div>
           </section>
@@ -131,16 +133,55 @@
           <div class="settings-panel translate-result-panel">
             <div class="translate-status-bar">
               <div class="translate-status">
-                <span class="translate-status-dot" aria-hidden="true" />
-                <span>等待选择视频</span>
+                <span class="translate-status-dot" :class="transcriptionStatusClass" aria-hidden="true" />
+                <span>{{ transcriptionStatusText }}</span>
               </div>
               <div class="translate-actions">
-                <button class="settings-action" type="button" disabled>开始转录</button>
-                <button class="settings-action" type="button" disabled>导出字幕</button>
+                <button
+                  class="settings-action"
+                  type="button"
+                  :disabled="!canStartTranscription"
+                  @click="startTranscription"
+                >
+                  {{ isTranscribing ? '转录中' : '开始转录' }}
+                </button>
+                <button
+                  class="settings-action"
+                  type="button"
+                  :disabled="!canExportTranscription"
+                  @click="exportTranscription"
+                >
+                  导出字幕
+                </button>
               </div>
             </div>
 
-            <div class="translate-preview translate-preview-empty">
+            <div v-if="isTranscribing || transcriptionProgress > 0" class="translate-progress" aria-label="转录进度">
+              <div class="translate-progress-track">
+                <span class="translate-progress-bar" :style="{ width: `${transcriptionProgress}%` }" />
+              </div>
+              <span class="translate-progress-value">{{ transcriptionProgress }}%</span>
+            </div>
+
+            <div v-if="transcriptionError" class="translate-alert" role="alert">
+              <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ transcriptionError }}</span>
+            </div>
+
+            <div v-if="transcriptionSegments.length > 0" class="translate-preview translate-subtitle-list">
+              <article
+                v-for="(segment, index) in transcriptionSegments"
+                :key="`${segment.startTime}-${index}`"
+                class="translate-subtitle-row"
+              >
+                <span class="translate-subtitle-index">{{ index + 1 }}</span>
+                <span class="translate-subtitle-time translate-subtitle-start">{{ formatSegmentTime(segment.startTime) }}</span>
+                <span class="translate-subtitle-time translate-subtitle-end">{{ formatSegmentTime(segment.endTime) }}</span>
+                <p>{{ segment.text }}</p>
+              </article>
+            </div>
+
+            <div v-else class="translate-preview translate-preview-empty">
               <Captions class="translate-empty-icon" :stroke-width="2.1" aria-hidden="true" />
               <span class="translate-empty-title">暂无转录内容</span>
               <span class="translate-empty-subtitle">选择视频并开始转录后，字幕内容会显示在这里</span>
@@ -175,7 +216,7 @@
 
               <div class="translate-file-strip" aria-label="当前字幕">
                 <FileText :stroke-width="2.1" aria-hidden="true" />
-                <span>尚未选择字幕</span>
+                <span>{{ lastOutputPath ? fileNameFromPath(lastOutputPath) : '尚未选择字幕' }}</span>
               </div>
             </div>
           </section>
@@ -322,11 +363,14 @@
 
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Bot,
   Captions,
   ChevronRight,
+  CircleAlert,
   Columns2,
   Film,
   FileText,
@@ -377,6 +421,24 @@ type DialogOption = {
   label: string
 }
 
+type TranscriptionSegment = {
+  text: string
+  startTime: number
+  endTime: number
+}
+
+type TranscriptionResult = {
+  segments: TranscriptionSegment[]
+  subtitleText: string
+  outputPath: string
+  outputFormat: string
+}
+
+type TranscriptionProgress = {
+  progress: number
+  message: string
+}
+
 const translateTabs = [
   { value: TranslateTab.Transcription, label: '转录', icon: Captions },
   { value: TranslateTab.TranslationOptimization, label: '翻译与优化', icon: WandSparkles },
@@ -395,9 +457,18 @@ const selectedOutputMode = ref<OutputMode>(OutputMode.Bilingual)
 const isSmartSegmentationEnabled = ref(true)
 const isSettingsLoaded = ref(false)
 const languageSearch = ref('')
+const selectedVideoPath = ref('')
+const isTranscribing = ref(false)
+const transcriptionProgress = ref(0)
+const transcriptionMessage = ref('等待选择视频')
+const transcriptionError = ref('')
+const transcriptionSegments = ref<TranscriptionSegment[]>([])
+const transcriptionText = ref('')
+const lastOutputPath = ref('')
 let isApplyingStoredSettings = false
 let hasLoadedOnce = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
+let unlistenTranscriptionProgress: UnlistenFn | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 
@@ -414,6 +485,27 @@ const translationFormatLabel = computed(() =>
 const videoContentTypeLabel = computed(() => getOptionLabel(videoContentTypeOptions, selectedVideoContentType.value))
 const targetLanguageLabel = computed(() => getOptionLabel(targetLanguageOptions, selectedTargetLanguage.value))
 const outputModeLabel = computed(() => getOptionLabel(outputModeOptions, selectedOutputMode.value))
+const selectedVideoName = computed(() => {
+  return selectedVideoPath.value ? fileNameFromPath(selectedVideoPath.value) : '尚未选择视频'
+})
+const canStartTranscription = computed(() => {
+  return Boolean(selectedVideoPath.value) && !isTranscribing.value
+})
+const canExportTranscription = computed(() => {
+  return Boolean(transcriptionText.value) && !isTranscribing.value
+})
+const transcriptionStatusText = computed(() => {
+  if (transcriptionError.value) {
+    return '转录失败'
+  }
+
+  return transcriptionMessage.value
+})
+const transcriptionStatusClass = computed(() => ({
+  active: isTranscribing.value,
+  success: !isTranscribing.value && transcriptionSegments.value.length > 0 && !transcriptionError.value,
+  error: Boolean(transcriptionError.value),
+}))
 const isLanguageDialog = computed(() => {
   return activeDialog.value === TranslateDialog.SourceLanguage || activeDialog.value === TranslateDialog.TargetLanguage
 })
@@ -602,6 +694,124 @@ const selectTab = async (tab: TranslateTab) => {
   void loadStoredSettings()
 }
 
+const selectVideoFile = async () => {
+  if (!isTauriRuntime()) {
+    transcriptionError.value = '请在桌面应用中选择视频文件'
+    return
+  }
+
+  try {
+    const selected = await open({
+      title: '选择需要转录的视频',
+      multiple: false,
+      filters: [
+        {
+          name: '媒体文件',
+          extensions: ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v', 'mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg'],
+        },
+        {
+          name: '视频文件',
+          extensions: ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v'],
+        },
+        {
+          name: '音频文件',
+          extensions: ['mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg'],
+        },
+      ],
+    })
+
+    if (typeof selected !== 'string') {
+      return
+    }
+
+    selectedVideoPath.value = selected
+    transcriptionError.value = ''
+    transcriptionProgress.value = 0
+    transcriptionMessage.value = '已选择视频'
+    transcriptionSegments.value = []
+    transcriptionText.value = ''
+    lastOutputPath.value = ''
+  } catch (error) {
+    transcriptionError.value = stringifyError(error)
+  }
+}
+
+const startTranscription = async () => {
+  if (!selectedVideoPath.value || isTranscribing.value) {
+    return
+  }
+
+  if (!isTauriRuntime()) {
+    transcriptionError.value = '请在桌面应用中开始转录'
+    return
+  }
+
+  await flushPendingSave()
+  isTranscribing.value = true
+  transcriptionError.value = ''
+  transcriptionProgress.value = 0
+  transcriptionMessage.value = '准备转录'
+  transcriptionSegments.value = []
+  transcriptionText.value = ''
+  lastOutputPath.value = ''
+
+  try {
+    const result = await invoke<TranscriptionResult>('start_transcription', {
+      request: {
+        filePath: selectedVideoPath.value,
+        model: selectedTranscriptionModel.value,
+        sourceLanguage: selectedSourceLanguage.value,
+        outputFormat: selectedTranscriptionFormat.value,
+      },
+    })
+
+    transcriptionSegments.value = result.segments
+    transcriptionText.value = result.subtitleText
+    lastOutputPath.value = result.outputPath
+    transcriptionProgress.value = 100
+    transcriptionMessage.value = `转录完成 · ${result.segments.length} 条字幕`
+  } catch (error) {
+    transcriptionError.value = stringifyError(error)
+    transcriptionMessage.value = '转录失败'
+  } finally {
+    isTranscribing.value = false
+  }
+}
+
+const exportTranscription = async () => {
+  if (!transcriptionText.value || !isTauriRuntime()) {
+    return
+  }
+
+  const suggestedPath = buildExportPath()
+
+  try {
+    const outputPath = await save({
+      title: '导出字幕',
+      defaultPath: suggestedPath,
+      filters: [
+        {
+          name: `${transcriptionFormatLabel.value} 字幕`,
+          extensions: [selectedTranscriptionFormat.value],
+        },
+      ],
+    })
+
+    if (!outputPath) {
+      return
+    }
+
+    await invoke('save_transcription_file', {
+      path: ensureSubtitleExtension(outputPath, selectedTranscriptionFormat.value),
+      content: transcriptionText.value,
+    })
+    lastOutputPath.value = ensureSubtitleExtension(outputPath, selectedTranscriptionFormat.value)
+    transcriptionMessage.value = '字幕已导出'
+  } catch (error) {
+    transcriptionError.value = stringifyError(error)
+  }
+}
+
 const openDialog = (dialog: TranslateDialog) => {
   languageSearch.value = ''
   activeDialog.value = dialog
@@ -645,16 +855,79 @@ const handleKeydown = (event: KeyboardEvent) => {
   }
 }
 
+const registerProgressListener = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  unlistenTranscriptionProgress = await listen<TranscriptionProgress>('transcription-progress', (event) => {
+    transcriptionProgress.value = Math.min(Math.max(Math.round(event.payload.progress), 0), 100)
+    transcriptionMessage.value = event.payload.message
+  })
+}
+
+const fileNameFromPath = (path: string) => {
+  const normalizedPath = path.replace(/\\/g, '/')
+  return normalizedPath.split('/').filter(Boolean).pop() ?? path
+}
+
+const buildExportPath = () => {
+  if (lastOutputPath.value) {
+    return replaceExtension(lastOutputPath.value, selectedTranscriptionFormat.value)
+  }
+
+  if (!selectedVideoPath.value) {
+    return `字幕.${selectedTranscriptionFormat.value}`
+  }
+
+  return replaceExtension(selectedVideoPath.value, selectedTranscriptionFormat.value)
+}
+
+const replaceExtension = (path: string, extension: string) => {
+  const withoutExtension = path.replace(/\.[^/.\\]+$/, '')
+  return `${withoutExtension}.${extension}`
+}
+
+const ensureSubtitleExtension = (path: string, extension: string) => {
+  return path.toLowerCase().endsWith(`.${extension}`) ? path : `${path}.${extension}`
+}
+
+const formatSegmentTime = (ms: number) => {
+  const safeMs = Math.max(0, Math.round(ms))
+  const milliseconds = safeMs % 1000
+  const totalSeconds = Math.floor(safeMs / 1000)
+  const seconds = totalSeconds % 60
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  const minutes = totalMinutes % 60
+  const hours = Math.floor(totalMinutes / 60)
+
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`
+}
+
+const stringifyError = (error: unknown) => {
+  if (typeof error === 'string') {
+    return error
+  }
+
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  return '操作失败'
+}
+
 watch(createSettingsSnapshot, scheduleSaveSettings, { deep: true })
 
 window.addEventListener('keydown', handleKeydown)
 
 onMounted(() => {
   void loadStoredSettings()
+  void registerProgressListener()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+  unlistenTranscriptionProgress?.()
 
   if (saveSettingsTimer !== undefined) {
     window.clearTimeout(saveSettingsTimer)
