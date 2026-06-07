@@ -224,6 +224,99 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="translation-optimization-settings-title">
+        <div id="translation-optimization-settings-title" class="section-heading">
+          <WandSparkles aria-hidden="true" />
+          <span>翻译与优化</span>
+        </div>
+
+        <div class="settings-panel">
+          <button class="setting-row setting-row-button" type="button" @click="openVideoContentTypeDialog">
+            <Film class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <span class="setting-copy">
+              <span class="setting-title">视频类型</span>
+              <span class="setting-subtitle">选择视频内容类型，不同类型使用不同的字幕处理策略和提示词</span>
+            </span>
+            <span class="setting-inline-action">
+              <span class="setting-value">{{ videoContentTypeLabel }}</span>
+              <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+            </span>
+          </button>
+
+          <div class="setting-row">
+            <Pencil class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">字幕校正</div>
+              <div class="setting-subtitle">字幕处理过程是否对生成的字幕进行校正</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: isSubtitleCorrectionEnabled }"
+              type="button"
+              :aria-pressed="isSubtitleCorrectionEnabled"
+              @click="isSubtitleCorrectionEnabled = !isSubtitleCorrectionEnabled"
+            >
+              <span class="setting-toggle-label">{{ isSubtitleCorrectionEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">字幕翻译</div>
+              <div class="setting-subtitle">字幕处理过程是否对生成的字幕进行翻译</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: isSubtitleTranslationEnabled }"
+              type="button"
+              :aria-pressed="isSubtitleTranslationEnabled"
+              @click="isSubtitleTranslationEnabled = !isSubtitleTranslationEnabled"
+            >
+              <span class="setting-toggle-label">{{ isSubtitleTranslationEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <AlignJustify class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">译后优化</div>
+              <div class="setting-subtitle">翻译完成后进一步优化译文</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: isPostTranslationOptimizationEnabled }"
+              type="button"
+              :aria-pressed="isPostTranslationOptimizationEnabled"
+              @click="isPostTranslationOptimizationEnabled = !isPostTranslationOptimizationEnabled"
+            >
+              <span class="setting-toggle-label">{{ isPostTranslationOptimizationEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <button class="setting-row setting-row-button" type="button" @click="openTargetLanguageDialog">
+            <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <span class="setting-copy">
+              <span class="setting-title">目标语言</span>
+              <span class="setting-subtitle">选择翻译字幕的目标语言</span>
+            </span>
+            <span class="setting-inline-action">
+              <span class="setting-value">{{ targetLanguageLabel }}</span>
+              <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+            </span>
+          </button>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="personalization-settings-title">
         <div id="personalization-settings-title" class="section-heading">
           <SlidersHorizontal aria-hidden="true" />
@@ -397,6 +490,79 @@
           </div>
         </section>
       </div>
+
+      <div
+        v-if="isVideoContentTypeDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeVideoContentTypeDialog"
+      >
+        <section
+          class="settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="video-content-type-dialog-title"
+        >
+          <h2 id="video-content-type-dialog-title" class="dialog-title">视频类型</h2>
+          <div class="dialog-options" role="radiogroup" aria-label="视频类型">
+            <button
+              v-for="option in videoContentTypeOptions"
+              :key="option.value"
+              class="dialog-option"
+              :class="{ active: selectedVideoContentType === option.value }"
+              type="button"
+              role="radio"
+              :aria-checked="selectedVideoContentType === option.value"
+              @click="selectVideoContentType(option.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span>{{ option.label }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <div
+        v-if="isTargetLanguageDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeTargetLanguageDialog"
+      >
+        <section
+          class="settings-dialog language-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="target-language-dialog-title"
+        >
+          <h2 id="target-language-dialog-title" class="dialog-title">目标语言</h2>
+          <label class="language-search-field">
+            <Search class="language-search-icon" :stroke-width="2.1" aria-hidden="true" />
+            <input
+              v-model="targetLanguageSearch"
+              class="settings-input language-search-input"
+              type="search"
+              placeholder="搜索语言"
+              aria-label="搜索目标语言"
+            />
+          </label>
+          <div class="language-options" role="radiogroup" aria-label="目标语言">
+            <button
+              v-for="option in filteredTargetLanguageOptions"
+              :key="option.value"
+              class="dialog-option language-option"
+              :class="{ active: selectedTargetLanguage === option.value }"
+              type="button"
+              role="radio"
+              :aria-checked="selectedTargetLanguage === option.value"
+              @click="selectTargetLanguage(option.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span class="language-option-label">{{ option.label }}</span>
+            </button>
+            <span v-if="filteredTargetLanguageOptions.length === 0" class="language-empty">未找到语言</span>
+          </div>
+        </section>
+      </div>
     </Teleport>
   </div>
 </template>
@@ -404,6 +570,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue'
 import {
+  AlignJustify,
   Bot,
   Brain,
   Captions,
@@ -411,6 +578,7 @@ import {
   CircleHelp,
   Eye,
   EyeOff,
+  Film,
   Gauge,
   KeyRound,
   Languages,
@@ -420,9 +588,11 @@ import {
   Pencil,
   Plug,
   RefreshCw,
+  Search,
   Server,
   SlidersHorizontal,
   Sun,
+  WandSparkles,
 } from 'lucide-vue-next'
 import { useTheme } from '../composables/useTheme'
 
@@ -457,6 +627,274 @@ enum TranslationService {
   Google = 'google',
 }
 
+enum VideoContentType {
+  General = 'general',
+  Trading = 'trading',
+}
+
+type TargetLanguageOption = {
+  value: string
+  label: string
+}
+
+const languageDisplayNames = new Intl.DisplayNames(['zh-Hans'], { type: 'language' })
+
+const targetLanguageLabelOverrides: Record<string, string> = {
+  aa: '阿法尔语',
+  ab: '阿布哈兹语',
+  ae: '阿维斯陀语',
+  ak: '阿坎语',
+  av: '阿瓦尔语',
+  ba: '巴什基尔语',
+  bi: '比斯拉马语',
+  bo: '藏语',
+  ce: '车臣语',
+  ch: '查莫罗语',
+  cr: '克里语',
+  cu: '教会斯拉夫语',
+  cv: '楚瓦什语',
+  dz: '宗喀语',
+  ff: '富拉语',
+  fj: '斐济语',
+  gv: '马恩岛语',
+  ho: '希里莫图语',
+  hz: '赫雷罗语',
+  ie: '国际语（E）',
+  ii: '四川彝语',
+  ik: '伊努皮克语',
+  io: '伊多语',
+  iu: '因纽特语',
+  kg: '刚果语',
+  ki: '吉库尤语',
+  kj: '宽亚玛语',
+  kl: '格陵兰语',
+  kr: '卡努里语',
+  ks: '克什米尔语',
+  kv: '科米语',
+  kw: '康沃尔语',
+  li: '林堡语',
+  lu: '鲁巴加丹加语',
+  mh: '马绍尔语',
+  na: '瑙鲁语',
+  nd: '北恩德贝莱语',
+  ng: '恩敦加语',
+  nr: '南恩德贝莱语',
+  nv: '纳瓦霍语',
+  oj: '奥吉布瓦语',
+  os: '奥塞梯语',
+  pi: '巴利语',
+  rn: '基隆迪语',
+  sc: '撒丁语',
+  se: '北萨米语',
+  sg: '桑戈语',
+  ss: '斯瓦蒂语',
+  tw: '特威语',
+  ty: '塔希提语',
+  ve: '文达语',
+  vo: '沃拉普克语',
+  za: '壮语',
+  'zh-Hans': '简体中文',
+  'zh-Hant': '繁体中文',
+}
+
+const isoLanguageCodes = [
+  'aa',
+  'ab',
+  'ae',
+  'af',
+  'ak',
+  'am',
+  'an',
+  'ar',
+  'as',
+  'av',
+  'ay',
+  'az',
+  'ba',
+  'be',
+  'bg',
+  'bh',
+  'bi',
+  'bm',
+  'bn',
+  'bo',
+  'br',
+  'bs',
+  'ca',
+  'ce',
+  'ch',
+  'co',
+  'cr',
+  'cs',
+  'cu',
+  'cv',
+  'cy',
+  'da',
+  'de',
+  'dv',
+  'dz',
+  'ee',
+  'el',
+  'en',
+  'eo',
+  'es',
+  'et',
+  'eu',
+  'fa',
+  'ff',
+  'fi',
+  'fj',
+  'fo',
+  'fr',
+  'fy',
+  'ga',
+  'gd',
+  'gl',
+  'gn',
+  'gu',
+  'gv',
+  'ha',
+  'he',
+  'hi',
+  'ho',
+  'hr',
+  'ht',
+  'hu',
+  'hy',
+  'hz',
+  'ia',
+  'id',
+  'ie',
+  'ig',
+  'ii',
+  'ik',
+  'io',
+  'is',
+  'it',
+  'iu',
+  'ja',
+  'jv',
+  'ka',
+  'kg',
+  'ki',
+  'kj',
+  'kk',
+  'kl',
+  'km',
+  'kn',
+  'ko',
+  'kr',
+  'ks',
+  'ku',
+  'kv',
+  'kw',
+  'ky',
+  'la',
+  'lb',
+  'lg',
+  'li',
+  'ln',
+  'lo',
+  'lt',
+  'lu',
+  'lv',
+  'mg',
+  'mh',
+  'mi',
+  'mk',
+  'ml',
+  'mn',
+  'mr',
+  'ms',
+  'mt',
+  'my',
+  'na',
+  'nb',
+  'nd',
+  'ne',
+  'ng',
+  'nl',
+  'nn',
+  'no',
+  'nr',
+  'nv',
+  'ny',
+  'oc',
+  'oj',
+  'om',
+  'or',
+  'os',
+  'pa',
+  'pi',
+  'pl',
+  'ps',
+  'pt',
+  'qu',
+  'rm',
+  'rn',
+  'ro',
+  'ru',
+  'rw',
+  'sa',
+  'sc',
+  'sd',
+  'se',
+  'sg',
+  'si',
+  'sk',
+  'sl',
+  'sm',
+  'sn',
+  'so',
+  'sq',
+  'sr',
+  'ss',
+  'st',
+  'su',
+  'sv',
+  'sw',
+  'ta',
+  'te',
+  'tg',
+  'th',
+  'ti',
+  'tk',
+  'tl',
+  'tn',
+  'to',
+  'tr',
+  'ts',
+  'tt',
+  'tw',
+  'ty',
+  'ug',
+  'uk',
+  'ur',
+  'uz',
+  've',
+  'vi',
+  'vo',
+  'wa',
+  'wo',
+  'xh',
+  'yi',
+  'yo',
+  'za',
+  'zu',
+] as const
+
+const getTargetLanguageLabel = (value: string) => {
+  if (targetLanguageLabelOverrides[value]) {
+    return targetLanguageLabelOverrides[value]
+  }
+
+  try {
+    return languageDisplayNames.of(value) ?? value
+  } catch {
+    return value
+  }
+}
+
 const llmServiceOptions = [
   { value: LlmService.OpenAI, label: 'OpenAI' },
   { value: LlmService.OpenAIResponses, label: 'OpenAI Responses' },
@@ -478,6 +916,22 @@ const translationServiceOptions = [
   { value: TranslationService.Google, label: '谷歌翻译' },
 ] as const
 
+const videoContentTypeOptions = [
+  { value: VideoContentType.General, label: '通用' },
+  { value: VideoContentType.Trading, label: '交易' },
+] as const
+
+const targetLanguageOptions: TargetLanguageOption[] = [
+  { value: 'zh-Hans', label: '简体中文' },
+  { value: 'zh-Hant', label: '繁体中文' },
+  ...isoLanguageCodes
+    .map((value) => ({
+      value,
+      label: getTargetLanguageLabel(value),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans')),
+]
+
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
 const isTranscriptionModelDialogOpen = ref(false)
 const selectedLlmService = ref<LlmService>(LlmService.OpenAI)
@@ -494,6 +948,14 @@ const isTranslationServiceDialogOpen = ref(false)
 const needsReflectionTranslation = ref(true)
 const translationBatchSize = ref(30)
 const translationThreadCount = ref(10)
+const selectedVideoContentType = ref<VideoContentType>(VideoContentType.General)
+const isVideoContentTypeDialogOpen = ref(false)
+const isSubtitleCorrectionEnabled = ref(true)
+const isSubtitleTranslationEnabled = ref(true)
+const isPostTranslationOptimizationEnabled = ref(true)
+const selectedTargetLanguage = ref('zh-Hans')
+const isTargetLanguageDialogOpen = ref(false)
+const targetLanguageSearch = ref('')
 
 const transcriptionModelLabel = computed(() => {
   return transcriptionModelOptions.find((option) => option.value === selectedTranscriptionModel.value)?.label ?? ''
@@ -509,6 +971,26 @@ const reasoningEffortLabel = computed(() => {
 
 const translationServiceLabel = computed(() => {
   return translationServiceOptions.find((option) => option.value === selectedTranslationService.value)?.label ?? ''
+})
+
+const videoContentTypeLabel = computed(() => {
+  return videoContentTypeOptions.find((option) => option.value === selectedVideoContentType.value)?.label ?? ''
+})
+
+const targetLanguageLabel = computed(() => {
+  return targetLanguageOptions.find((option) => option.value === selectedTargetLanguage.value)?.label ?? ''
+})
+
+const filteredTargetLanguageOptions = computed(() => {
+  const query = targetLanguageSearch.value.trim().toLowerCase()
+
+  if (!query) {
+    return targetLanguageOptions
+  }
+
+  return targetLanguageOptions.filter((option) => {
+    return option.label.toLowerCase().includes(query) || option.value.toLowerCase().includes(query)
+  })
 })
 
 const openTranscriptionModelDialog = () => {
@@ -563,12 +1045,41 @@ const selectTranslationService = (service: TranslationService) => {
   closeTranslationServiceDialog()
 }
 
+const openVideoContentTypeDialog = () => {
+  isVideoContentTypeDialogOpen.value = true
+}
+
+const closeVideoContentTypeDialog = () => {
+  isVideoContentTypeDialogOpen.value = false
+}
+
+const selectVideoContentType = (type: VideoContentType) => {
+  selectedVideoContentType.value = type
+  closeVideoContentTypeDialog()
+}
+
+const openTargetLanguageDialog = () => {
+  targetLanguageSearch.value = ''
+  isTargetLanguageDialogOpen.value = true
+}
+
+const closeTargetLanguageDialog = () => {
+  isTargetLanguageDialogOpen.value = false
+}
+
+const selectTargetLanguage = (language: string) => {
+  selectedTargetLanguage.value = language
+  closeTargetLanguageDialog()
+}
+
 const handleKeydown = (event: KeyboardEvent) => {
   if (event.key === 'Escape') {
     closeTranscriptionModelDialog()
     closeLlmServiceDialog()
     closeReasoningEffortDialog()
     closeTranslationServiceDialog()
+    closeVideoContentTypeDialog()
+    closeTargetLanguageDialog()
   }
 }
 
