@@ -23,6 +23,10 @@ pub struct LlmConfig {
 pub struct AppSettings {
     pub theme: String,
     pub transcription_model: String,
+    pub source_language: String,
+    pub transcription_format: String,
+    pub translation_format: String,
+    pub is_smart_segmentation_enabled: bool,
     pub selected_llm_service: String,
     pub llm_configs: HashMap<String, LlmConfig>,
     pub translation_service: String,
@@ -30,6 +34,7 @@ pub struct AppSettings {
     pub translation_batch_size: u32,
     pub translation_thread_count: u32,
     pub video_content_type: String,
+    pub output_mode: String,
     pub is_subtitle_correction_enabled: bool,
     pub is_subtitle_translation_enabled: bool,
     pub is_post_translation_optimization_enabled: bool,
@@ -75,6 +80,14 @@ impl SettingsStore {
                 "transcription_model",
                 "bilibili",
             ),
+            source_language: read_string_setting(&setting_values, "source_language", "auto"),
+            transcription_format: read_string_setting(&setting_values, "transcription_format", "srt"),
+            translation_format: read_string_setting(&setting_values, "translation_format", "srt"),
+            is_smart_segmentation_enabled: read_bool_setting(
+                &setting_values,
+                "is_smart_segmentation_enabled",
+                true,
+            ),
             selected_llm_service: read_string_setting(
                 &setting_values,
                 "selected_llm_service",
@@ -98,6 +111,7 @@ impl SettingsStore {
                 "video_content_type",
                 "general",
             ),
+            output_mode: read_string_setting(&setting_values, "output_mode", "bilingual"),
             is_subtitle_correction_enabled: read_bool_setting(
                 &setting_values,
                 "is_subtitle_correction_enabled",
@@ -132,6 +146,22 @@ impl SettingsStore {
             "transcription_model",
             &settings.transcription_model,
         )?;
+        upsert_setting(&transaction, "source_language", &settings.source_language)?;
+        upsert_setting(
+            &transaction,
+            "transcription_format",
+            &settings.transcription_format,
+        )?;
+        upsert_setting(
+            &transaction,
+            "translation_format",
+            &settings.translation_format,
+        )?;
+        upsert_setting(
+            &transaction,
+            "is_smart_segmentation_enabled",
+            bool_to_text(settings.is_smart_segmentation_enabled),
+        )?;
         upsert_setting(
             &transaction,
             "selected_llm_service",
@@ -162,6 +192,7 @@ impl SettingsStore {
             "video_content_type",
             &settings.video_content_type,
         )?;
+        upsert_setting(&transaction, "output_mode", &settings.output_mode)?;
         upsert_setting(
             &transaction,
             "is_subtitle_correction_enabled",

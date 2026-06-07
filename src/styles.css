@@ -626,6 +626,275 @@ html[data-theme='dark'] .theme-option.active {
   text-align: center;
 }
 
+.translate-page {
+  min-height: 100%;
+  height: 100%;
+  overflow: auto;
+  padding: 24px 26px 44px;
+  scrollbar-width: none;
+}
+
+.translate-page::-webkit-scrollbar {
+  display: none;
+}
+
+.translate-header {
+  width: min(1120px, calc(100vw - var(--sidebar-w) - 52px));
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+}
+
+.translate-tabs {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  padding: 5px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+html[data-theme='dark'] .translate-tabs {
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.translate-tab {
+  min-width: 118px;
+  height: 34px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+
+.translate-tab svg {
+  width: 16px;
+  height: 16px;
+}
+
+.translate-tab:hover {
+  color: var(--text);
+}
+
+.translate-tab.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+html[data-theme='dark'] .translate-tab.active {
+  color: #18140f;
+}
+
+.translate-workspace {
+  width: min(1120px, calc(100vw - var(--sidebar-w) - 52px));
+  margin: 44px auto 0;
+}
+
+.translate-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+
+.translate-grid {
+  display: grid;
+  grid-template-columns: minmax(310px, 0.88fr) minmax(440px, 1.12fr);
+  gap: 26px;
+  align-items: stretch;
+}
+
+.translate-grid > .settings-section {
+  height: 100%;
+}
+
+.translate-grid > .settings-section + .settings-section {
+  margin-top: 0;
+}
+
+.translate-grid > .settings-section > .settings-panel {
+  flex: 1;
+}
+
+.translate-drop-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 18px;
+}
+
+.translate-drop-zone {
+  flex: 1;
+  min-height: 176px;
+  border: 1px dashed color-mix(in srgb, var(--text-muted) 44%, transparent);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.24);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 15px;
+  padding: 22px;
+}
+
+html[data-theme='dark'] .translate-drop-zone {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.translate-drop-icon {
+  width: 30px;
+  height: 30px;
+  color: var(--accent);
+}
+
+.translate-drop-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.translate-drop-title {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.translate-drop-subtitle {
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.translate-drop-zone .settings-action {
+  justify-self: start;
+  align-self: flex-start;
+}
+
+.translate-file-strip {
+  min-height: 42px;
+  margin-top: 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.28);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+html[data-theme='dark'] .translate-file-strip {
+  background: rgba(0, 0, 0, 0.14);
+}
+
+.translate-file-strip svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.translate-output-section {
+  margin-top: 0;
+}
+
+.translate-result-panel {
+  padding: 18px;
+}
+
+.translate-status-bar {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.translate-status {
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.translate-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--text-subtle);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--text-subtle) 18%, transparent);
+}
+
+.translate-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.translate-preview {
+  min-height: 260px;
+  margin-top: 16px;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+html[data-theme='dark'] .translate-preview {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.translate-preview-empty {
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.translate-empty-icon {
+  width: 30px;
+  height: 30px;
+  color: var(--accent);
+}
+
+.translate-empty-title {
+  color: var(--text);
+  font-size: 17px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.translate-empty-subtitle {
+  max-width: 280px;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.translate-compare {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
 @media (max-width: 860px) {
   :root {
     --sidebar-w: 68px;
@@ -709,5 +978,60 @@ html[data-theme='dark'] .theme-option.active {
 
   .language-options {
     grid-template-columns: 1fr;
+  }
+
+  .translate-page {
+    padding: 22px 24px 44px;
+  }
+
+  .translate-header {
+    width: 100%;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .translate-tabs {
+    width: 100%;
+  }
+
+  .translate-tab {
+    min-width: 0;
+  }
+
+  .translate-workspace {
+    width: 100%;
+    margin-top: 34px;
+  }
+
+  .translate-grid,
+  .translate-compare {
+    grid-template-columns: 1fr;
+  }
+
+  .translate-grid > .settings-section,
+  .translate-grid > .settings-section > .settings-panel {
+    height: auto;
+  }
+
+  .translate-drop-zone {
+    min-height: 164px;
+  }
+
+  .translate-status-bar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .translate-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .translate-actions .settings-action {
+    min-width: 0;
+  }
+
+  .translate-preview {
+    min-height: 220px;
   }
 }

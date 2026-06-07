@@ -635,6 +635,18 @@ enum VideoContentType {
   Trading = 'trading',
 }
 
+enum SubtitleFormat {
+  Srt = 'srt',
+  Vtt = 'vtt',
+  Ass = 'ass',
+}
+
+enum OutputMode {
+  TargetOnly = 'target-only',
+  Bilingual = 'bilingual',
+  SourceAndTargetFiles = 'source-and-target-files',
+}
+
 type TargetLanguageOption = {
   value: string
   label: string
@@ -653,6 +665,10 @@ type LlmConfigs = Record<LlmService, LlmConfig>
 type AppSettings = {
   theme: ThemeMode
   transcriptionModel: TranscriptionModel
+  sourceLanguage: string
+  transcriptionFormat: SubtitleFormat
+  translationFormat: SubtitleFormat
+  isSmartSegmentationEnabled: boolean
   selectedLlmService: LlmService
   llmConfigs: LlmConfigs
   translationService: TranslationService
@@ -660,6 +676,7 @@ type AppSettings = {
   translationBatchSize: number
   translationThreadCount: number
   videoContentType: VideoContentType
+  outputMode: OutputMode
   isSubtitleCorrectionEnabled: boolean
   isSubtitleTranslationEnabled: boolean
   isPostTranslationOptimizationEnabled: boolean
@@ -950,6 +967,18 @@ const videoContentTypeOptions = [
   { value: VideoContentType.Trading, label: '交易' },
 ] as const
 
+const subtitleFormatOptions = [
+  { value: SubtitleFormat.Srt, label: 'SRT' },
+  { value: SubtitleFormat.Vtt, label: 'VTT' },
+  { value: SubtitleFormat.Ass, label: 'ASS' },
+] as const
+
+const outputModeOptions = [
+  { value: OutputMode.TargetOnly, label: '仅译文字幕' },
+  { value: OutputMode.Bilingual, label: '双语字幕' },
+  { value: OutputMode.SourceAndTargetFiles, label: '原文与译文文件' },
+] as const
+
 const targetLanguageOptions: TargetLanguageOption[] = [
   { value: 'zh-Hans', label: '简体中文' },
   { value: 'zh-Hant', label: '繁体中文' },
@@ -1014,6 +1043,11 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
     transcriptionModelOptions,
     TranscriptionModel.Bilibili,
   ),
+  sourceLanguage: typeof settings.sourceLanguage === 'string' ? settings.sourceLanguage : 'auto',
+  transcriptionFormat: readOptionValue(settings.transcriptionFormat, subtitleFormatOptions, SubtitleFormat.Srt),
+  translationFormat: readOptionValue(settings.translationFormat, subtitleFormatOptions, SubtitleFormat.Srt),
+  isSmartSegmentationEnabled:
+    typeof settings.isSmartSegmentationEnabled === 'boolean' ? settings.isSmartSegmentationEnabled : true,
   selectedLlmService: readOptionValue(settings.selectedLlmService, llmServiceOptions, LlmService.OpenAI),
   llmConfigs: normalizeLlmConfigs(settings.llmConfigs),
   translationService: readOptionValue(settings.translationService, translationServiceOptions, TranslationService.Llm),
@@ -1022,6 +1056,7 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
   translationBatchSize: readNumberSetting(settings.translationBatchSize, 30, 10, 100),
   translationThreadCount: readNumberSetting(settings.translationThreadCount, 10, 1, 100),
   videoContentType: readOptionValue(settings.videoContentType, videoContentTypeOptions, VideoContentType.General),
+  outputMode: readOptionValue(settings.outputMode, outputModeOptions, OutputMode.Bilingual),
   isSubtitleCorrectionEnabled:
     typeof settings.isSubtitleCorrectionEnabled === 'boolean' ? settings.isSubtitleCorrectionEnabled : true,
   isSubtitleTranslationEnabled:
@@ -1038,6 +1073,10 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
 })
 
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
+const selectedSourceLanguage = ref('auto')
+const selectedTranscriptionFormat = ref<SubtitleFormat>(SubtitleFormat.Srt)
+const selectedTranslationFormat = ref<SubtitleFormat>(SubtitleFormat.Srt)
+const isSmartSegmentationEnabled = ref(true)
 const isTranscriptionModelDialogOpen = ref(false)
 const selectedLlmService = ref<LlmService>(LlmService.OpenAI)
 const isLlmServiceDialogOpen = ref(false)
@@ -1050,6 +1089,7 @@ const needsReflectionTranslation = ref(true)
 const translationBatchSize = ref(30)
 const translationThreadCount = ref(10)
 const selectedVideoContentType = ref<VideoContentType>(VideoContentType.General)
+const selectedOutputMode = ref<OutputMode>(OutputMode.Bilingual)
 const isVideoContentTypeDialogOpen = ref(false)
 const isSubtitleCorrectionEnabled = ref(true)
 const isSubtitleTranslationEnabled = ref(true)
@@ -1060,6 +1100,8 @@ const targetLanguageSearch = ref('')
 const isSettingsLoaded = ref(false)
 let isApplyingStoredSettings = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
+
+const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 
 const getCurrentLlmConfig = () => {
   return llmConfigs.value[selectedLlmService.value]
@@ -1140,6 +1182,10 @@ const filteredTargetLanguageOptions = computed(() => {
 const createSettingsSnapshot = (): AppSettings => ({
   theme: currentTheme.value,
   transcriptionModel: selectedTranscriptionModel.value,
+  sourceLanguage: selectedSourceLanguage.value,
+  transcriptionFormat: selectedTranscriptionFormat.value,
+  translationFormat: selectedTranslationFormat.value,
+  isSmartSegmentationEnabled: isSmartSegmentationEnabled.value,
   selectedLlmService: selectedLlmService.value,
   llmConfigs: llmConfigs.value,
   translationService: selectedTranslationService.value,
@@ -1147,6 +1193,7 @@ const createSettingsSnapshot = (): AppSettings => ({
   translationBatchSize: translationBatchSize.value,
   translationThreadCount: translationThreadCount.value,
   videoContentType: selectedVideoContentType.value,
+  outputMode: selectedOutputMode.value,
   isSubtitleCorrectionEnabled: isSubtitleCorrectionEnabled.value,
   isSubtitleTranslationEnabled: isSubtitleTranslationEnabled.value,
   isPostTranslationOptimizationEnabled: isPostTranslationOptimizationEnabled.value,
@@ -1158,6 +1205,10 @@ const applySettings = (settings: AppSettings) => {
 
   setTheme(settings.theme)
   selectedTranscriptionModel.value = settings.transcriptionModel
+  selectedSourceLanguage.value = settings.sourceLanguage
+  selectedTranscriptionFormat.value = settings.transcriptionFormat
+  selectedTranslationFormat.value = settings.translationFormat
+  isSmartSegmentationEnabled.value = settings.isSmartSegmentationEnabled
   selectedLlmService.value = settings.selectedLlmService
   llmConfigs.value = settings.llmConfigs
   selectedTranslationService.value = settings.translationService
@@ -1165,6 +1216,7 @@ const applySettings = (settings: AppSettings) => {
   translationBatchSize.value = settings.translationBatchSize
   translationThreadCount.value = settings.translationThreadCount
   selectedVideoContentType.value = settings.videoContentType
+  selectedOutputMode.value = settings.outputMode
   isSubtitleCorrectionEnabled.value = settings.isSubtitleCorrectionEnabled
   isSubtitleTranslationEnabled.value = settings.isSubtitleTranslationEnabled
   isPostTranslationOptimizationEnabled.value = settings.isPostTranslationOptimizationEnabled
@@ -1176,6 +1228,10 @@ const applySettings = (settings: AppSettings) => {
 }
 
 const saveSettingsNow = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
   try {
     await invoke('save_settings', { settings: createSettingsSnapshot() })
   } catch (error) {
@@ -1199,6 +1255,13 @@ const scheduleSaveSettings = () => {
 }
 
 const loadStoredSettings = async () => {
+  if (!isTauriRuntime()) {
+    applySettings(normalizeSettings({}))
+    await nextTick()
+    isSettingsLoaded.value = true
+    return
+  }
+
   try {
     const storedSettings = await invoke<Partial<AppSettings>>('load_settings')
     applySettings(normalizeSettings(storedSettings))
