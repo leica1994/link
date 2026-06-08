@@ -217,7 +217,7 @@ where
             "maxSplitChunkWords": MAX_SPLIT_CHUNK_WORDS,
             "skippedBlockCount": skipped_blocks,
             "videoContentType": &settings.video_content_type,
-            "llmMode": "structured_non_streaming_with_reasoning",
+            "llmMode": "configured_llm_settings",
         }),
     );
 
@@ -408,7 +408,7 @@ where
             "chunkCount": chunks.len(),
             "batchSize": settings.translation_batch_size.max(1),
             "videoContentType": &settings.video_content_type,
-            "llmMode": "structured_non_streaming_with_reasoning",
+            "llmMode": "configured_llm_settings",
         }),
     );
 

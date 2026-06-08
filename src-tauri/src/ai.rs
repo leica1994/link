@@ -143,17 +143,8 @@ impl AiService {
         user_prompt: String,
         max_output_tokens: u32,
     ) -> Result<String, String> {
-        let (service, config) = selected_llm_config(settings)?;
-        let request = AiChatRequest {
-            system_prompt,
-            user_prompt,
-            max_output_tokens,
-            temperature: Some(0.2),
-            force_non_streaming: true,
-            disable_reasoning: false,
-        };
-
-        self.send_chat(service, config, &request, None).await
+        self.chat(settings, system_prompt, user_prompt, max_output_tokens)
+            .await
     }
 
     async fn chat_for_connection_check(

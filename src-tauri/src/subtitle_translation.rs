@@ -466,7 +466,7 @@ where
             "targetLanguage": &settings.target_language,
             "reflectionEnabled": settings.needs_reflection_translation,
             "videoContentType": &settings.video_content_type,
-            "llmMode": "structured_non_streaming_with_reasoning",
+            "llmMode": "configured_llm_settings",
         }),
     );
 
@@ -855,7 +855,7 @@ async fn optimize_translation_chunk_by_llm(
         let user_prompt =
             build_post_optimization_user_prompt(&source_entries, &chunk.entries, &feedback);
         let response = match ai_service
-            .chat(
+            .chat_for_structured_output(
                 settings,
                 system_prompt.clone(),
                 user_prompt,
@@ -1598,9 +1598,14 @@ fn parse_reflection_translation_candidate(
 }
 
 fn parse_json_text_map(text: &str) -> Result<BTreeMap<String, String>, String> {
-    let candidates = extract_json_object_candidates(text);
+    let candidates = extract_json_value_candidates(text);
     if candidates.is_empty() {
-        return Err("未找到 JSON 对象开始符".to_string());
+        let trimmed = text.trim();
+        if let Ok(Value::String(inner_text)) = serde_json::from_str::<Value>(trimmed) {
+            return parse_json_text_map(&inner_text);
+        }
+
+        return Err("未找到 JSON 对象或数组开始符".to_string());
     }
 
     let mut last_error = String::new();
@@ -1615,12 +1620,19 @@ fn parse_json_text_map(text: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 fn parse_json_text_map_candidate(json_text: &str) -> Result<BTreeMap<String, String>, String> {
-    let value = serde_json::from_str::<Value>(json_text)
-        .map_err(|error| format!("JSON 解析失败: {error}"))?;
+    let value = parse_json_candidate_value(json_text)?;
     parse_json_text_map_value(&value)
 }
 
 fn parse_json_text_map_value(value: &Value) -> Result<BTreeMap<String, String>, String> {
+    if let Some(text) = value.as_str() {
+        return parse_json_text_map(text);
+    }
+
+    if let Some(items) = value.as_array() {
+        return parse_text_map_array(items);
+    }
+
     let object = value
         .as_object()
         .ok_or_else(|| "LLM 返回内容不是 JSON 对象".to_string())?;
@@ -1692,6 +1704,22 @@ fn parse_json_text_map_value(value: &Value) -> Result<BTreeMap<String, String>, 
     }
 
     Err(last_error)
+}
+
+fn parse_json_candidate_value(json_text: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(json_text) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let repaired = quote_bare_numeric_object_keys(json_text);
+            if repaired == json_text {
+                return Err(format!("JSON 解析失败: {error}"));
+            }
+
+            serde_json::from_str::<Value>(&repaired).map_err(|repair_error| {
+                format!("JSON 解析失败: {error}; 数字 key 修复后仍失败: {repair_error}")
+            })
+        }
+    }
 }
 
 fn parse_text_map_object(
@@ -1881,10 +1909,10 @@ fn sorted_subtitle_keys(entries: &BTreeMap<String, String>) -> Vec<String> {
     keys.into_iter().map(|(_, key)| key).collect()
 }
 
-fn extract_json_object_candidates(text: &str) -> Vec<&str> {
+fn extract_json_value_candidates(text: &str) -> Vec<&str> {
     let mut candidates = Vec::new();
     let mut start = None;
-    let mut depth = 0usize;
+    let mut expected_closers = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
 
@@ -1906,18 +1934,29 @@ fn extract_json_object_candidates(text: &str) -> Vec<&str> {
         match character {
             '"' => in_string = true,
             '{' => {
-                if depth == 0 {
+                if expected_closers.is_empty() {
                     start = Some(index);
                 }
-                depth += 1;
+                expected_closers.push('}');
             }
-            '}' => {
-                if depth == 0 {
+            '[' => {
+                if expected_closers.is_empty() {
+                    start = Some(index);
+                }
+                expected_closers.push(']');
+            }
+            '}' | ']' => {
+                let Some(expected) = expected_closers.pop() else {
+                    continue;
+                };
+
+                if character != expected {
+                    expected_closers.clear();
+                    start = None;
                     continue;
                 }
 
-                depth -= 1;
-                if depth == 0 {
+                if expected_closers.is_empty() {
                     if let Some(start_index) = start.take() {
                         candidates.push(&text[start_index..=index]);
                     }
@@ -1928,6 +1967,90 @@ fn extract_json_object_candidates(text: &str) -> Vec<&str> {
     }
 
     candidates
+}
+
+fn extract_json_object_candidates(text: &str) -> Vec<&str> {
+    extract_json_value_candidates(text)
+        .into_iter()
+        .filter(|candidate| candidate.trim_start().starts_with('{'))
+        .collect()
+}
+
+fn quote_bare_numeric_object_keys(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while index < chars.len() {
+        let character = chars[index];
+
+        if in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else {
+                match character {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            index += 1;
+            continue;
+        }
+
+        if character == '"' {
+            in_string = true;
+            output.push(character);
+            index += 1;
+            continue;
+        }
+
+        if character == '{' || character == ',' {
+            output.push(character);
+            index += 1;
+
+            let whitespace_start = index;
+            while index < chars.len() && chars[index].is_whitespace() {
+                index += 1;
+            }
+
+            let key_start = index;
+            while index < chars.len() && chars[index].is_ascii_digit() {
+                index += 1;
+            }
+
+            if key_start == index {
+                output.extend(chars[whitespace_start..index].iter().copied());
+                continue;
+            }
+
+            let mut colon_index = index;
+            while colon_index < chars.len() && chars[colon_index].is_whitespace() {
+                colon_index += 1;
+            }
+
+            if colon_index < chars.len() && chars[colon_index] == ':' {
+                output.extend(chars[whitespace_start..key_start].iter().copied());
+                output.push('"');
+                output.extend(chars[key_start..index].iter().copied());
+                output.push('"');
+                output.extend(chars[index..colon_index].iter().copied());
+                index = colon_index;
+                continue;
+            }
+
+            output.extend(chars[whitespace_start..index].iter().copied());
+            continue;
+        }
+
+        output.push(character);
+        index += 1;
+    }
+
+    output
 }
 
 fn validate_or_remap_relative_keys(
@@ -2189,6 +2312,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_text_map_with_unquoted_numeric_keys() {
+        let parsed = parse_json_text_map(r#"{31:"优化译文",32:"下一句"}"#).unwrap();
+
+        assert_eq!(parsed.get("31"), Some(&"优化译文".to_string()));
+        assert_eq!(parsed.get("32"), Some(&"下一句".to_string()));
+    }
+
+    #[test]
     fn parses_text_map_from_array_items() {
         let parsed = parse_json_text_map(
             r#"{"items":[{"index":1,"optimized_translation":"优化译文"},{"id":"2","translation":"下一句"}]}"#,
@@ -2197,6 +2328,26 @@ mod tests {
 
         assert_eq!(parsed.get("1"), Some(&"优化译文".to_string()));
         assert_eq!(parsed.get("2"), Some(&"下一句".to_string()));
+    }
+
+    #[test]
+    fn parses_text_map_from_top_level_array_items() {
+        let parsed = parse_json_text_map(
+            r#"[{"index":31,"optimized_translation":"优化译文"},{"id":"32","translation":"下一句"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.get("31"), Some(&"优化译文".to_string()));
+        assert_eq!(parsed.get("32"), Some(&"下一句".to_string()));
+    }
+
+    #[test]
+    fn parses_text_map_from_json_string_wrapper() {
+        let wrapped = serde_json::to_string(r#"{"31":"优化译文","32":"下一句"}"#).unwrap();
+        let parsed = parse_json_text_map(&wrapped).unwrap();
+
+        assert_eq!(parsed.get("31"), Some(&"优化译文".to_string()));
+        assert_eq!(parsed.get("32"), Some(&"下一句".to_string()));
     }
 
     #[test]
