@@ -113,7 +113,7 @@
                 <Scissors class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
                 <div class="setting-copy">
                   <div class="setting-title">智能断句</div>
-                  <div class="setting-subtitle">后续将结合 LLM 优化字幕断句</div>
+                  <div class="setting-subtitle">开启后转录完成会用 AI 优化字幕断句</div>
                 </div>
                 <button
                   class="setting-toggle"
@@ -161,14 +161,25 @@
                 >
                   导出字幕
                 </button>
+                <button
+                  class="settings-action"
+                  type="button"
+                  :disabled="!canOpenTranscriptionLog"
+                  @click="openTranscriptionLog"
+                >
+                  打开日志
+                </button>
               </div>
             </div>
 
-            <div v-if="isTranscribing || transcriptionProgress > 0" class="translate-progress" aria-label="转录进度">
+            <div v-if="currentTranscriptionStage" class="translate-progress" aria-label="处理进度">
               <div class="translate-progress-track">
-                <span class="translate-progress-bar" :style="{ width: `${transcriptionProgress}%` }" />
+                <span
+                  class="translate-progress-bar"
+                  :style="{ width: `${currentTranscriptionStage.progress}%` }"
+                />
               </div>
-              <span class="translate-progress-value">{{ transcriptionProgress }}%</span>
+              <span class="translate-progress-value">{{ currentTranscriptionStage.progress }}%</span>
             </div>
 
             <div v-if="transcriptionError" class="translate-alert" role="alert">
@@ -179,10 +190,16 @@
             <div v-if="transcriptionSegments.length > 0" class="translate-preview translate-subtitle-list">
               <article
                 v-for="(segment, index) in transcriptionSegments"
-                :key="`${segment.startTime}-${index}`"
+                :key="segment.uid || `${segment.startTime}-${index}`"
                 class="translate-subtitle-row"
               >
                 <span class="translate-subtitle-index">{{ index + 1 }}</span>
+                <span
+                  class="translate-subtitle-status"
+                  :class="segment.status ? `status-${segment.status}` : 'status-raw'"
+                >
+                  {{ transcriptionSegmentStatusLabel(segment.status) }}
+                </span>
                 <span class="translate-subtitle-time translate-subtitle-start">{{ formatSegmentTime(segment.startTime) }}</span>
                 <span class="translate-subtitle-time translate-subtitle-end">{{ formatSegmentTime(segment.endTime) }}</span>
                 <p>{{ segment.text }}</p>
@@ -394,6 +411,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { DragDropEvent } from '@tauri-apps/api/webview'
 import { open, save } from '@tauri-apps/plugin-dialog'
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Bot,
@@ -455,10 +473,28 @@ type DialogOption = {
   label: string
 }
 
+type TranscriptionSegmentStatus = 'raw' | 'segmenting' | 'segmented' | 'correcting' | 'corrected' | 'kept' | 'done'
+
 type TranscriptionSegment = {
+  uid?: string
   text: string
   startTime: number
   endTime: number
+  status?: TranscriptionSegmentStatus
+}
+
+type TranscriptionStageStatus = 'pending' | 'active' | 'done' | 'failed'
+
+type TranscriptionProgressStage = {
+  progress: number
+  message: string
+  status: TranscriptionStageStatus
+}
+
+type TranscriptionStageProgress = {
+  transcription?: TranscriptionProgressStage
+  smartSegmentation?: TranscriptionProgressStage
+  subtitleCorrection?: TranscriptionProgressStage
 }
 
 type TranscriptionResult = {
@@ -466,11 +502,27 @@ type TranscriptionResult = {
   subtitleText: string
   outputPath: string
   outputFormat: string
+  logPath: string
+  warnings: string[]
 }
 
 type TranscriptionProgress = {
   progress: number
   message: string
+  stageProgress?: TranscriptionStageProgress
+  revision?: number
+  segments?: TranscriptionSegment[]
+  warnings?: string[]
+}
+
+const transcriptionSegmentStatusLabels: Record<TranscriptionSegmentStatus, string> = {
+  raw: '原始',
+  segmenting: '断句中',
+  segmented: '已断句',
+  correcting: '校正中',
+  corrected: '已校正',
+  kept: '保留原文',
+  done: '完成',
 }
 
 const translateTabs = [
@@ -498,11 +550,15 @@ const selectedVideoPath = ref('')
 const selectedSubtitlePath = ref('')
 const isTranscribing = ref(false)
 const transcriptionProgress = ref(0)
+const transcriptionStageProgress = ref<TranscriptionStageProgress>({})
 const transcriptionMessage = ref('等待选择视频')
 const transcriptionError = ref('')
+const transcriptionWarnings = ref<string[]>([])
 const transcriptionSegments = ref<TranscriptionSegment[]>([])
 const transcriptionText = ref('')
+const lastTranscriptionRevision = ref(0)
 const lastOutputPath = ref('')
+const lastTranscriptionLogPath = ref('')
 const subtitleInputError = ref('')
 const translationMessage = ref('等待选择字幕')
 let isApplyingStoredSettings = false
@@ -541,10 +597,17 @@ const canStartTranscription = computed(() => {
 const canExportTranscription = computed(() => {
   return Boolean(transcriptionText.value) && !isTranscribing.value
 })
+const canOpenTranscriptionLog = computed(() => {
+  return Boolean(lastTranscriptionLogPath.value) && !isTranscribing.value && isTauriRuntime()
+})
 const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value)
 const transcriptionStatusText = computed(() => {
   if (transcriptionError.value) {
     return '转录失败'
+  }
+
+  if (isTranscribing.value && currentTranscriptionStage.value) {
+    return currentTranscriptionStage.value.message
   }
 
   return transcriptionMessage.value
@@ -552,8 +615,35 @@ const transcriptionStatusText = computed(() => {
 const transcriptionStatusClass = computed(() => ({
   active: isTranscribing.value,
   success: !isTranscribing.value && transcriptionSegments.value.length > 0 && !transcriptionError.value,
+  warning: !isTranscribing.value && transcriptionWarnings.value.length > 0 && !transcriptionError.value,
   error: Boolean(transcriptionError.value),
 }))
+const visibleTranscriptionStages = computed(() => {
+  const stages = transcriptionStageProgress.value
+  return [
+    { key: 'transcription', label: '转录', stage: stages.transcription },
+    { key: 'smart-segmentation', label: '智能断句', stage: stages.smartSegmentation },
+    { key: 'subtitle-correction', label: '字幕校正', stage: stages.subtitleCorrection },
+  ]
+    .filter((item): item is { key: string; label: string; stage: TranscriptionProgressStage } => Boolean(item.stage))
+    .map((item) => ({
+      key: item.key,
+      label: item.label,
+      progress: clampProgress(item.stage.progress),
+      status: item.stage.status,
+      message: item.stage.message,
+    }))
+})
+const currentTranscriptionStage = computed(() => {
+  const stages = visibleTranscriptionStages.value
+  return (
+    [...stages].reverse().find((stage) => stage.status === 'active') ??
+    [...stages].reverse().find((stage) => stage.status === 'pending') ??
+    [...stages].reverse().find((stage) => stage.status === 'failed') ??
+    [...stages].reverse().find((stage) => stage.status === 'done') ??
+    null
+  )
+})
 const translationStatusText = computed(() => {
   if (subtitleInputError.value) {
     return '字幕导入失败'
@@ -831,10 +921,14 @@ const applyVideoFile = (path: string) => {
   selectedVideoPath.value = path
   transcriptionError.value = ''
   transcriptionProgress.value = 0
+  transcriptionStageProgress.value = {}
   transcriptionMessage.value = '已选择视频'
+  transcriptionWarnings.value = []
   transcriptionSegments.value = []
   transcriptionText.value = ''
+  lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
   lastOutputPath.value = ''
+  lastTranscriptionLogPath.value = ''
 }
 
 const applySubtitleFile = (path: string) => {
@@ -879,6 +973,36 @@ const clearNativeDragTarget = (target: FileInputTarget) => {
   }
 }
 
+const clampProgress = (value: number) => Math.min(Math.max(Math.round(value), 0), 100)
+
+const markStageProgressDone = (stages: TranscriptionStageProgress): TranscriptionStageProgress => ({
+  transcription: stages.transcription ? { ...stages.transcription, progress: 100, status: 'done' } : undefined,
+  smartSegmentation: stages.smartSegmentation
+    ? { ...stages.smartSegmentation, progress: 100, status: 'done' }
+    : undefined,
+  subtitleCorrection: stages.subtitleCorrection
+    ? { ...stages.subtitleCorrection, progress: 100, status: 'done' }
+    : undefined,
+})
+
+const markActiveStageFailed = (stages: TranscriptionStageProgress): TranscriptionStageProgress => ({
+  transcription: stages.transcription
+    ? { ...stages.transcription, status: stages.transcription.status === 'active' ? 'failed' : stages.transcription.status }
+    : undefined,
+  smartSegmentation: stages.smartSegmentation
+    ? {
+        ...stages.smartSegmentation,
+        status: stages.smartSegmentation.status === 'active' ? 'failed' : stages.smartSegmentation.status,
+      }
+    : undefined,
+  subtitleCorrection: stages.subtitleCorrection
+    ? {
+        ...stages.subtitleCorrection,
+        status: stages.subtitleCorrection.status === 'active' ? 'failed' : stages.subtitleCorrection.status,
+      }
+    : undefined,
+})
+
 const startTranscription = async () => {
   if (!selectedVideoPath.value || isTranscribing.value) {
     return
@@ -893,10 +1017,22 @@ const startTranscription = async () => {
   isTranscribing.value = true
   transcriptionError.value = ''
   transcriptionProgress.value = 0
+  transcriptionStageProgress.value = {
+    transcription: { progress: 0, message: '准备转录', status: 'active' },
+    ...(isSmartSegmentationEnabled.value
+      ? { smartSegmentation: { progress: 0, message: '等待语音转录完成', status: 'pending' as TranscriptionStageStatus } }
+      : {}),
+    ...(currentSettings.value.isSubtitleCorrectionEnabled
+      ? { subtitleCorrection: { progress: 0, message: '等待前置处理完成', status: 'pending' as TranscriptionStageStatus } }
+      : {}),
+  }
   transcriptionMessage.value = '准备转录'
+  transcriptionWarnings.value = []
   transcriptionSegments.value = []
   transcriptionText.value = ''
+  lastTranscriptionRevision.value = 0
   lastOutputPath.value = ''
+  lastTranscriptionLogPath.value = ''
 
   try {
     const result = await invoke<TranscriptionResult>('start_transcription', {
@@ -908,14 +1044,22 @@ const startTranscription = async () => {
       },
     })
 
+    lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
     transcriptionSegments.value = result.segments
     transcriptionText.value = result.subtitleText
     lastOutputPath.value = result.outputPath
+    lastTranscriptionLogPath.value = result.logPath
+    transcriptionWarnings.value = result.warnings ?? []
     transcriptionProgress.value = 100
-    transcriptionMessage.value = `转录完成 · ${result.segments.length} 条字幕`
+    transcriptionStageProgress.value = markStageProgressDone(transcriptionStageProgress.value)
+    transcriptionMessage.value =
+      transcriptionWarnings.value.length > 0
+        ? `转录完成 · ${result.segments.length} 条字幕 · 部分 AI 处理保留原文`
+        : `转录完成 · ${result.segments.length} 条字幕`
   } catch (error) {
     transcriptionError.value = stringifyError(error)
     transcriptionMessage.value = '转录失败'
+    transcriptionStageProgress.value = markActiveStageFailed(transcriptionStageProgress.value)
   } finally {
     isTranscribing.value = false
   }
@@ -950,6 +1094,18 @@ const exportTranscription = async () => {
     })
     lastOutputPath.value = ensureSubtitleExtension(outputPath, selectedTranscriptionFormat.value)
     transcriptionMessage.value = '字幕已导出'
+  } catch (error) {
+    transcriptionError.value = stringifyError(error)
+  }
+}
+
+const openTranscriptionLog = async () => {
+  if (!lastTranscriptionLogPath.value || !isTauriRuntime()) {
+    return
+  }
+
+  try {
+    await revealItemInDir(lastTranscriptionLogPath.value)
   } catch (error) {
     transcriptionError.value = stringifyError(error)
   }
@@ -1012,8 +1168,35 @@ const registerProgressListener = async () => {
   }
 
   unlistenTranscriptionProgress = await listen<TranscriptionProgress>('transcription-progress', (event) => {
-    transcriptionProgress.value = Math.min(Math.max(Math.round(event.payload.progress), 0), 100)
-    transcriptionMessage.value = event.payload.message
+    const payload = event.payload
+
+    if (typeof payload.revision === 'number') {
+      if (payload.revision <= lastTranscriptionRevision.value) {
+        return
+      }
+
+      lastTranscriptionRevision.value = payload.revision
+      transcriptionProgress.value = clampProgress(payload.progress)
+      transcriptionMessage.value = payload.message
+      if (payload.stageProgress) {
+        transcriptionStageProgress.value = payload.stageProgress
+      }
+
+      if (payload.segments) {
+        transcriptionSegments.value = payload.segments
+      }
+
+      if (payload.warnings) {
+        transcriptionWarnings.value = payload.warnings
+      }
+      return
+    }
+
+    transcriptionProgress.value = clampProgress(payload.progress)
+    transcriptionMessage.value = payload.message
+    if (payload.stageProgress) {
+      transcriptionStageProgress.value = payload.stageProgress
+    }
   })
 }
 
@@ -1130,6 +1313,10 @@ const formatSegmentTime = (ms: number) => {
   const hours = Math.floor(totalMinutes / 60)
 
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`
+}
+
+const transcriptionSegmentStatusLabel = (status?: TranscriptionSegmentStatus) => {
+  return status ? transcriptionSegmentStatusLabels[status] : transcriptionSegmentStatusLabels.raw
 }
 
 const stringifyError = (error: unknown) => {

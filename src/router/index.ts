@@ -7,7 +7,7 @@ export default createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: '/', component: Home },
-    { path: '/translate', component: Translate },
+    { path: '/translate', component: Translate, meta: { keepAlive: true } },
     { path: '/settings', component: Settings },
   ],
 })

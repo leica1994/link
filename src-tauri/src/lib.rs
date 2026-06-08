@@ -1,11 +1,14 @@
 mod ai;
+mod app_log;
 mod settings;
+mod subtitle_ai;
 mod transcription;
 
 use ai::{check_llm_connection, AiService};
+use app_log::AppLogger;
 use settings::{load_settings, save_settings, SettingsStore};
-use transcription::{save_transcription_file, start_transcription};
 use tauri::Manager;
+use transcription::{save_transcription_file, start_transcription};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -25,7 +28,14 @@ pub fn run() {
                     error,
                 ))
             })?;
-            let ai_service = AiService::new(settings.translation_thread_count).map_err(|error| {
+            let ai_service =
+                AiService::new(settings.translation_thread_count).map_err(|error| {
+                    Box::<dyn std::error::Error>::from(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        error,
+                    ))
+                })?;
+            let app_logger = AppLogger::new(app.handle()).map_err(|error| {
                 Box::<dyn std::error::Error>::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     error,
@@ -33,6 +43,7 @@ pub fn run() {
             })?;
             app.manage(store);
             app.manage(ai_service);
+            app.manage(app_logger);
 
             Ok(())
         })

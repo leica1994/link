@@ -1,3 +1,7 @@
+use crate::ai::AiService;
+use crate::app_log::{AppLogger, LogSession};
+use crate::settings::{AppSettings, SettingsStore};
+use crate::subtitle_ai::{correct_subtitles, smart_segment_subtitles};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -14,8 +18,7 @@ const API_REQ_UPLOAD: &str = "https://member.bilibili.com/x/bcut/rubick-interfac
 const API_COMMIT_UPLOAD: &str =
     "https://member.bilibili.com/x/bcut/rubick-interface/resource/create/complete";
 const API_CREATE_TASK: &str = "https://member.bilibili.com/x/bcut/rubick-interface/task";
-const API_QUERY_RESULT: &str =
-    "https://member.bilibili.com/x/bcut/rubick-interface/task/result";
+const API_QUERY_RESULT: &str = "https://member.bilibili.com/x/bcut/rubick-interface/task/result";
 const BCUT_MODEL_ID_FOR_UPLOAD: &str = "8";
 const BCUT_MODEL_ID_FOR_RESULT: &str = "7";
 const CHUNK_THRESHOLD_MS: u64 = 2 * 60 * 60 * 1000;
@@ -41,11 +44,64 @@ pub struct TranscriptionRequest {
 pub struct TranscriptionProgress {
     pub progress: u8,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_progress: Option<TranscriptionStageProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<TranscriptionSegment>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionProgressStage {
+    pub progress: u8,
+    pub message: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionStageProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<TranscriptionProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_segmentation: Option<TranscriptionProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle_correction: Option<TranscriptionProgressStage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProgressStage {
+    Transcription,
+    SmartSegmentation,
+    SubtitleCorrection,
+}
+
+#[derive(Clone)]
+struct WorkflowProgress {
+    stages: std::sync::Arc<std::sync::Mutex<TranscriptionStageProgress>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptionSegment {
+    pub text: String,
+    pub start_time: u64,
+    pub end_time: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(skip_serializing)]
+    pub words: Vec<TranscriptionWord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionWord {
     pub text: String,
     pub start_time: u64,
     pub end_time: u64,
@@ -58,6 +114,8 @@ pub struct TranscriptionResult {
     pub subtitle_text: String,
     pub output_path: String,
     pub output_format: String,
+    pub log_path: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +197,73 @@ struct TranscriptionOptions {
     source_language: String,
 }
 
+struct RawTranscriptionResult {
+    segments: Vec<TranscriptionSegment>,
+    output_path: PathBuf,
+    output_format: SubtitleFormat,
+}
+
+struct SnapshotEmitter {
+    app: AppHandle,
+    revision: u64,
+    workflow_progress: WorkflowProgress,
+}
+
+impl SnapshotEmitter {
+    fn new(app: AppHandle, workflow_progress: WorkflowProgress) -> Self {
+        Self {
+            app,
+            revision: 0,
+            workflow_progress,
+        }
+    }
+
+    fn emit(&mut self, message: &str, segments: &[TranscriptionSegment], warnings: &[String]) {
+        self.revision += 1;
+        emit_progress_snapshot(
+            &self.app,
+            message,
+            self.workflow_progress.snapshot(),
+            self.revision,
+            segments,
+            warnings,
+        );
+    }
+}
+
+impl WorkflowProgress {
+    fn new(_app: AppHandle) -> Self {
+        Self {
+            stages: std::sync::Arc::new(std::sync::Mutex::new(
+                TranscriptionStageProgress::default(),
+            )),
+        }
+    }
+
+    fn set_stage(&self, stage: ProgressStage, progress: u8, message: &str, status: &str) {
+        if let Ok(mut stages) = self.stages.lock() {
+            let stage_progress = Some(TranscriptionProgressStage {
+                progress: progress.min(100),
+                message: message.to_string(),
+                status: status.to_string(),
+            });
+
+            match stage {
+                ProgressStage::Transcription => stages.transcription = stage_progress,
+                ProgressStage::SmartSegmentation => stages.smart_segmentation = stage_progress,
+                ProgressStage::SubtitleCorrection => stages.subtitle_correction = stage_progress,
+            }
+        }
+    }
+
+    fn snapshot(&self) -> TranscriptionStageProgress {
+        self.stages
+            .lock()
+            .map(|stages| stages.clone())
+            .unwrap_or_default()
+    }
+}
+
 trait TranscriptionStrategy {
     fn transcribe(
         &self,
@@ -190,8 +315,8 @@ impl BilibiliTranscriptionStrategy {
 
             let chunk_file_path = export_audio_clip(audio_path, chunk.start_ms, chunk.end_ms)?;
             let chunk_path: &Path = chunk_file_path.as_ref();
-            let chunk_bytes = fs::read(chunk_path)
-                .map_err(|error| format!("无法读取分段音频文件: {error}"))?;
+            let chunk_bytes =
+                fs::read(chunk_path).map_err(|error| format!("无法读取分段音频文件: {error}"))?;
 
             let progress_offset = index as u8 * (100 / chunk_count as u8).max(1);
             let progress_span = if index as u64 == chunk_count - 1 {
@@ -202,8 +327,7 @@ impl BilibiliTranscriptionStrategy {
 
             let mut chunk_utterances =
                 self.run_single_chunk(&chunk_bytes, progress_offset, progress_span, progress)?;
-            chunk_utterances =
-                self.fix_blob_utterances(chunk_path, chunk_utterances, progress)?;
+            chunk_utterances = self.fix_blob_utterances(chunk_path, chunk_utterances, progress)?;
 
             for utterance in &mut chunk_utterances {
                 offset_utterance(utterance, chunk.start_ms);
@@ -226,13 +350,7 @@ impl BilibiliTranscriptionStrategy {
         self.report_scaled_progress(progress, progress_offset, progress_span, 0, "上传中");
         let download_url = self.upload(audio_bytes)?;
 
-        self.report_scaled_progress(
-            progress,
-            progress_offset,
-            progress_span,
-            40,
-            "创建任务中",
-        );
+        self.report_scaled_progress(progress, progress_offset, progress_span, 40, "创建任务中");
         let task_id = self.create_task(&download_url)?;
 
         self.report_scaled_progress(progress, progress_offset, progress_span, 60, "正在转录");
@@ -347,10 +465,7 @@ impl BilibiliTranscriptionStrategy {
                 .client
                 .get(API_QUERY_RESULT)
                 .header(USER_AGENT, "Bilibili/1.0.0 (https://www.bilibili.com)")
-                .query(&[
-                    ("model_id", BCUT_MODEL_ID_FOR_RESULT),
-                    ("task_id", task_id),
-                ])
+                .query(&[("model_id", BCUT_MODEL_ID_FOR_RESULT), ("task_id", task_id)])
                 .send()
                 .and_then(|response| response.error_for_status())
                 .map_err(|error| format!("B站转录查询任务失败: {error}"))?
@@ -400,18 +515,11 @@ impl BilibiliTranscriptionStrategy {
             for (index, sub_chunk) in sub_chunks.iter().enumerate() {
                 progress(
                     0,
-                    &format!(
-                        "正在重新转录异常段落 {}/{}",
-                        index + 1,
-                        sub_chunk_count
-                    ),
+                    &format!("正在重新转录异常段落 {}/{}", index + 1, sub_chunk_count),
                 );
 
-                let sub_file_path = export_audio_clip(
-                    blob_path,
-                    sub_chunk.start_ms,
-                    sub_chunk.end_ms,
-                )?;
+                let sub_file_path =
+                    export_audio_clip(blob_path, sub_chunk.start_ms, sub_chunk.end_ms)?;
                 let sub_path: &Path = sub_file_path.as_ref();
                 let sub_bytes = fs::read(sub_path)
                     .map_err(|error| format!("无法读取异常段落音频文件: {error}"))?;
@@ -454,7 +562,10 @@ impl TranscriptionStrategy for BilibiliTranscriptionStrategy {
         }
 
         let duration_ms = probe_duration_ms(audio_path)?;
-        progress(0, &format!("音频时长 {:.1} 分钟", duration_ms as f64 / 60000.0));
+        progress(
+            0,
+            &format!("音频时长 {:.1} 分钟", duration_ms as f64 / 60000.0),
+        );
 
         let mut utterances = self.run_chunks(audio_path, duration_ms, progress)?;
         utterances.sort_by_key(|utterance| utterance.start_time);
@@ -466,10 +577,30 @@ impl TranscriptionStrategy for BilibiliTranscriptionStrategy {
                 if text.is_empty() {
                     None
                 } else {
+                    let words = utterance
+                        .words
+                        .into_iter()
+                        .filter_map(|word| {
+                            let text = word.label.trim().to_string();
+                            if text.is_empty() {
+                                None
+                            } else {
+                                Some(TranscriptionWord {
+                                    text,
+                                    start_time: word.start_time,
+                                    end_time: word.end_time,
+                                })
+                            }
+                        })
+                        .collect();
+
                     Some(TranscriptionSegment {
                         text,
                         start_time: utterance.start_time,
                         end_time: utterance.end_time,
+                        uid: String::new(),
+                        status: String::new(),
+                        words,
                     })
                 }
             })
@@ -483,11 +614,268 @@ impl TranscriptionStrategy for BilibiliTranscriptionStrategy {
 #[tauri::command]
 pub async fn start_transcription(
     app: AppHandle,
+    settings_store: tauri::State<'_, SettingsStore>,
+    ai_service: tauri::State<'_, AiService>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: TranscriptionRequest,
 ) -> Result<TranscriptionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || run_transcription(app, request))
-        .await
-        .map_err(|error| format!("转录任务执行失败: {error}"))?
+    let log_session = app_logger.start_session("transcription")?;
+    log_session.info(
+        "request_received",
+        "收到转录请求",
+        json!({
+            "filePath": &request.file_path,
+            "model": &request.model,
+            "sourceLanguage": &request.source_language,
+            "outputFormat": &request.output_format,
+        }),
+    );
+
+    let settings = settings_store.load()?;
+    log_transcription_settings(&log_session, &settings);
+
+    let workflow_progress = WorkflowProgress::new(app.clone());
+    workflow_progress.set_stage(ProgressStage::Transcription, 0, "准备转录", "active");
+    if settings.is_smart_segmentation_enabled {
+        workflow_progress.set_stage(
+            ProgressStage::SmartSegmentation,
+            0,
+            "等待语音转录完成",
+            "pending",
+        );
+    }
+    if settings.is_subtitle_correction_enabled {
+        workflow_progress.set_stage(
+            ProgressStage::SubtitleCorrection,
+            0,
+            "等待前置处理完成",
+            "pending",
+        );
+    }
+    emit_progress_event(
+        &app,
+        0,
+        "准备转录",
+        Some(workflow_progress.snapshot()),
+        None,
+        None,
+        &[],
+    );
+
+    let transcription_app = app.clone();
+    let raw_log_session = log_session.clone();
+    let raw_workflow_progress = workflow_progress.clone();
+    let raw_result = match tauri::async_runtime::spawn_blocking(move || {
+        run_transcription(
+            transcription_app,
+            request,
+            raw_log_session,
+            raw_workflow_progress,
+        )
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            log_session.error("asr_failed", "语音转录阶段失败", json!({ "error": &error }));
+            return Err(error);
+        }
+        Err(error) => {
+            let message = format!("转录任务执行失败: {error}");
+            log_session.error(
+                "asr_task_join_failed",
+                "转录任务线程执行失败",
+                json!({ "error": error.to_string() }),
+            );
+            return Err(message);
+        }
+    };
+
+    let mut segments = raw_result.segments;
+    let mut warnings = Vec::new();
+    let mut emitter = SnapshotEmitter::new(app.clone(), workflow_progress.clone());
+
+    assign_segment_metadata(&mut segments, "raw", "raw");
+    workflow_progress.set_stage(ProgressStage::Transcription, 100, "语音转录完成", "done");
+    emitter.emit("语音转录完成", &segments, &warnings);
+    log_session.info(
+        "asr_completed",
+        "语音转录完成",
+        json!({
+            "segmentCount": segments.len(),
+            "outputPath": raw_result.output_path.to_string_lossy(),
+        }),
+    );
+
+    if settings.is_smart_segmentation_enabled {
+        workflow_progress.set_stage(
+            ProgressStage::SmartSegmentation,
+            0,
+            "AI 智能断句中",
+            "active",
+        );
+        emit_progress_event(
+            &app,
+            overall_progress(&workflow_progress.snapshot()),
+            "AI 智能断句中",
+            Some(workflow_progress.snapshot()),
+            None,
+            None,
+            &warnings,
+        );
+        log_session.info(
+            "smart_segmentation_start",
+            "开始 AI 智能断句",
+            json!({ "segmentCount": segments.len() }),
+        );
+        let mut report_snapshot = |progress: u8,
+                                   message: &str,
+                                   snapshot_segments: &[TranscriptionSegment],
+                                   snapshot_warnings: &[String]| {
+            let status = if progress >= 100 { "done" } else { "active" };
+            workflow_progress.set_stage(
+                ProgressStage::SmartSegmentation,
+                progress,
+                message,
+                status,
+            );
+            emitter.emit(message, snapshot_segments, snapshot_warnings);
+        };
+        let segmentation_result = smart_segment_subtitles(
+            &settings,
+            &ai_service,
+            &log_session,
+            segments,
+            &mut report_snapshot,
+        )
+        .await;
+        segments = segmentation_result.segments;
+        warnings.extend(segmentation_result.warnings);
+        workflow_progress.set_stage(
+            ProgressStage::SmartSegmentation,
+            100,
+            "AI 智能断句完成",
+            "done",
+        );
+        log_session.info(
+            "smart_segmentation_completed",
+            "AI 智能断句完成",
+            json!({
+                "segmentCount": segments.len(),
+                "warningCount": warnings.len(),
+            }),
+        );
+    }
+
+    if settings.is_subtitle_correction_enabled {
+        let previous_warnings = warnings.clone();
+        workflow_progress.set_stage(
+            ProgressStage::SubtitleCorrection,
+            0,
+            "AI 字幕校正中",
+            "active",
+        );
+        emit_progress_event(
+            &app,
+            overall_progress(&workflow_progress.snapshot()),
+            "AI 字幕校正中",
+            Some(workflow_progress.snapshot()),
+            None,
+            None,
+            &warnings,
+        );
+        log_session.info(
+            "subtitle_correction_start",
+            "开始 AI 字幕校正",
+            json!({
+                "segmentCount": segments.len(),
+                "batchSize": settings.translation_batch_size.max(1),
+            }),
+        );
+        let mut report_snapshot = |progress: u8,
+                                   message: &str,
+                                   snapshot_segments: &[TranscriptionSegment],
+                                   snapshot_warnings: &[String]| {
+            let mut combined_warnings = previous_warnings.clone();
+            combined_warnings.extend(snapshot_warnings.iter().cloned());
+            let status = if progress >= 100 { "done" } else { "active" };
+            workflow_progress.set_stage(
+                ProgressStage::SubtitleCorrection,
+                progress,
+                message,
+                status,
+            );
+            emitter.emit(message, snapshot_segments, &combined_warnings);
+        };
+        let correction_result = correct_subtitles(
+            &settings,
+            &ai_service,
+            &log_session,
+            segments,
+            &mut report_snapshot,
+        )
+        .await;
+        segments = correction_result.segments;
+        warnings.extend(correction_result.warnings);
+        workflow_progress.set_stage(
+            ProgressStage::SubtitleCorrection,
+            100,
+            "AI 字幕校正完成",
+            "done",
+        );
+        log_session.info(
+            "subtitle_correction_completed",
+            "AI 字幕校正完成",
+            json!({
+                "segmentCount": segments.len(),
+                "warningCount": warnings.len(),
+            }),
+        );
+    }
+
+    mark_segments_status(&mut segments, "done");
+    let subtitle_text = serialize_subtitle(&segments, raw_result.output_format);
+    if let Err(error) = fs::write(&raw_result.output_path, &subtitle_text) {
+        log_session.error(
+            "subtitle_save_failed",
+            "无法保存字幕文件",
+            json!({
+                "outputPath": raw_result.output_path.to_string_lossy(),
+                "error": error.to_string(),
+            }),
+        );
+        return Err(format!("无法保存字幕文件: {error}"));
+    }
+    log_session.info(
+        "subtitle_saved",
+        "字幕文件已保存",
+        json!({
+            "outputPath": raw_result.output_path.to_string_lossy(),
+            "outputFormat": raw_result.output_format.to_string(),
+            "segmentCount": segments.len(),
+            "warningCount": warnings.len(),
+        }),
+    );
+
+    emitter.emit("转录完成", &segments, &warnings);
+    log_session.info(
+        "transcription_completed",
+        "转录流程完成",
+        json!({
+            "segmentCount": segments.len(),
+            "warningCount": warnings.len(),
+            "logPath": log_session.path_string(),
+        }),
+    );
+
+    Ok(TranscriptionResult {
+        segments,
+        subtitle_text,
+        output_path: raw_result.output_path.to_string_lossy().to_string(),
+        output_format: raw_result.output_format.to_string(),
+        log_path: log_session.path_string(),
+        warnings,
+    })
 }
 
 #[tauri::command]
@@ -500,54 +888,177 @@ pub fn save_transcription_file(path: String, content: String) -> Result<(), Stri
     fs::write(&output_path, content).map_err(|error| format!("无法保存字幕文件: {error}"))
 }
 
+fn log_transcription_settings(log_session: &LogSession, settings: &AppSettings) {
+    let llm_config = settings.llm_configs.get(&settings.selected_llm_service);
+    log_session.info(
+        "settings_loaded",
+        "已加载转录相关设置",
+        json!({
+            "transcriptionModel": &settings.transcription_model,
+            "sourceLanguage": &settings.source_language,
+            "transcriptionFormat": &settings.transcription_format,
+            "smartSegmentationEnabled": settings.is_smart_segmentation_enabled,
+            "subtitleCorrectionEnabled": settings.is_subtitle_correction_enabled,
+            "videoContentType": &settings.video_content_type,
+            "translationBatchSize": settings.translation_batch_size,
+            "translationThreadCount": settings.translation_thread_count,
+            "selectedLlmService": &settings.selected_llm_service,
+            "llmBaseUrl": llm_config.map(|config| config.base_url.as_str()).unwrap_or(""),
+            "llmModel": llm_config.map(|config| config.model.as_str()).unwrap_or(""),
+            "llmReasoningEffort": llm_config
+                .map(|config| config.reasoning_effort.as_str())
+                .unwrap_or(""),
+            "llmStreaming": llm_config.map(|config| config.is_streaming).unwrap_or(false),
+        }),
+    );
+}
+
 fn run_transcription(
     app: AppHandle,
     request: TranscriptionRequest,
-) -> Result<TranscriptionResult, String> {
+    log_session: LogSession,
+    workflow_progress: WorkflowProgress,
+) -> Result<RawTranscriptionResult, String> {
     let input_path = PathBuf::from(&request.file_path);
     if !input_path.is_file() {
+        log_session.error(
+            "input_file_missing",
+            "视频文件不存在",
+            json!({ "filePath": input_path.to_string_lossy() }),
+        );
         return Err("视频文件不存在".to_string());
     }
 
     let output_format = normalize_subtitle_format(&request.output_format);
-    let output_path = default_output_path(&input_path, output_format)?;
-    let audio_file = NamedTempFile::new()
-        .map_err(|error| format!("无法创建临时音频文件: {error}"))?
-        .into_temp_path()
-        .with_extension("wav");
+    let output_path = match default_output_path(&input_path, output_format) {
+        Ok(output_path) => output_path,
+        Err(error) => {
+            log_session.error(
+                "output_path_prepare_failed",
+                "无法准备字幕输出路径",
+                json!({
+                    "inputPath": input_path.to_string_lossy(),
+                    "error": &error,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    log_session.info(
+        "asr_prepare",
+        "准备语音转录",
+        json!({
+            "inputPath": input_path.to_string_lossy(),
+            "outputPath": output_path.to_string_lossy(),
+            "outputFormat": output_format.to_string(),
+        }),
+    );
+    let audio_file = match NamedTempFile::new() {
+        Ok(file) => file.into_temp_path().with_extension("wav"),
+        Err(error) => {
+            log_session.error(
+                "temp_audio_create_failed",
+                "无法创建临时音频文件",
+                json!({ "error": error.to_string() }),
+            );
+            return Err(format!("无法创建临时音频文件: {error}"));
+        }
+    };
 
-    emit_progress(&app, 5, "转换音频中");
-    convert_media_to_audio(&input_path, &audio_file)?;
+    emit_progress(&app, &workflow_progress, 5, "转换音频中");
+    log_session.info(
+        "audio_conversion_start",
+        "开始转换音频",
+        json!({
+            "inputPath": input_path.to_string_lossy(),
+            "tempAudioPath": audio_file.to_string_lossy(),
+        }),
+    );
+    if let Err(error) = convert_media_to_audio(&input_path, &audio_file) {
+        log_session.error(
+            "audio_conversion_failed",
+            "音频转换失败",
+            json!({ "error": &error }),
+        );
+        return Err(error);
+    }
+    log_session.info(
+        "audio_conversion_completed",
+        "音频转换完成",
+        json!({ "tempAudioPath": audio_file.to_string_lossy() }),
+    );
 
-    emit_progress(&app, 20, "语音转录中");
+    emit_progress(&app, &workflow_progress, 10, "语音转录中");
 
-    let strategy = create_strategy(&request.model)?;
+    let strategy = match create_strategy(&request.model) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            log_session.error(
+                "asr_strategy_create_failed",
+                "转录模型创建失败",
+                json!({
+                    "model": &request.model,
+                    "error": &error,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    log_session.info(
+        "asr_strategy_created",
+        "转录模型已创建",
+        json!({
+            "model": &request.model,
+            "sourceLanguage": &request.source_language,
+        }),
+    );
     let options = TranscriptionOptions {
         source_language: request.source_language.clone(),
     };
     let mut progress_callback = |progress: u8, message: &str| {
-        let scaled = 20_u8.saturating_add(((progress as u16 * 80) / 100) as u8);
-        emit_progress(&app, scaled.min(100), message);
+        let scaled = 10_u8.saturating_add(((progress as u16 * 90) / 100) as u8);
+        emit_progress(&app, &workflow_progress, scaled.min(100), message);
     };
 
-    let segments = strategy.transcribe(&audio_file, &options, &mut progress_callback)?;
+    let segments = match strategy.transcribe(&audio_file, &options, &mut progress_callback) {
+        Ok(segments) => segments,
+        Err(error) => {
+            log_session.error(
+                "asr_provider_failed",
+                "转录服务执行失败",
+                json!({ "error": &error }),
+            );
+            return Err(error);
+        }
+    };
 
     if segments.is_empty() {
+        log_session.error("asr_empty_result", "转录结果为空", json!({}));
         return Err("转录结果为空，请检查音频文件".to_string());
     }
 
-    let subtitle_text = serialize_subtitle(&segments, output_format);
-    fs::write(&output_path, &subtitle_text).map_err(|error| format!("无法保存字幕文件: {error}"))?;
+    emit_progress(&app, &workflow_progress, 100, "语音转录完成");
+    log_session.info(
+        "asr_provider_completed",
+        "转录服务返回字幕",
+        json!({ "segmentCount": segments.len() }),
+    );
 
-    emit_progress(&app, 100, "转录完成");
+    if let Err(error) = fs::remove_file(&audio_file) {
+        log_session.warn(
+            "temp_audio_cleanup_failed",
+            "临时音频文件清理失败",
+            json!({
+                "tempAudioPath": audio_file.to_string_lossy(),
+                "error": error.to_string(),
+            }),
+        );
+    }
 
-    let _ = fs::remove_file(&audio_file);
-
-    Ok(TranscriptionResult {
+    Ok(RawTranscriptionResult {
         segments,
-        subtitle_text,
-        output_path: output_path.to_string_lossy().to_string(),
-        output_format: output_format.to_string(),
+        output_path,
+        output_format,
     })
 }
 
@@ -558,14 +1069,105 @@ fn create_strategy(model: &str) -> Result<Box<dyn TranscriptionStrategy + Send>,
     }
 }
 
-fn emit_progress(app: &AppHandle, progress: u8, message: &str) {
+fn emit_progress(
+    app: &AppHandle,
+    workflow_progress: &WorkflowProgress,
+    progress: u8,
+    message: &str,
+) {
+    workflow_progress.set_stage(
+        ProgressStage::Transcription,
+        progress,
+        message,
+        if progress >= 100 { "done" } else { "active" },
+    );
+    emit_progress_event(
+        app,
+        progress,
+        message,
+        Some(workflow_progress.snapshot()),
+        None,
+        None,
+        &[],
+    );
+}
+
+fn emit_progress_snapshot(
+    app: &AppHandle,
+    message: &str,
+    stage_progress: TranscriptionStageProgress,
+    revision: u64,
+    segments: &[TranscriptionSegment],
+    warnings: &[String],
+) {
+    let progress = overall_progress(&stage_progress);
+    emit_progress_event(
+        app,
+        progress,
+        message,
+        Some(stage_progress),
+        Some(revision),
+        Some(segments.to_vec()),
+        warnings,
+    );
+}
+
+fn emit_progress_event(
+    app: &AppHandle,
+    progress: u8,
+    message: &str,
+    stage_progress: Option<TranscriptionStageProgress>,
+    revision: Option<u64>,
+    segments: Option<Vec<TranscriptionSegment>>,
+    warnings: &[String],
+) {
     let _ = app.emit(
         PROGRESS_EVENT,
         TranscriptionProgress {
             progress,
             message: message.to_string(),
+            stage_progress,
+            revision,
+            segments,
+            warnings: warnings.to_vec(),
         },
     );
+}
+
+fn overall_progress(stages: &TranscriptionStageProgress) -> u8 {
+    let visible = [
+        stages.transcription.as_ref(),
+        stages.smart_segmentation.as_ref(),
+        stages.subtitle_correction.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if visible.is_empty() {
+        return 0;
+    }
+
+    let total = visible
+        .iter()
+        .map(|stage| stage.progress as u16)
+        .sum::<u16>();
+    (total / visible.len() as u16).min(100) as u8
+}
+
+fn assign_segment_metadata(segments: &mut [TranscriptionSegment], uid_prefix: &str, status: &str) {
+    for (index, segment) in segments.iter_mut().enumerate() {
+        if segment.uid.is_empty() {
+            segment.uid = format!("{uid_prefix}-{index}");
+        }
+        segment.status = status.to_string();
+    }
+}
+
+fn mark_segments_status(segments: &mut [TranscriptionSegment], status: &str) {
+    for segment in segments {
+        segment.status = status.to_string();
+    }
 }
 
 fn convert_media_to_audio(input_path: &Path, output_path: &Path) -> Result<(), String> {
@@ -730,7 +1332,9 @@ fn find_smart_split_point(audio_path: &Path, duration_ms: u64, target_ms: u64) -
         .arg("-i")
         .arg(audio_path)
         .arg("-af")
-        .arg(format!("silencedetect=noise={silence_threshold_db:.1}dB:d=0.3"))
+        .arg(format!(
+            "silencedetect=noise={silence_threshold_db:.1}dB:d=0.3"
+        ))
         .arg("-f")
         .arg("null")
         .arg("-");
@@ -741,7 +1345,11 @@ fn find_smart_split_point(audio_path: &Path, duration_ms: u64, target_ms: u64) -
         command.creation_flags(0x08000000);
     }
 
-    let output = match command.stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
+    let output = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
         Ok(output) => output,
         Err(_) => return target_ms,
     };
@@ -788,7 +1396,11 @@ fn probe_mean_volume_db(audio_path: &Path, start_ms: u64, duration_ms: u64) -> O
         command.creation_flags(0x08000000);
     }
 
-    let output = command.stdout(Stdio::piped()).stderr(Stdio::piped()).output().ok()?;
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1022,7 +1634,5 @@ fn ms_to_ass_time(ms: u64) -> String {
 }
 
 fn escape_ass_text(text: &str) -> String {
-    text.replace('\n', "\\N")
-        .replace('{', "")
-        .replace('}', "")
+    text.replace('\n', "\\N").replace('{', "").replace('}', "")
 }

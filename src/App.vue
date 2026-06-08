@@ -4,7 +4,12 @@
     <div class="app-body">
       <Sidebar />
       <main class="app-content">
-        <RouterView />
+        <RouterView v-slot="{ Component, route }">
+          <KeepAlive>
+            <component :is="Component" v-if="route.meta.keepAlive" />
+          </KeepAlive>
+          <component :is="Component" v-if="!route.meta.keepAlive" />
+        </RouterView>
       </main>
     </div>
   </div>

@@ -83,7 +83,11 @@ impl SettingsStore {
                 "bilibili",
             ),
             source_language: read_string_setting(&setting_values, "source_language", "auto"),
-            transcription_format: read_string_setting(&setting_values, "transcription_format", "srt"),
+            transcription_format: read_string_setting(
+                &setting_values,
+                "transcription_format",
+                "srt",
+            ),
             translation_format: read_string_setting(&setting_values, "translation_format", "srt"),
             is_smart_segmentation_enabled: read_bool_setting(
                 &setting_values,

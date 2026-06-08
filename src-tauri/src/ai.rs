@@ -3,14 +3,21 @@ use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
+use tokio::time::sleep;
 
 const MIN_AI_CONCURRENCY: usize = 1;
 const MAX_AI_CONCURRENCY: usize = 100;
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "chat/completions";
 const OPENAI_RESPONSES_PATH: &str = "responses";
 const ANTHROPIC_MESSAGES_PATH: &str = "messages";
+const DEFAULT_AI_REQUEST_ATTEMPTS: usize = 3;
+const RATE_LIMIT_BACKOFF_MIN_SECONDS: u64 = 15;
+const RATE_LIMIT_BACKOFF_MAX_SECONDS: u64 = 90;
+const RAW_RESPONSE_LOG_CHARS: usize = 8_000;
+const DEFAULT_AI_CONNECT_TIMEOUT_SECONDS: u64 = 60;
+const CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const TEST_SYSTEM_PROMPT: &str = "你是一个连接测试助手。";
 const TEST_USER_PROMPT: &str = "请只回复 OK。";
 
@@ -28,6 +35,9 @@ struct AiChatRequest {
     system_prompt: String,
     user_prompt: String,
     max_output_tokens: u32,
+    temperature: Option<f32>,
+    force_non_streaming: bool,
+    disable_reasoning: bool,
 }
 
 #[derive(Debug)]
@@ -50,19 +60,22 @@ struct AiPermit {
 pub struct AiService {
     client: reqwest::Client,
     limiter: Arc<AiConcurrencyLimiter>,
+    connection_check_timeout: Duration,
+    rate_limit_cooldown_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AiService {
     pub fn new(thread_count: u32) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(DEFAULT_AI_CONNECT_TIMEOUT_SECONDS))
             .build()
             .map_err(|error| format!("无法初始化 AI 客户端: {error}"))?;
 
         Ok(Self {
             client,
             limiter: Arc::new(AiConcurrencyLimiter::new(thread_count)),
+            connection_check_timeout: Duration::from_secs(CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS),
+            rate_limit_cooldown_until: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -75,14 +88,22 @@ impl AiService {
         settings: &AppSettings,
     ) -> Result<LlmConnectionCheckResult, String> {
         let started_at = Instant::now();
-        let response = self
-            .chat(
+        let response = tokio::time::timeout(
+            self.connection_check_timeout,
+            self.chat_for_connection_check(
                 settings,
                 TEST_SYSTEM_PROMPT.to_string(),
                 TEST_USER_PROMPT.to_string(),
                 16,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "LLM 连接检查超时（{} 秒）",
+                self.connection_check_timeout.as_secs()
             )
-            .await?;
+        })??;
         let latency_ms = started_at.elapsed().as_millis();
         let (service, config) = selected_llm_config(settings)?;
 
@@ -94,6 +115,7 @@ impl AiService {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn chat(
         &self,
         settings: &AppSettings,
@@ -106,9 +128,58 @@ impl AiService {
             system_prompt,
             user_prompt,
             max_output_tokens,
+            temperature: None,
+            force_non_streaming: false,
+            disable_reasoning: false,
         };
 
-        self.send_chat(service, config, &request).await
+        self.send_chat(service, config, &request, None).await
+    }
+
+    pub async fn chat_for_structured_output(
+        &self,
+        settings: &AppSettings,
+        system_prompt: String,
+        user_prompt: String,
+        max_output_tokens: u32,
+    ) -> Result<String, String> {
+        let (service, config) = selected_llm_config(settings)?;
+        let request = AiChatRequest {
+            system_prompt,
+            user_prompt,
+            max_output_tokens,
+            temperature: Some(0.2),
+            force_non_streaming: true,
+            disable_reasoning: false,
+        };
+
+        self.send_chat(service, config, &request, None).await
+    }
+
+    async fn chat_for_connection_check(
+        &self,
+        settings: &AppSettings,
+        system_prompt: String,
+        user_prompt: String,
+        max_output_tokens: u32,
+    ) -> Result<String, String> {
+        let (service, config) = selected_llm_config(settings)?;
+        let request = AiChatRequest {
+            system_prompt,
+            user_prompt,
+            max_output_tokens,
+            temperature: None,
+            force_non_streaming: true,
+            disable_reasoning: true,
+        };
+
+        self.send_chat(
+            service,
+            config,
+            &request,
+            Some(self.connection_check_timeout),
+        )
+        .await
     }
 
     async fn send_chat(
@@ -116,25 +187,102 @@ impl AiService {
         service: &str,
         config: &LlmConfig,
         request: &AiChatRequest,
+        request_timeout: Option<Duration>,
     ) -> Result<String, String> {
         validate_llm_config(config)?;
 
-        let _permit = self.limiter.clone().acquire().await?;
+        let mut last_error = String::new();
 
-        match service {
-            "openai" => self.send_openai_chat_completion(config, request).await,
-            "openai-responses" => self.send_openai_response(config, request).await,
-            "anthropic" => self.send_anthropic_message(config, request).await,
-            _ => Err(format!("暂不支持该 LLM 服务: {service}")),
+        for attempt in 1..=DEFAULT_AI_REQUEST_ATTEMPTS {
+            self.wait_for_rate_limit_cooldown().await?;
+
+            let result = {
+                let _permit = self.limiter.clone().acquire().await?;
+                match service {
+                    "openai" => {
+                        self.send_openai_chat_completion(config, request, request_timeout)
+                            .await
+                    }
+                    "openai-responses" => {
+                        self.send_openai_response(config, request, request_timeout)
+                            .await
+                    }
+                    "anthropic" => {
+                        self.send_anthropic_message(config, request, request_timeout)
+                            .await
+                    }
+                    _ => return Err(format!("暂不支持该 LLM 服务: {service}")),
+                }
+            };
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = error;
+                    if attempt < DEFAULT_AI_REQUEST_ATTEMPTS {
+                        let delay = retry_delay(attempt, &last_error);
+                        if is_rate_limit_error(&last_error) {
+                            self.extend_rate_limit_cooldown(delay)?;
+                        }
+                        sleep(delay).await;
+                        continue;
+                    }
+                }
+            }
         }
+
+        Err(format!(
+            "LLM 请求失败，已尝试 {} 次: {}",
+            DEFAULT_AI_REQUEST_ATTEMPTS, last_error
+        ))
+    }
+
+    async fn wait_for_rate_limit_cooldown(&self) -> Result<(), String> {
+        loop {
+            let delay = {
+                let guard = self
+                    .rate_limit_cooldown_until
+                    .lock()
+                    .map_err(|error| format!("AI 限流冷却锁定失败: {error}"))?;
+
+                guard
+                    .and_then(|until| until.checked_duration_since(Instant::now()))
+                    .unwrap_or_default()
+            };
+
+            if delay.is_zero() {
+                return Ok(());
+            }
+
+            sleep(delay).await;
+        }
+    }
+
+    fn extend_rate_limit_cooldown(&self, delay: Duration) -> Result<(), String> {
+        let cooldown_until = Instant::now() + delay;
+        let mut guard = self
+            .rate_limit_cooldown_until
+            .lock()
+            .map_err(|error| format!("AI 限流冷却锁定失败: {error}"))?;
+
+        if guard
+            .map(|current| cooldown_until > current)
+            .unwrap_or(true)
+        {
+            *guard = Some(cooldown_until);
+        }
+
+        Ok(())
     }
 
     async fn send_openai_chat_completion(
         &self,
         config: &LlmConfig,
         request: &AiChatRequest,
+        request_timeout: Option<Duration>,
     ) -> Result<String, String> {
-        let payload = json!({
+        let is_streaming = is_streaming_enabled(config, request);
+        let mut payload = json!({
             "model": config.model.trim(),
             "messages": [
                 {
@@ -146,49 +294,77 @@ impl AiService {
                     "content": request.user_prompt.as_str(),
                 },
             ],
-            "stream": false,
+            "stream": is_streaming,
             "max_tokens": request.max_output_tokens,
         });
-        let value = self
-            .post_json(
-                &api_url(&config.base_url, OPENAI_CHAT_COMPLETIONS_PATH),
-                openai_headers(&config.api_key)?,
-                &payload,
-            )
-            .await?;
 
-        parse_openai_chat_completion_text(&value)
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+
+        if let Some(effort) = openai_chat_reasoning_effort(config, request) {
+            payload["reasoning_effort"] = json!(effort);
+        }
+
+        let url = api_url(&config.base_url, OPENAI_CHAT_COMPLETIONS_PATH);
+        let headers = openai_headers(&config.api_key)?;
+
+        if is_streaming {
+            let body = self
+                .post_text(&url, headers, &payload, request_timeout)
+                .await?;
+            parse_openai_chat_completion_stream_text(&body, !request.disable_reasoning)
+        } else {
+            let value = self
+                .post_json(&url, headers, &payload, request_timeout)
+                .await?;
+            parse_openai_chat_completion_text(&value, !request.disable_reasoning)
+        }
     }
 
     async fn send_openai_response(
         &self,
         config: &LlmConfig,
         request: &AiChatRequest,
+        request_timeout: Option<Duration>,
     ) -> Result<String, String> {
-        let payload = json!({
+        let is_streaming = is_streaming_enabled(config, request);
+        let mut payload = json!({
             "model": config.model.trim(),
             "instructions": request.system_prompt.as_str(),
             "input": request.user_prompt.as_str(),
-            "stream": false,
+            "stream": is_streaming,
             "max_output_tokens": request.max_output_tokens,
         });
-        let value = self
-            .post_json(
-                &api_url(&config.base_url, OPENAI_RESPONSES_PATH),
-                openai_headers(&config.api_key)?,
-                &payload,
-            )
-            .await?;
 
-        parse_openai_response_text(&value)
+        if let Some(effort) = openai_responses_reasoning_effort(config, request) {
+            payload["reasoning"] = json!({ "effort": effort });
+        }
+
+        let url = api_url(&config.base_url, OPENAI_RESPONSES_PATH);
+        let headers = openai_headers(&config.api_key)?;
+
+        if is_streaming {
+            let body = self
+                .post_text(&url, headers, &payload, request_timeout)
+                .await?;
+            parse_openai_response_stream_text(&body)
+        } else {
+            let value = self
+                .post_json(&url, headers, &payload, request_timeout)
+                .await?;
+            parse_openai_response_text(&value)
+        }
     }
 
     async fn send_anthropic_message(
         &self,
         config: &LlmConfig,
         request: &AiChatRequest,
+        request_timeout: Option<Duration>,
     ) -> Result<String, String> {
-        let payload = json!({
+        let is_streaming = is_streaming_enabled(config, request);
+        let mut payload = json!({
             "model": config.model.trim(),
             "system": request.system_prompt.as_str(),
             "messages": [
@@ -197,18 +373,31 @@ impl AiService {
                     "content": request.user_prompt.as_str(),
                 },
             ],
-            "stream": false,
+            "stream": is_streaming,
             "max_tokens": request.max_output_tokens,
         });
-        let value = self
-            .post_json(
-                &api_url(&config.base_url, ANTHROPIC_MESSAGES_PATH),
-                anthropic_headers(&config.api_key)?,
-                &payload,
-            )
-            .await?;
 
-        parse_anthropic_message_text(&value)
+        if let Some(effort) = anthropic_reasoning_effort(config, request) {
+            payload["thinking"] = json!({
+                "type": "adaptive",
+            });
+            payload["output_config"] = json!({ "effort": effort });
+        }
+
+        let url = api_url(&config.base_url, ANTHROPIC_MESSAGES_PATH);
+        let headers = anthropic_headers(&config.api_key)?;
+
+        if is_streaming {
+            let body = self
+                .post_text(&url, headers, &payload, request_timeout)
+                .await?;
+            parse_anthropic_message_stream_text(&body)
+        } else {
+            let value = self
+                .post_json(&url, headers, &payload, request_timeout)
+                .await?;
+            parse_anthropic_message_text(&value)
+        }
     }
 
     async fn post_json(
@@ -216,15 +405,34 @@ impl AiService {
         url: &str,
         headers: HeaderMap,
         payload: &Value,
+        request_timeout: Option<Duration>,
     ) -> Result<Value, String> {
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(payload)
-            .send()
-            .await
-            .map_err(|error| format!("LLM 请求失败: {error}"))?;
+        let body = self
+            .post_text(url, headers, payload, request_timeout)
+            .await?;
+
+        serde_json::from_str(&body).map_err(|error| {
+            format!(
+                "LLM 响应解析失败: {error}; 原始响应: {}",
+                truncate_text(&body, RAW_RESPONSE_LOG_CHARS)
+            )
+        })
+    }
+
+    async fn post_text(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        payload: &Value,
+        request_timeout: Option<Duration>,
+    ) -> Result<String, String> {
+        let mut request_builder = self.client.post(url).headers(headers).json(payload);
+
+        if let Some(request_timeout) = request_timeout {
+            request_builder = request_builder.timeout(request_timeout);
+        }
+
+        let response = request_builder.send().await.map_err(format_request_error)?;
 
         let status = response.status();
         let body = response
@@ -236,11 +444,11 @@ impl AiService {
             return Err(format!(
                 "LLM 请求失败（HTTP {}）: {}",
                 status.as_u16(),
-                truncate_text(&body, 500)
+                truncate_text(&body, RAW_RESPONSE_LOG_CHARS)
             ));
         }
 
-        serde_json::from_str(&body).map_err(|error| format!("LLM 响应解析失败: {error}"))
+        Ok(body)
     }
 }
 
@@ -300,9 +508,7 @@ impl Drop for AiPermit {
     }
 }
 
-fn selected_llm_config<'a>(
-    settings: &'a AppSettings,
-) -> Result<(&'a str, &'a LlmConfig), String> {
+fn selected_llm_config<'a>(settings: &'a AppSettings) -> Result<(&'a str, &'a LlmConfig), String> {
     let service = settings.selected_llm_service.trim();
     let config = settings
         .llm_configs
@@ -332,8 +538,120 @@ fn normalize_thread_count(thread_count: u32) -> usize {
     (thread_count as usize).clamp(MIN_AI_CONCURRENCY, MAX_AI_CONCURRENCY)
 }
 
+fn is_streaming_enabled(config: &LlmConfig, request: &AiChatRequest) -> bool {
+    config.is_streaming && !request.force_non_streaming
+}
+
+fn openai_chat_reasoning_effort(
+    config: &LlmConfig,
+    request: &AiChatRequest,
+) -> Option<&'static str> {
+    openai_reasoning_effort(config, request)
+}
+
+fn openai_responses_reasoning_effort(
+    config: &LlmConfig,
+    request: &AiChatRequest,
+) -> Option<&'static str> {
+    openai_reasoning_effort(config, request)
+}
+
+fn openai_reasoning_effort(config: &LlmConfig, request: &AiChatRequest) -> Option<&'static str> {
+    if request.disable_reasoning {
+        return None;
+    }
+
+    match config.reasoning_effort.trim() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "ultra-high" => Some("xhigh"),
+        _ => None,
+    }
+}
+
+fn anthropic_reasoning_effort(config: &LlmConfig, request: &AiChatRequest) -> Option<&'static str> {
+    if request.disable_reasoning {
+        return None;
+    }
+
+    match config.reasoning_effort.trim() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "ultra-high" => Some("max"),
+        _ => None,
+    }
+}
+
+fn retry_delay(attempt: usize, error: &str) -> Duration {
+    if is_rate_limit_error(error) {
+        let exponential_seconds = RATE_LIMIT_BACKOFF_MIN_SECONDS
+            .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1) as u32))
+            .min(RATE_LIMIT_BACKOFF_MAX_SECONDS);
+        let jitter_ms = jitter_millis(0, 1200);
+        return Duration::from_secs(exponential_seconds) + Duration::from_millis(jitter_ms);
+    }
+
+    let base_ms = 500_u64.saturating_mul(attempt as u64).min(2_000);
+    Duration::from_millis(base_ms + jitter_millis(0, 300))
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("http 429")
+        || lower.contains("\"code\": 429")
+        || lower.contains("too many requests")
+        || lower.contains("rate limit")
+        || lower.contains("ratelimit")
+        || lower.contains("limitation")
+}
+
+fn format_request_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        return format!("LLM 请求超时: {error}");
+    }
+
+    if error.is_connect() {
+        return format!("LLM 连接失败: {error}");
+    }
+
+    format!("LLM 请求失败: {error}")
+}
+
+fn jitter_millis(min: u64, max: u64) -> u64 {
+    if max <= min {
+        return min;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or(0);
+
+    min + nanos % (max - min + 1)
+}
+
 fn api_url(base_url: &str, path: &str) -> String {
-    format!("{}/{}", base_url.trim().trim_end_matches('/'), path)
+    format!("{}/{}", normalize_base_url(base_url), path)
+}
+
+fn normalize_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let address = trimmed
+        .split_once("://")
+        .map(|(_, value)| value)
+        .unwrap_or(trimmed);
+
+    if address.contains('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
 }
 
 fn openai_headers(api_key: &str) -> Result<HeaderMap, String> {
@@ -361,16 +679,92 @@ fn anthropic_headers(api_key: &str) -> Result<HeaderMap, String> {
     Ok(headers)
 }
 
-fn parse_openai_chat_completion_text(value: &Value) -> Result<String, String> {
-    value
+fn parse_openai_chat_completion_text(
+    value: &Value,
+    allow_reasoning_fallback: bool,
+) -> Result<String, String> {
+    let choices = value
         .get("choices")
         .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(extract_text_value)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| "OpenAI 响应内容为空".to_string())
+        .ok_or_else(|| {
+            format!(
+                "OpenAI 响应内容为空: {}",
+                truncate_text(&value.to_string(), RAW_RESPONSE_LOG_CHARS)
+            )
+        })?;
+
+    let text = choices
+        .iter()
+        .filter_map(extract_openai_choice_content)
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string()
+        .pipe_non_empty()
+        .or_else(|| {
+            if !allow_reasoning_fallback {
+                return None;
+            }
+
+            choices
+                .iter()
+                .filter_map(extract_openai_choice_reasoning_content)
+                .collect::<Vec<_>>()
+                .join("")
+                .trim()
+                .to_string()
+                .pipe_non_empty()
+        })
+        .ok_or_else(|| {
+            format!(
+                "OpenAI 响应内容为空: {}",
+                truncate_text(&value.to_string(), RAW_RESPONSE_LOG_CHARS)
+            )
+        })?;
+
+    Ok(text)
+}
+
+fn parse_openai_chat_completion_stream_text(
+    body: &str,
+    allow_reasoning_fallback: bool,
+) -> Result<String, String> {
+    let mut content_text = String::new();
+    let mut reasoning_fallback_text = String::new();
+
+    for value in parse_sse_json_values(body) {
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for choice in choices {
+            if let Some(chunk_text) = extract_openai_choice_content(choice) {
+                content_text.push_str(&chunk_text);
+            }
+
+            if let Some(chunk_text) = extract_openai_choice_reasoning_content(choice) {
+                reasoning_fallback_text.push_str(&chunk_text);
+            }
+        }
+    }
+
+    content_text
+        .trim()
+        .to_string()
+        .pipe_non_empty()
+        .or_else(|| {
+            if allow_reasoning_fallback {
+                reasoning_fallback_text.trim().to_string().pipe_non_empty()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "OpenAI 流式响应内容为空: {}",
+                truncate_text(body, RAW_RESPONSE_LOG_CHARS)
+            )
+        })
 }
 
 fn parse_openai_response_text(value: &Value) -> Result<String, String> {
@@ -395,7 +789,47 @@ fn parse_openai_response_text(value: &Value) -> Result<String, String> {
         .trim()
         .to_string()
         .pipe_non_empty()
-        .ok_or_else(|| "OpenAI Responses 响应内容为空".to_string())
+        .ok_or_else(|| {
+            format!(
+                "OpenAI Responses 响应内容为空: {}",
+                truncate_text(&value.to_string(), RAW_RESPONSE_LOG_CHARS)
+            )
+        })
+}
+
+fn parse_openai_response_stream_text(body: &str) -> Result<String, String> {
+    let mut text = String::new();
+
+    for value in parse_sse_json_values(body) {
+        if value.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                text.push_str(delta);
+                continue;
+            }
+        }
+
+        if let Some(delta) = value
+            .get("delta")
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.trim().is_empty())
+        {
+            text.push_str(delta);
+            continue;
+        }
+
+        if text.is_empty() {
+            if let Ok(snapshot_text) = parse_openai_response_text(&value) {
+                text.push_str(&snapshot_text);
+            }
+        }
+    }
+
+    text.trim().to_string().pipe_non_empty().ok_or_else(|| {
+        format!(
+            "OpenAI Responses 流式响应内容为空: {}",
+            truncate_text(body, RAW_RESPONSE_LOG_CHARS)
+        )
+    })
 }
 
 fn parse_anthropic_message_text(value: &Value) -> Result<String, String> {
@@ -410,12 +844,79 @@ fn parse_anthropic_message_text(value: &Value) -> Result<String, String> {
         .trim()
         .to_string()
         .pipe_non_empty()
-        .ok_or_else(|| "Anthropic 响应内容为空".to_string())
+        .ok_or_else(|| {
+            format!(
+                "Anthropic 响应内容为空: {}",
+                truncate_text(&value.to_string(), RAW_RESPONSE_LOG_CHARS)
+            )
+        })
+}
+
+fn parse_anthropic_message_stream_text(body: &str) -> Result<String, String> {
+    let mut text = String::new();
+
+    for value in parse_sse_json_values(body) {
+        if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+            if let Some(delta) = value
+                .get("delta")
+                .and_then(|delta| delta.get("text"))
+                .and_then(Value::as_str)
+            {
+                text.push_str(delta);
+                continue;
+            }
+        }
+
+        if value.get("type").and_then(Value::as_str) == Some("content_block_start") {
+            if let Some(start_text) = value
+                .get("content_block")
+                .and_then(|content| content.get("text"))
+                .and_then(Value::as_str)
+            {
+                text.push_str(start_text);
+            }
+        }
+    }
+
+    text.trim().to_string().pipe_non_empty().ok_or_else(|| {
+        format!(
+            "Anthropic 流式响应内容为空: {}",
+            truncate_text(body, RAW_RESPONSE_LOG_CHARS)
+        )
+    })
+}
+
+fn extract_openai_choice_content(choice: &Value) -> Option<String> {
+    if let Some(text) = choice.get("text").and_then(extract_text_value) {
+        return Some(text);
+    }
+
+    choice
+        .get("message")
+        .or_else(|| choice.get("delta"))
+        .and_then(|message| message.get("content"))
+        .and_then(extract_text_value)
+}
+
+fn extract_openai_choice_reasoning_content(choice: &Value) -> Option<String> {
+    choice
+        .get("message")
+        .or_else(|| choice.get("delta"))
+        .and_then(|message| message.get("reasoning_content"))
+        .and_then(extract_text_value)
 }
 
 fn extract_text_value(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
         return Some(text.to_string());
+    }
+
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+
+    if let Some(content) = value.get("content").and_then(extract_text_value) {
+        return Some(content);
     }
 
     value
@@ -428,6 +929,15 @@ fn extract_text_value(value: &Value) -> Option<String> {
         .trim()
         .to_string()
         .pipe_non_empty()
+}
+
+fn parse_sse_json_values(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect()
 }
 
 fn summarize_response_text(text: &str) -> String {

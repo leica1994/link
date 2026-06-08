@@ -27,7 +27,21 @@ This project is a Tauri + Vue 3 + TypeScript app. Follow these defaults when add
 - Reuse the managed `AiService` for translation, optimization, subtitle correction, smart segmentation, and connection checks instead of creating ad hoc HTTP clients in feature commands.
 - Keep the AI concurrency limit tied to `translation_thread_count`; saving settings must update this limit dynamically.
 - `translation_batch_size` controls work chunking only and must not change the AI concurrency limit.
+- AI network/provider retries must be centralized in `AiService`, with 3 total attempts by default. Retries must reacquire the AI concurrency permit so they queue behind the same thread pool limit.
+- Normal LLM requests should not set a total request timeout because reasoning models may take longer than fixed client limits. Keep the shared connection timeout at 60 seconds, and keep LLM connection checks capped at 60 seconds.
+- LLM response validation retries are separate from network/provider retries. If a request succeeds but the structured content is invalid, the feature logic may retry with feedback while still sending each retry through `AiService`.
 - Connection checks should use the currently saved LLM settings, send a minimal non-streaming test request, and never expose API keys in responses or logs.
+
+## Transcription AI Workflow
+
+- Use `src-tauri/src/subtitle_ai.rs` for subtitle correction and smart segmentation behavior.
+- Smart segmentation should batch by the internal word-count cap (`MAX_SPLIT_CHUNK_WORDS`) for better context, not by `translation_batch_size`.
+- `translation_batch_size` should be used for subtitle correction chunking.
+- Single short smart-segmentation blocks that already satisfy subtitle length rules should skip the LLM request and be marked as segmented, not as retained original text.
+- Smart segmentation and subtitle correction should update the visible subtitle table while running. Only batches currently submitted for execution should show processing states such as `断句中` or `校正中`.
+- The translate page should use one progress bar whose value represents the current active stage. Transcription, smart segmentation, and subtitle correction each maintain independent 0-100 stage progress behind that single bar.
+- Keep `/translate` route state alive when switching app pages so an in-progress transcription view restores when returning to the Translate page.
+- Logging for transcription and AI processing should stay concise. Log starts, completions, partial failures, and validation failure reasons; avoid logging full prompts or full LLM responses unless temporarily debugging a specific issue.
 
 ## Visual Style
 
