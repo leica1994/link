@@ -319,6 +319,28 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="log-settings-title">
+        <div id="log-settings-title" class="section-heading">
+          <FolderOpen aria-hidden="true" />
+          <span>日志</span>
+        </div>
+
+        <div class="settings-panel">
+          <div class="setting-row">
+            <FolderOpen class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">应用日志</div>
+              <div class="setting-subtitle" :class="{ 'setting-subtitle-error': Boolean(logDirectoryError) }">
+                {{ logDirectoryError || '查看转录、AI 处理和系统运行日志' }}
+              </div>
+            </div>
+            <button class="settings-action" type="button" @click="openLogDirectory">
+              打开日志
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="personalization-settings-title">
         <div id="personalization-settings-title" class="section-heading">
           <SlidersHorizontal aria-hidden="true" />
@@ -582,6 +604,7 @@ import {
   Eye,
   EyeOff,
   Film,
+  FolderOpen,
   Gauge,
   KeyRound,
   Languages,
@@ -1111,6 +1134,7 @@ const isPostTranslationOptimizationEnabled = ref(true)
 const selectedTargetLanguage = ref('zh-Hans')
 const isTargetLanguageDialogOpen = ref(false)
 const targetLanguageSearch = ref('')
+const logDirectoryError = ref('')
 const isSettingsLoaded = ref(false)
 let isApplyingStoredSettings = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
@@ -1323,6 +1347,21 @@ const checkLlmConnection = async () => {
     llmConnectionMessage.value = stringifyError(error)
   } finally {
     isCheckingLlmConnection.value = false
+  }
+}
+
+const openLogDirectory = async () => {
+  logDirectoryError.value = ''
+
+  if (!isTauriRuntime()) {
+    logDirectoryError.value = '请在桌面应用中打开日志'
+    return
+  }
+
+  try {
+    await invoke<string>('open_log_directory')
+  } catch (error) {
+    logDirectoryError.value = stringifyError(error)
   }
 }
 

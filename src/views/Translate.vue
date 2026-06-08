@@ -161,14 +161,6 @@
                 >
                   导出字幕
                 </button>
-                <button
-                  class="settings-action"
-                  type="button"
-                  :disabled="!canOpenTranscriptionLog"
-                  @click="openTranscriptionLog"
-                >
-                  打开日志
-                </button>
               </div>
             </div>
 
@@ -411,7 +403,6 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { DragDropEvent } from '@tauri-apps/api/webview'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Bot,
@@ -558,7 +549,6 @@ const transcriptionSegments = ref<TranscriptionSegment[]>([])
 const transcriptionText = ref('')
 const lastTranscriptionRevision = ref(0)
 const lastOutputPath = ref('')
-const lastTranscriptionLogPath = ref('')
 const subtitleInputError = ref('')
 const translationMessage = ref('等待选择字幕')
 let isApplyingStoredSettings = false
@@ -597,9 +587,6 @@ const canStartTranscription = computed(() => {
 const canExportTranscription = computed(() => {
   return Boolean(transcriptionText.value) && !isTranscribing.value
 })
-const canOpenTranscriptionLog = computed(() => {
-  return Boolean(lastTranscriptionLogPath.value) && !isTranscribing.value && isTauriRuntime()
-})
 const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value)
 const transcriptionStatusText = computed(() => {
   if (transcriptionError.value) {
@@ -615,7 +602,6 @@ const transcriptionStatusText = computed(() => {
 const transcriptionStatusClass = computed(() => ({
   active: isTranscribing.value,
   success: !isTranscribing.value && transcriptionSegments.value.length > 0 && !transcriptionError.value,
-  warning: !isTranscribing.value && transcriptionWarnings.value.length > 0 && !transcriptionError.value,
   error: Boolean(transcriptionError.value),
 }))
 const visibleTranscriptionStages = computed(() => {
@@ -928,7 +914,6 @@ const applyVideoFile = (path: string) => {
   transcriptionText.value = ''
   lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
   lastOutputPath.value = ''
-  lastTranscriptionLogPath.value = ''
 }
 
 const applySubtitleFile = (path: string) => {
@@ -1032,7 +1017,6 @@ const startTranscription = async () => {
   transcriptionText.value = ''
   lastTranscriptionRevision.value = 0
   lastOutputPath.value = ''
-  lastTranscriptionLogPath.value = ''
 
   try {
     const result = await invoke<TranscriptionResult>('start_transcription', {
@@ -1048,14 +1032,10 @@ const startTranscription = async () => {
     transcriptionSegments.value = result.segments
     transcriptionText.value = result.subtitleText
     lastOutputPath.value = result.outputPath
-    lastTranscriptionLogPath.value = result.logPath
     transcriptionWarnings.value = result.warnings ?? []
     transcriptionProgress.value = 100
     transcriptionStageProgress.value = markStageProgressDone(transcriptionStageProgress.value)
-    transcriptionMessage.value =
-      transcriptionWarnings.value.length > 0
-        ? `转录完成 · ${result.segments.length} 条字幕 · 部分 AI 处理保留原文`
-        : `转录完成 · ${result.segments.length} 条字幕`
+    transcriptionMessage.value = `转录成功 · ${result.segments.length} 条字幕`
   } catch (error) {
     transcriptionError.value = stringifyError(error)
     transcriptionMessage.value = '转录失败'
@@ -1094,18 +1074,6 @@ const exportTranscription = async () => {
     })
     lastOutputPath.value = ensureSubtitleExtension(outputPath, selectedTranscriptionFormat.value)
     transcriptionMessage.value = '字幕已导出'
-  } catch (error) {
-    transcriptionError.value = stringifyError(error)
-  }
-}
-
-const openTranscriptionLog = async () => {
-  if (!lastTranscriptionLogPath.value || !isTauriRuntime()) {
-    return
-  }
-
-  try {
-    await revealItemInDir(lastTranscriptionLogPath.value)
   } catch (error) {
     transcriptionError.value = stringifyError(error)
   }

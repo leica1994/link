@@ -5,7 +5,7 @@ mod subtitle_ai;
 mod transcription;
 
 use ai::{check_llm_connection, AiService};
-use app_log::AppLogger;
+use app_log::{open_log_directory, AppLogger};
 use settings::{load_settings, save_settings, SettingsStore};
 use tauri::Manager;
 use transcription::{save_transcription_file, start_transcription};
@@ -51,6 +51,7 @@ pub fn run() {
             load_settings,
             save_settings,
             check_llm_connection,
+            open_log_directory,
             start_transcription,
             save_transcription_file,
         ])

@@ -42,6 +42,7 @@ This project is a Tauri + Vue 3 + TypeScript app. Follow these defaults when add
 - The translate page should use one progress bar whose value represents the current active stage. Transcription, smart segmentation, and subtitle correction each maintain independent 0-100 stage progress behind that single bar.
 - Keep `/translate` route state alive when switching app pages so an in-progress transcription view restores when returning to the Translate page.
 - Logging for transcription and AI processing should stay concise. Log starts, completions, partial failures, and validation failure reasons; avoid logging full prompts or full LLM responses unless temporarily debugging a specific issue.
+- App logs are global application logs, not translation-only logs. Store them directly in the app log directory with compact timestamp file names such as `20260608152815.log`; do not create date subdirectories or feature-specific file name prefixes. Open log directories through backend commands instead of frontend plugin path permissions.
 
 ## Visual Style
 
