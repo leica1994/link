@@ -466,7 +466,7 @@ where
             "targetLanguage": &settings.target_language,
             "reflectionEnabled": settings.needs_reflection_translation,
             "videoContentType": &settings.video_content_type,
-            "llmMode": "configured_llm_settings",
+            "llmMode": "configured_llm_settings_json_response",
         }),
     );
 
@@ -614,7 +614,7 @@ where
             "batchSize": settings.translation_batch_size.max(1),
             "targetLanguage": &settings.target_language,
             "videoContentType": &settings.video_content_type,
-            "llmMode": "configured_llm_settings",
+            "llmMode": "configured_llm_settings_json_response",
         }),
     );
 
@@ -777,9 +777,13 @@ async fn translate_chunk_by_llm(
     let mut feedback = String::new();
 
     for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
-        let user_prompt = build_translation_user_prompt(&chunk.entries, &feedback);
+        let user_prompt = build_translation_user_prompt(
+            &chunk.entries,
+            settings.needs_reflection_translation,
+            &feedback,
+        );
         let response = match ai_service
-            .chat_for_structured_output(
+            .chat_for_json_output(
                 settings,
                 system_prompt.clone(),
                 user_prompt,
@@ -807,8 +811,11 @@ async fn translate_chunk_by_llm(
             match parse_translation_response(&response, settings.needs_reflection_translation) {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    feedback =
-                        format!("上一次结果不是有效 JSON: {error}\n请只输出完整 JSON 对象。");
+                    feedback = build_translation_json_feedback(
+                        &chunk.entries,
+                        settings.needs_reflection_translation,
+                        &error,
+                    );
                     continue;
                 }
             };
@@ -824,8 +831,10 @@ async fn translate_chunk_by_llm(
                 return Ok(TranslationChunkResult { chunk, entries });
             }
             Err(error) => {
-                feedback = format!(
-                    "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。"
+                feedback = build_translation_key_feedback(
+                    &chunk.entries,
+                    settings.needs_reflection_translation,
+                    &error,
                 );
             }
         }
@@ -855,7 +864,7 @@ async fn optimize_translation_chunk_by_llm(
         let user_prompt =
             build_post_optimization_user_prompt(&source_entries, &chunk.entries, &feedback);
         let response = match ai_service
-            .chat_for_structured_output(
+            .chat_for_json_output(
                 settings,
                 system_prompt.clone(),
                 user_prompt,
@@ -1013,7 +1022,8 @@ fn build_post_optimization_system_prompt(settings: &AppSettings) -> String {
 3. 相邻字幕跨句衔接时，允许让单行译文更自然地承接前后文，但不要把一行内容搬到另一行。
 4. 如果某行已经通顺，保留该行。
 5. 你可以在内部分析哪些行不通顺，但不要输出分析、理由、评分、建议或嵌套对象。
-6. 输出必须是纯 JSON 对象，第一字符必须是 {{，最后字符必须是 }}；外层只能是字幕 key，value 必须是字符串，不要 Markdown、解释或额外文本。
+6. 输出只能是单个 JSON object，第一字符必须是 {{，最后字符必须是 }}。
+7. 外层只能是字幕 key，key 和 value 都必须使用英文双引号；禁止输出数组、列表、key: value 文本、Markdown、XML 标签、代码块、解释或额外文本。
 </rules>
 
 <terminology_and_requirements>
@@ -1028,10 +1038,19 @@ fn build_post_optimization_system_prompt(settings: &AppSettings) -> String {
     )
 }
 
-fn build_translation_user_prompt(entries: &BTreeMap<String, String>, feedback: &str) -> String {
+fn build_translation_user_prompt(
+    entries: &BTreeMap<String, String>,
+    is_reflection: bool,
+    feedback: &str,
+) -> String {
     let input_json = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+    let output_template = build_translation_output_template(entries, is_reflection);
     let mut prompt = format!(
-        "请翻译以下字幕 JSON。最终必须输出 JSON 对象，key 必须与输入完全一致。\n<input_subtitle>{input_json}</input_subtitle>"
+        "请翻译以下字幕 JSON。最终必须输出 JSON 对象，key 必须与输入完全一致。\n\
+         <input_subtitle>{input_json}</input_subtitle>\n\
+         <output_template>{output_template}</output_template>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改 value 内容。</template_rule>\n\
+         <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
     );
 
     if !feedback.is_empty() {
@@ -1041,6 +1060,59 @@ fn build_translation_user_prompt(entries: &BTreeMap<String, String>, feedback: &
     }
 
     prompt
+}
+
+fn build_translation_output_template(
+    entries: &BTreeMap<String, String>,
+    is_reflection: bool,
+) -> String {
+    if is_reflection {
+        let template = entries
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    json!({
+                        "initial_translation": "初译",
+                        "reflection": "指出不自然之处和改写理由",
+                        "native_translation": "最终自然译文"
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        return Value::Object(template).to_string();
+    }
+
+    let template = entries
+        .keys()
+        .map(|key| (key.clone(), "译文".to_string()))
+        .collect::<BTreeMap<_, _>>();
+
+    serde_json::to_string(&template).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn build_translation_json_feedback(
+    entries: &BTreeMap<String, String>,
+    is_reflection: bool,
+    error: &str,
+) -> String {
+    let output_template = build_translation_output_template(entries, is_reflection);
+
+    format!(
+        "上一次结果不是有效 JSON: {error}\n请只输出完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。请复制这个 JSON object 的外层结构和全部 key，只改 value: {output_template}"
+    )
+}
+
+fn build_translation_key_feedback(
+    entries: &BTreeMap<String, String>,
+    is_reflection: bool,
+    error: &str,
+) -> String {
+    let output_template = build_translation_output_template(entries, is_reflection);
+
+    format!(
+        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。请复制这个 JSON object 的外层结构和全部 key，只改 value: {output_template}"
+    )
 }
 
 fn build_post_optimization_user_prompt(
@@ -1054,7 +1126,6 @@ fn build_post_optimization_user_prompt(
     let required_keys = sorted_subtitle_keys(translated_entries);
     let required_keys_json =
         serde_json::to_string(&required_keys).unwrap_or_else(|_| "[]".to_string());
-    let output_example = build_key_preservation_example(&required_keys);
     let paragraph = translated_entries
         .values()
         .cloned()
@@ -1063,11 +1134,13 @@ fn build_post_optimization_user_prompt(
     let mut prompt = format!(
         "请对以下同批字幕译文做译后优化。先把译文行组成句子或段落理解，在内部判断哪些行不通顺，然后只输出 key 完全一致、value 全部为字符串的 JSON 对象。\n\
          <required_keys>{required_keys_json}</required_keys>\n\
-         <output_contract>必须完整使用 required_keys 中的真实字幕编号；禁止遗漏、增加、重命名 key；禁止从 1 重新编号；禁止输出 Markdown、说明文字、思考过程或 XML 标签。</output_contract>\n\
+         <output_contract>required_keys 只用于核对，不要原样输出 required_keys 数组。最终输出必须是单个 JSON object；必须完整使用 required_keys 中的真实字幕编号；key 和 value 都必须使用英文双引号；禁止遗漏、增加、重命名 key；禁止从 1 重新编号；禁止输出数组、列表、key: value 文本、Markdown、说明文字、思考过程或 XML 标签。</output_contract>\n\
          <source_subtitle>{source_json}</source_subtitle>\n\
          <current_translation>{translated_json}</current_translation>\n\
+         <output_template>{translated_json}</output_template>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只根据上下文改写 value；不需要优化的 value 原样保留。</template_rule>\n\
          <translation_paragraph>{paragraph}</translation_paragraph>\n\
-         <output_example>{output_example}</output_example>"
+         <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
     );
 
     if !feedback.is_empty() {
@@ -1082,9 +1155,10 @@ fn build_post_optimization_user_prompt(
 fn build_json_parse_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
     let required_keys_json =
         serde_json::to_string(&sorted_subtitle_keys(entries)).unwrap_or_else(|_| "[]".to_string());
+    let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
 
     format!(
-        "上一次结果不是有效 JSON: {error}\n请只输出一个完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。不要输出 Markdown、说明、思考过程或 XML 标签。必须包含这些真实 key: {required_keys_json}。"
+        "上一次结果不是有效 JSON: {error}\n请只输出一个完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。key 和 value 都必须使用英文双引号。不要输出数组、列表、key: value 文本、Markdown、说明、思考过程或 XML 标签。必须包含这些真实 key: {required_keys_json}。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
     )
 }
 
@@ -1092,6 +1166,7 @@ fn build_key_mismatch_feedback(entries: &BTreeMap<String, String>, error: &str) 
     let required_keys = sorted_subtitle_keys(entries);
     let required_keys_json =
         serde_json::to_string(&required_keys).unwrap_or_else(|_| "[]".to_string());
+    let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
     let key_hint = match (required_keys.first(), required_keys.last()) {
         (Some(first), Some(last)) if first != last => {
             format!("本批 key 从 {first} 到 {last}，不能改成 1..N。")
@@ -1101,18 +1176,8 @@ fn build_key_mismatch_feedback(entries: &BTreeMap<String, String>, error: &str) 
     };
 
     format!(
-        "上一次结果 key 不匹配: {error}\n{key_hint}请输出完整 JSON，必须且只能包含这些真实 key: {required_keys_json}。"
+        "上一次结果 key 不匹配: {error}\n{key_hint}请输出完整 JSON，必须且只能包含这些真实 key: {required_keys_json}。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
     )
-}
-
-fn build_key_preservation_example(keys: &[String]) -> String {
-    let example = keys
-        .iter()
-        .take(2)
-        .map(|key| (key.clone(), format!("优化后的译文 {key}")))
-        .collect::<BTreeMap<_, _>>();
-
-    serde_json::to_string(&example).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn translation_reference(settings: &AppSettings) -> &'static str {
@@ -1598,14 +1663,9 @@ fn parse_reflection_translation_candidate(
 }
 
 fn parse_json_text_map(text: &str) -> Result<BTreeMap<String, String>, String> {
-    let candidates = extract_json_value_candidates(text);
+    let candidates = extract_json_object_candidates(text);
     if candidates.is_empty() {
-        let trimmed = text.trim();
-        if let Ok(Value::String(inner_text)) = serde_json::from_str::<Value>(trimmed) {
-            return parse_json_text_map(&inner_text);
-        }
-
-        return Err("未找到 JSON 对象或数组开始符".to_string());
+        return Err("未找到 JSON 对象开始符".to_string());
     }
 
     let mut last_error = String::new();
@@ -1620,19 +1680,12 @@ fn parse_json_text_map(text: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 fn parse_json_text_map_candidate(json_text: &str) -> Result<BTreeMap<String, String>, String> {
-    let value = parse_json_candidate_value(json_text)?;
+    let value = serde_json::from_str::<Value>(json_text)
+        .map_err(|error| format!("JSON 解析失败: {error}"))?;
     parse_json_text_map_value(&value)
 }
 
 fn parse_json_text_map_value(value: &Value) -> Result<BTreeMap<String, String>, String> {
-    if let Some(text) = value.as_str() {
-        return parse_json_text_map(text);
-    }
-
-    if let Some(items) = value.as_array() {
-        return parse_text_map_array(items);
-    }
-
     let object = value
         .as_object()
         .ok_or_else(|| "LLM 返回内容不是 JSON 对象".to_string())?;
@@ -1704,22 +1757,6 @@ fn parse_json_text_map_value(value: &Value) -> Result<BTreeMap<String, String>, 
     }
 
     Err(last_error)
-}
-
-fn parse_json_candidate_value(json_text: &str) -> Result<Value, String> {
-    match serde_json::from_str::<Value>(json_text) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            let repaired = quote_bare_numeric_object_keys(json_text);
-            if repaired == json_text {
-                return Err(format!("JSON 解析失败: {error}"));
-            }
-
-            serde_json::from_str::<Value>(&repaired).map_err(|repair_error| {
-                format!("JSON 解析失败: {error}; 数字 key 修复后仍失败: {repair_error}")
-            })
-        }
-    }
 }
 
 fn parse_text_map_object(
@@ -1974,83 +2011,6 @@ fn extract_json_object_candidates(text: &str) -> Vec<&str> {
         .into_iter()
         .filter(|candidate| candidate.trim_start().starts_with('{'))
         .collect()
-}
-
-fn quote_bare_numeric_object_keys(text: &str) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    let mut output = String::with_capacity(text.len());
-    let mut index = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while index < chars.len() {
-        let character = chars[index];
-
-        if in_string {
-            output.push(character);
-            if escaped {
-                escaped = false;
-            } else {
-                match character {
-                    '\\' => escaped = true,
-                    '"' => in_string = false,
-                    _ => {}
-                }
-            }
-            index += 1;
-            continue;
-        }
-
-        if character == '"' {
-            in_string = true;
-            output.push(character);
-            index += 1;
-            continue;
-        }
-
-        if character == '{' || character == ',' {
-            output.push(character);
-            index += 1;
-
-            let whitespace_start = index;
-            while index < chars.len() && chars[index].is_whitespace() {
-                index += 1;
-            }
-
-            let key_start = index;
-            while index < chars.len() && chars[index].is_ascii_digit() {
-                index += 1;
-            }
-
-            if key_start == index {
-                output.extend(chars[whitespace_start..index].iter().copied());
-                continue;
-            }
-
-            let mut colon_index = index;
-            while colon_index < chars.len() && chars[colon_index].is_whitespace() {
-                colon_index += 1;
-            }
-
-            if colon_index < chars.len() && chars[colon_index] == ':' {
-                output.extend(chars[whitespace_start..key_start].iter().copied());
-                output.push('"');
-                output.extend(chars[key_start..index].iter().copied());
-                output.push('"');
-                output.extend(chars[index..colon_index].iter().copied());
-                index = colon_index;
-                continue;
-            }
-
-            output.extend(chars[whitespace_start..index].iter().copied());
-            continue;
-        }
-
-        output.push(character);
-        index += 1;
-    }
-
-    output
 }
 
 fn validate_or_remap_relative_keys(
@@ -2312,14 +2272,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_text_map_with_unquoted_numeric_keys() {
-        let parsed = parse_json_text_map(r#"{31:"优化译文",32:"下一句"}"#).unwrap();
-
-        assert_eq!(parsed.get("31"), Some(&"优化译文".to_string()));
-        assert_eq!(parsed.get("32"), Some(&"下一句".to_string()));
-    }
-
-    #[test]
     fn parses_text_map_from_array_items() {
         let parsed = parse_json_text_map(
             r#"{"items":[{"index":1,"optimized_translation":"优化译文"},{"id":"2","translation":"下一句"}]}"#,
@@ -2328,26 +2280,6 @@ mod tests {
 
         assert_eq!(parsed.get("1"), Some(&"优化译文".to_string()));
         assert_eq!(parsed.get("2"), Some(&"下一句".to_string()));
-    }
-
-    #[test]
-    fn parses_text_map_from_top_level_array_items() {
-        let parsed = parse_json_text_map(
-            r#"[{"index":31,"optimized_translation":"优化译文"},{"id":"32","translation":"下一句"}]"#,
-        )
-        .unwrap();
-
-        assert_eq!(parsed.get("31"), Some(&"优化译文".to_string()));
-        assert_eq!(parsed.get("32"), Some(&"下一句".to_string()));
-    }
-
-    #[test]
-    fn parses_text_map_from_json_string_wrapper() {
-        let wrapped = serde_json::to_string(r#"{"31":"优化译文","32":"下一句"}"#).unwrap();
-        let parsed = parse_json_text_map(&wrapped).unwrap();
-
-        assert_eq!(parsed.get("31"), Some(&"优化译文".to_string()));
-        assert_eq!(parsed.get("32"), Some(&"下一句".to_string()));
     }
 
     #[test]
@@ -2403,7 +2335,11 @@ mod tests {
 
         assert!(prompt.contains(r#"<required_keys>["31","32"]</required_keys>"#));
         assert!(prompt.contains("禁止从 1 重新编号"));
-        assert!(prompt.contains(r#""31":"优化后的译文 31""#));
+        assert!(prompt.contains("禁止输出数组"));
+        assert!(prompt.contains("key 和 value 都必须使用英文双引号"));
+        assert!(prompt.contains("<output_template>"));
+        assert!(prompt.contains("复制 output_template 的完整 JSON object 外层结构和全部 key"));
+        assert!(prompt.contains(r#""31":"译文 31""#));
         assert!(!prompt.contains(r#""1":"优化后的译文 1""#));
     }
 }

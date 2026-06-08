@@ -78,7 +78,8 @@ impl VideoPromptStrategy for GeneralPromptStrategy {
 2. 不翻译、不改写、不扩写，不替换为同义表达。
 3. 保持输入 JSON 的所有 key，不新增、不删除、不合并、不拆分条目。
 4. 英文需要修正常规大小写和标点；中文标点保持自然、克制。
-5. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。"#
+5. 输出只能是单个 JSON object，第一字符必须是 {，最后字符必须是 }。
+6. 外层只能是字幕 key，key 和 value 都必须使用英文双引号；禁止输出数组、列表、Markdown、代码块、解释或额外文本。"#
             .to_string()
     }
 
@@ -118,8 +119,9 @@ impl VideoPromptStrategy for TradingPromptStrategy {
 2. 不翻译、不改写、不扩写，不改变交易判断、交易方向、风险提示或说话者语气。
 3. 保持原始语言：英文输入输出英文，中文输入输出中文，绝不跨语言翻译。
 4. 保持输入 JSON 的所有 key，不新增、不删除、不合并、不拆分条目。
-5. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
-6. 如果上下文不明确，宁可保留原文，也不要猜测或替换为同义表达。
+5. 输出只能是单个 JSON object，第一字符必须是 {，最后字符必须是 }。
+6. 外层只能是字幕 key，key 和 value 都必须使用英文双引号；禁止输出数组、列表、Markdown、代码块、解释或额外文本。
+7. 如果上下文不明确，宁可保留原文，也不要猜测或替换为同义表达。
 
 # 交易内容保护规则
 1. 严格保留数字、价格、百分比、比例、倍数、杠杆倍数、ticker、币种、货币对、交易所名称、时间周期和方向词。
@@ -408,7 +410,7 @@ where
             "chunkCount": chunks.len(),
             "batchSize": settings.translation_batch_size.max(1),
             "videoContentType": &settings.video_content_type,
-            "llmMode": "configured_llm_settings",
+            "llmMode": "configured_llm_settings_json_response",
         }),
     );
 
@@ -733,7 +735,7 @@ async fn split_chunk_by_llm(
     for attempt in 1..=MAX_SPLIT_ATTEMPTS {
         let user_prompt = build_split_user_prompt(&source_text, &reference, &feedback);
         let response = match ai_service
-            .chat_for_structured_output(
+            .chat(
                 settings,
                 system_prompt.clone(),
                 user_prompt,
@@ -841,7 +843,7 @@ async fn correct_chunk_by_llm(
     for attempt in 1..=MAX_CORRECTION_ATTEMPTS {
         let user_prompt = build_correction_user_prompt(&chunk.entries, &reference, &feedback);
         let response = match ai_service
-            .chat_for_structured_output(
+            .chat_for_json_output(
                 settings,
                 system_prompt.clone(),
                 user_prompt,
@@ -867,7 +869,7 @@ async fn correct_chunk_by_llm(
         let parsed = match parse_json_text_map(&response) {
             Ok(parsed) => parsed,
             Err(error) => {
-                feedback = format!("上一次结果不是有效 JSON: {error}\n请只输出完整 JSON 对象。");
+                feedback = build_correction_json_feedback(&chunk.entries, &error);
                 continue;
             }
         };
@@ -883,9 +885,7 @@ async fn correct_chunk_by_llm(
                 return Ok(CorrectionChunkResult { chunk, entries });
             }
             Err(error) => {
-                feedback = format!(
-                    "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。"
-                );
+                feedback = build_correction_key_feedback(&chunk.entries, &error);
             }
         }
     }
@@ -919,6 +919,7 @@ fn build_correction_user_prompt(
     reference: &str,
     feedback: &str,
 ) -> String {
+    let input_json = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
     let input_lines = entries
         .iter()
         .map(|(key, text)| format!("{key}\t{text}"))
@@ -927,8 +928,12 @@ fn build_correction_user_prompt(
     let mut prompt = format!(
         "请校正以下字幕。保持原始语言，不要翻译。\n\
          输入格式是每行一个字幕 key 和原文，中间用 Tab 分隔；最终必须输出一个 JSON 对象，key 必须与输入完全一致，value 是校正后的字幕文本。\n\
-         可以思考，但最终答案的最后一段只能是 JSON 对象；不要在最终答案中复述规则、输入或分析过程。\n\
-         <reference>{reference}</reference>\n<input_subtitle>\n{input_lines}\n</input_subtitle>"
+         可以思考，但最终答案只能是 JSON 对象；不要在最终答案中复述规则、输入或分析过程。\n\
+         <reference>{reference}</reference>\n\
+         <input_subtitle>\n{input_lines}\n</input_subtitle>\n\
+         <output_template>{input_json}</output_template>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改 value 内容；不需要校正的 value 原样保留。</template_rule>\n\
+         <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
     );
 
     if !feedback.is_empty() {
@@ -938,6 +943,22 @@ fn build_correction_user_prompt(
     }
 
     prompt
+}
+
+fn build_correction_json_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
+    let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+
+    format!(
+        "上一次结果不是有效 JSON: {error}\n请只输出完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。key 和 value 都必须使用英文双引号。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
+    )
+}
+
+fn build_correction_key_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
+    let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+
+    format!(
+        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
+    )
 }
 
 fn build_word_units(segments: &[TranscriptionSegment]) -> Vec<WordUnit> {

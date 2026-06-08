@@ -38,6 +38,7 @@ struct AiChatRequest {
     temperature: Option<f32>,
     force_non_streaming: bool,
     disable_reasoning: bool,
+    json_response: bool,
 }
 
 #[derive(Debug)]
@@ -131,20 +132,31 @@ impl AiService {
             temperature: None,
             force_non_streaming: false,
             disable_reasoning: false,
+            json_response: false,
         };
 
         self.send_chat(service, config, &request, None).await
     }
 
-    pub async fn chat_for_structured_output(
+    pub async fn chat_for_json_output(
         &self,
         settings: &AppSettings,
         system_prompt: String,
         user_prompt: String,
         max_output_tokens: u32,
     ) -> Result<String, String> {
-        self.chat(settings, system_prompt, user_prompt, max_output_tokens)
-            .await
+        let (service, config) = selected_llm_config(settings)?;
+        let request = AiChatRequest {
+            system_prompt,
+            user_prompt,
+            max_output_tokens,
+            temperature: None,
+            force_non_streaming: false,
+            disable_reasoning: false,
+            json_response: true,
+        };
+
+        self.send_chat(service, config, &request, None).await
     }
 
     async fn chat_for_connection_check(
@@ -162,6 +174,7 @@ impl AiService {
             temperature: None,
             force_non_streaming: true,
             disable_reasoning: true,
+            json_response: false,
         };
 
         self.send_chat(
@@ -293,6 +306,10 @@ impl AiService {
             payload["temperature"] = json!(temperature);
         }
 
+        if request.json_response {
+            payload["response_format"] = json!({ "type": "json_object" });
+        }
+
         if let Some(effort) = openai_chat_reasoning_effort(config, request) {
             payload["reasoning_effort"] = json!(effort);
         }
@@ -332,6 +349,14 @@ impl AiService {
             payload["reasoning"] = json!({ "effort": effort });
         }
 
+        if request.json_response {
+            payload["text"] = json!({
+                "format": {
+                    "type": "json_object"
+                }
+            });
+        }
+
         let url = api_url(&config.base_url, OPENAI_RESPONSES_PATH);
         let headers = openai_headers(&config.api_key)?;
 
@@ -368,11 +393,16 @@ impl AiService {
             "max_tokens": request.max_output_tokens,
         });
 
-        if let Some(effort) = anthropic_reasoning_effort(config, request) {
+        let anthropic_effort = anthropic_reasoning_effort(config, request);
+        if anthropic_effort.is_some() {
             payload["thinking"] = json!({
                 "type": "adaptive",
             });
-            payload["output_config"] = json!({ "effort": effort });
+        }
+
+        if anthropic_effort.is_some() || request.json_response {
+            payload["output_config"] =
+                anthropic_output_config(anthropic_effort, request.json_response);
         }
 
         let url = api_url(&config.base_url, ANTHROPIC_MESSAGES_PATH);
@@ -668,6 +698,29 @@ fn anthropic_headers(api_key: &str) -> Result<HeaderMap, String> {
     );
 
     Ok(headers)
+}
+
+fn anthropic_output_config(effort: Option<&str>, json_response: bool) -> Value {
+    let mut config = serde_json::Map::new();
+
+    if let Some(effort) = effort {
+        config.insert("effort".to_string(), json!(effort));
+    }
+
+    if json_response {
+        config.insert(
+            "format".to_string(),
+            json!({
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            }),
+        );
+    }
+
+    Value::Object(config)
 }
 
 fn parse_openai_chat_completion_text(
