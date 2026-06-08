@@ -2,11 +2,13 @@ mod ai;
 mod app_log;
 mod settings;
 mod subtitle_ai;
+mod subtitle_translation;
 mod transcription;
 
 use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
 use settings::{load_settings, save_settings, SettingsStore};
+use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
 use tauri::Manager;
 use transcription::{save_transcription_file, start_transcription};
 
@@ -54,6 +56,8 @@ pub fn run() {
             open_log_directory,
             start_transcription,
             save_transcription_file,
+            load_subtitle_preview,
+            start_subtitle_translation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

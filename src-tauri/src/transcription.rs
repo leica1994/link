@@ -835,22 +835,11 @@ pub async fn start_transcription(
 
     mark_segments_status(&mut segments, "done");
     let subtitle_text = serialize_subtitle(&segments, raw_result.output_format);
-    if let Err(error) = fs::write(&raw_result.output_path, &subtitle_text) {
-        log_session.error(
-            "subtitle_save_failed",
-            "无法保存字幕文件",
-            json!({
-                "outputPath": raw_result.output_path.to_string_lossy(),
-                "error": error.to_string(),
-            }),
-        );
-        return Err(format!("无法保存字幕文件: {error}"));
-    }
     log_session.info(
-        "subtitle_saved",
-        "字幕文件已保存",
+        "subtitle_ready_for_export",
+        "字幕内容已生成，等待手动导出",
         json!({
-            "outputPath": raw_result.output_path.to_string_lossy(),
+            "suggestedOutputPath": raw_result.output_path.to_string_lossy(),
             "outputFormat": raw_result.output_format.to_string(),
             "segmentCount": segments.len(),
             "warningCount": warnings.len(),
@@ -1509,14 +1498,14 @@ fn default_output_path(input_path: &Path, format: SubtitleFormat) -> Result<Path
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SubtitleFormat {
+pub(crate) enum SubtitleFormat {
     Srt,
     Vtt,
     Ass,
 }
 
 impl SubtitleFormat {
-    fn as_extension(self) -> &'static str {
+    pub(crate) fn as_extension(self) -> &'static str {
         match self {
             Self::Srt => "srt",
             Self::Vtt => "vtt",
@@ -1531,7 +1520,7 @@ impl std::fmt::Display for SubtitleFormat {
     }
 }
 
-fn normalize_subtitle_format(format: &str) -> SubtitleFormat {
+pub(crate) fn normalize_subtitle_format(format: &str) -> SubtitleFormat {
     match format {
         "vtt" => SubtitleFormat::Vtt,
         "ass" => SubtitleFormat::Ass,
@@ -1539,7 +1528,10 @@ fn normalize_subtitle_format(format: &str) -> SubtitleFormat {
     }
 }
 
-fn serialize_subtitle(segments: &[TranscriptionSegment], format: SubtitleFormat) -> String {
+pub(crate) fn serialize_subtitle(
+    segments: &[TranscriptionSegment],
+    format: SubtitleFormat,
+) -> String {
     match format {
         SubtitleFormat::Srt => to_srt(segments),
         SubtitleFormat::Vtt => to_vtt(segments),

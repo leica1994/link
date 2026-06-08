@@ -52,7 +52,7 @@
                 <UploadCloud class="translate-drop-icon" :stroke-width="2.1" aria-hidden="true" />
                 <div class="translate-drop-copy">
                   <span class="translate-drop-title">选择或拖入需要转录的视频</span>
-                  <span class="translate-drop-subtitle">支持本地视频和音频文件，转录完成后会自动保存字幕</span>
+                  <span class="translate-drop-subtitle">支持本地视频和音频文件，转录完成后可手动导出字幕</span>
                 </div>
                 <button class="settings-action" type="button" :disabled="isTranscribing" @click="selectVideoFile">
                   选择视频
@@ -101,7 +101,7 @@
                 <Captions class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
                 <span class="setting-copy">
                   <span class="setting-title">输出格式</span>
-                  <span class="setting-subtitle">转录后生成的字幕格式</span>
+                  <span class="setting-subtitle">手动导出时使用的字幕格式</span>
                 </span>
                 <span class="setting-inline-action">
                   <span class="setting-value">{{ transcriptionFormatLabel }}</span>
@@ -236,7 +236,9 @@
                   <span class="translate-drop-title">选择或拖入转录后的字幕</span>
                   <span class="translate-drop-subtitle">支持 SRT、VTT、ASS，可直接导入已有字幕继续处理</span>
                 </div>
-                <button class="settings-action" type="button" @click="selectSubtitleFile">选择字幕</button>
+                <button class="settings-action" type="button" :disabled="isTranslationProcessing" @click="selectSubtitleFile">
+                  选择字幕
+                </button>
               </div>
 
               <div class="translate-file-strip" aria-label="当前字幕">
@@ -323,10 +325,27 @@
                   :disabled="!canStartTranslationProcessing"
                   @click="startTranslationProcessing"
                 >
-                  开始处理
+                  {{ isTranslationProcessing ? '处理中' : '开始处理' }}
                 </button>
-                <button class="settings-action" type="button" disabled>导出结果</button>
+                <button
+                  class="settings-action"
+                  type="button"
+                  :disabled="!canExportTranslation"
+                  @click="exportTranslationResult"
+                >
+                  导出结果
+                </button>
               </div>
+            </div>
+
+            <div v-if="currentTranslationStage" class="translate-progress" aria-label="处理进度">
+              <div class="translate-progress-track">
+                <span
+                  class="translate-progress-bar"
+                  :style="{ width: `${currentTranslationStage.progress}%` }"
+                />
+              </div>
+              <span class="translate-progress-value">{{ currentTranslationStage.progress }}%</span>
             </div>
 
             <div v-if="subtitleInputError" class="translate-alert" role="alert">
@@ -334,17 +353,64 @@
               <span>{{ subtitleInputError }}</span>
             </div>
 
-            <div class="translate-compare">
-              <div class="translate-preview translate-preview-empty">
-                <FileText class="translate-empty-icon" :stroke-width="2.1" aria-hidden="true" />
-                <span class="translate-empty-title">原文字幕</span>
-                <span class="translate-empty-subtitle">导入字幕后显示原文内容</span>
-              </div>
-              <div class="translate-preview translate-preview-empty">
-                <Languages class="translate-empty-icon" :stroke-width="2.1" aria-hidden="true" />
-                <span class="translate-empty-title">译文字幕</span>
-                <span class="translate-empty-subtitle">完成翻译与优化后显示结果</span>
-              </div>
+            <div v-if="translationError" class="translate-alert" role="alert">
+              <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ translationError }}</span>
+            </div>
+
+            <div v-if="translationWarnings.length > 0" class="translate-alert translate-alert-warning" role="status">
+              <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ translationWarnings.join('；') }}</span>
+            </div>
+
+            <div
+              v-if="translationRows.length > 0"
+              class="translate-preview translate-subtitle-list translate-translation-table"
+              role="table"
+              aria-label="翻译与优化结果"
+            >
+              <article
+                v-for="row in translationRows"
+                :key="row.key"
+                class="translate-translation-row"
+                role="row"
+              >
+                <span class="translate-subtitle-index" role="cell">{{ row.index }}</span>
+                <span
+                  class="translate-subtitle-status"
+                  :class="`status-${row.status}`"
+                  role="cell"
+                >
+                  {{ transcriptionSegmentStatusLabel(row.status) }}
+                </span>
+                <span
+                  class="translate-subtitle-time translate-subtitle-start translate-translation-start"
+                  role="cell"
+                  aria-label="开始时间"
+                >
+                  {{ formatSegmentTime(row.startTime) }}
+                </span>
+                <span
+                  class="translate-subtitle-time translate-subtitle-end translate-translation-end"
+                  role="cell"
+                  aria-label="结束时间"
+                >
+                  {{ formatSegmentTime(row.endTime) }}
+                </span>
+                <p class="translate-translation-source" role="cell">{{ row.sourceText }}</p>
+                <p
+                  class="translate-translation-target"
+                  :class="{ empty: !row.targetText }"
+                  role="cell"
+                >
+                  {{ row.targetText || '等待处理' }}
+                </p>
+              </article>
+            </div>
+            <div v-else class="translate-preview translate-preview-empty">
+              <FileText class="translate-empty-icon" :stroke-width="2.1" aria-hidden="true" />
+              <span class="translate-empty-title">暂无字幕内容</span>
+              <span class="translate-empty-subtitle">导入字幕后，原文与译文会合并显示在同一张表内</span>
             </div>
           </div>
         </section>
@@ -464,7 +530,18 @@ type DialogOption = {
   label: string
 }
 
-type TranscriptionSegmentStatus = 'raw' | 'segmenting' | 'segmented' | 'correcting' | 'corrected' | 'kept' | 'done'
+type TranscriptionSegmentStatus =
+  | 'raw'
+  | 'segmenting'
+  | 'segmented'
+  | 'correcting'
+  | 'corrected'
+  | 'translating'
+  | 'translated'
+  | 'optimizing'
+  | 'optimized'
+  | 'kept'
+  | 'done'
 
 type TranscriptionSegment = {
   uid?: string
@@ -472,6 +549,16 @@ type TranscriptionSegment = {
   startTime: number
   endTime: number
   status?: TranscriptionSegmentStatus
+}
+
+type TranslationResultRow = {
+  key: string
+  index: number
+  startTime: number
+  endTime: number
+  sourceText: string
+  targetText: string
+  status: TranscriptionSegmentStatus
 }
 
 type TranscriptionStageStatus = 'pending' | 'active' | 'done' | 'failed'
@@ -506,12 +593,48 @@ type TranscriptionProgress = {
   warnings?: string[]
 }
 
+type SubtitleTranslationStageProgress = {
+  subtitleTranslation?: TranscriptionProgressStage
+  postTranslationOptimization?: TranscriptionProgressStage
+}
+
+type SubtitlePreviewResult = {
+  segments: TranscriptionSegment[]
+}
+
+type SubtitleTranslationProgress = {
+  progress: number
+  message: string
+  stageProgress?: SubtitleTranslationStageProgress
+  revision?: number
+  sourceSegments?: TranscriptionSegment[]
+  translatedSegments?: TranscriptionSegment[]
+  warnings?: string[]
+}
+
+type SubtitleTranslationResult = {
+  sourceSegments: TranscriptionSegment[]
+  translatedSegments: TranscriptionSegment[]
+  outputSegments: TranscriptionSegment[]
+  subtitleText: string
+  sourceSubtitleText: string
+  targetSubtitleText: string
+  outputFormat: string
+  outputMode: string
+  logPath: string
+  warnings: string[]
+}
+
 const transcriptionSegmentStatusLabels: Record<TranscriptionSegmentStatus, string> = {
   raw: '原始',
   segmenting: '断句中',
   segmented: '已断句',
   correcting: '校正中',
   corrected: '已校正',
+  translating: '翻译中',
+  translated: '已翻译',
+  optimizing: '优化中',
+  optimized: '已优化',
   kept: '保留原文',
   done: '完成',
 }
@@ -548,13 +671,26 @@ const transcriptionWarnings = ref<string[]>([])
 const transcriptionSegments = ref<TranscriptionSegment[]>([])
 const transcriptionText = ref('')
 const lastTranscriptionRevision = ref(0)
+const suggestedTranscriptionExportPath = ref('')
 const lastOutputPath = ref('')
 const subtitleInputError = ref('')
 const translationMessage = ref('等待选择字幕')
+const translationError = ref('')
+const isTranslationProcessing = ref(false)
+const translationProgress = ref(0)
+const translationStageProgress = ref<SubtitleTranslationStageProgress>({})
+const translationWarnings = ref<string[]>([])
+const sourceSubtitleSegments = ref<TranscriptionSegment[]>([])
+const translatedSubtitleSegments = ref<TranscriptionSegment[]>([])
+const translationText = ref('')
+const sourceTranslationText = ref('')
+const targetTranslationText = ref('')
+const lastTranslationRevision = ref(0)
 let isApplyingStoredSettings = false
 let hasLoadedOnce = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 let unlistenTranscriptionProgress: UnlistenFn | undefined
+let unlistenSubtitleTranslationProgress: UnlistenFn | undefined
 let unlistenDragDrop: UnlistenFn | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
@@ -587,7 +723,26 @@ const canStartTranscription = computed(() => {
 const canExportTranscription = computed(() => {
   return Boolean(transcriptionText.value) && !isTranscribing.value
 })
-const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value)
+const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value && !isTranslationProcessing.value)
+const canExportTranslation = computed(() => Boolean(translationText.value) && !isTranslationProcessing.value)
+const translationRows = computed<TranslationResultRow[]>(() => {
+  const total = Math.max(sourceSubtitleSegments.value.length, translatedSubtitleSegments.value.length)
+
+  return Array.from({ length: total }, (_, index) => {
+    const source = sourceSubtitleSegments.value[index]
+    const translated = translatedSubtitleSegments.value[index]
+
+    return {
+      key: translated?.uid || source?.uid || `translation-row-${index}`,
+      index: index + 1,
+      startTime: source?.startTime ?? translated?.startTime ?? 0,
+      endTime: source?.endTime ?? translated?.endTime ?? 0,
+      sourceText: source?.text ?? '',
+      targetText: translated?.text ?? '',
+      status: normalizeSegmentStatus(translated?.status || source?.status),
+    }
+  })
+})
 const transcriptionStatusText = computed(() => {
   if (transcriptionError.value) {
     return '转录失败'
@@ -630,9 +785,42 @@ const currentTranscriptionStage = computed(() => {
     null
   )
 })
+const visibleTranslationStages = computed(() => {
+  const stages = translationStageProgress.value
+  return [
+    { key: 'subtitle-translation', label: '字幕翻译', stage: stages.subtitleTranslation },
+    { key: 'post-translation-optimization', label: '译后优化', stage: stages.postTranslationOptimization },
+  ]
+    .filter((item): item is { key: string; label: string; stage: TranscriptionProgressStage } => Boolean(item.stage))
+    .map((item) => ({
+      key: item.key,
+      label: item.label,
+      progress: clampProgress(item.stage.progress),
+      status: item.stage.status,
+      message: item.stage.message,
+    }))
+})
+const currentTranslationStage = computed(() => {
+  const stages = visibleTranslationStages.value
+  return (
+    [...stages].reverse().find((stage) => stage.status === 'active') ??
+    [...stages].reverse().find((stage) => stage.status === 'pending') ??
+    [...stages].reverse().find((stage) => stage.status === 'failed') ??
+    [...stages].reverse().find((stage) => stage.status === 'done') ??
+    null
+  )
+})
 const translationStatusText = computed(() => {
   if (subtitleInputError.value) {
     return '字幕导入失败'
+  }
+
+  if (translationError.value) {
+    return '处理失败'
+  }
+
+  if (isTranslationProcessing.value && currentTranslationStage.value) {
+    return currentTranslationStage.value.message
   }
 
   if (activeSubtitlePath.value && translationMessage.value === '等待选择字幕') {
@@ -642,8 +830,13 @@ const translationStatusText = computed(() => {
   return translationMessage.value
 })
 const translationStatusClass = computed(() => ({
-  success: Boolean(activeSubtitlePath.value) && !subtitleInputError.value,
-  error: Boolean(subtitleInputError.value),
+  active: isTranslationProcessing.value,
+  success:
+    !isTranslationProcessing.value &&
+    (Boolean(translationText.value) || Boolean(activeSubtitlePath.value)) &&
+    !subtitleInputError.value &&
+    !translationError.value,
+  error: Boolean(subtitleInputError.value || translationError.value),
 }))
 const isLanguageDialog = computed(() => {
   return activeDialog.value === TranslateDialog.SourceLanguage || activeDialog.value === TranslateDialog.TargetLanguage
@@ -913,6 +1106,7 @@ const applyVideoFile = (path: string) => {
   transcriptionSegments.value = []
   transcriptionText.value = ''
   lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
+  suggestedTranscriptionExportPath.value = ''
   lastOutputPath.value = ''
 }
 
@@ -925,7 +1119,18 @@ const applySubtitleFile = (path: string) => {
 
   selectedSubtitlePath.value = path
   subtitleInputError.value = ''
+  translationError.value = ''
   translationMessage.value = '已选择字幕'
+  translationProgress.value = 0
+  translationStageProgress.value = {}
+  translationWarnings.value = []
+  sourceSubtitleSegments.value = []
+  translatedSubtitleSegments.value = []
+  translationText.value = ''
+  sourceTranslationText.value = ''
+  targetTranslationText.value = ''
+  lastTranslationRevision.value = Number.MAX_SAFE_INTEGER
+  void loadSubtitlePreview(path)
 }
 
 const handleBrowserDrop = (target: FileInputTarget, event: DragEvent) => {
@@ -988,6 +1193,51 @@ const markActiveStageFailed = (stages: TranscriptionStageProgress): Transcriptio
     : undefined,
 })
 
+const markTranslationStageProgressDone = (
+  stages: SubtitleTranslationStageProgress,
+): SubtitleTranslationStageProgress => ({
+  subtitleTranslation: stages.subtitleTranslation ? { ...stages.subtitleTranslation, progress: 100, status: 'done' } : undefined,
+  postTranslationOptimization: stages.postTranslationOptimization
+    ? { ...stages.postTranslationOptimization, progress: 100, status: 'done' }
+    : undefined,
+})
+
+const markActiveTranslationStageFailed = (
+  stages: SubtitleTranslationStageProgress,
+): SubtitleTranslationStageProgress => ({
+  subtitleTranslation: stages.subtitleTranslation
+    ? {
+        ...stages.subtitleTranslation,
+        status: stages.subtitleTranslation.status === 'active' ? 'failed' : stages.subtitleTranslation.status,
+      }
+    : undefined,
+  postTranslationOptimization: stages.postTranslationOptimization
+    ? {
+        ...stages.postTranslationOptimization,
+        status:
+          stages.postTranslationOptimization.status === 'active'
+            ? 'failed'
+            : stages.postTranslationOptimization.status,
+      }
+    : undefined,
+})
+
+const loadSubtitlePreview = async (path: string) => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  try {
+    const result = await invoke<SubtitlePreviewResult>('load_subtitle_preview', { filePath: path })
+    sourceSubtitleSegments.value = result.segments
+    translatedSubtitleSegments.value = []
+    translationMessage.value = `已导入字幕 · ${result.segments.length} 条`
+  } catch (error) {
+    subtitleInputError.value = stringifyError(error)
+    translationMessage.value = '字幕导入失败'
+  }
+}
+
 const startTranscription = async () => {
   if (!selectedVideoPath.value || isTranscribing.value) {
     return
@@ -1016,6 +1266,7 @@ const startTranscription = async () => {
   transcriptionSegments.value = []
   transcriptionText.value = ''
   lastTranscriptionRevision.value = 0
+  suggestedTranscriptionExportPath.value = ''
   lastOutputPath.value = ''
 
   try {
@@ -1031,11 +1282,11 @@ const startTranscription = async () => {
     lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
     transcriptionSegments.value = result.segments
     transcriptionText.value = result.subtitleText
-    lastOutputPath.value = result.outputPath
+    suggestedTranscriptionExportPath.value = result.outputPath
     transcriptionWarnings.value = result.warnings ?? []
     transcriptionProgress.value = 100
     transcriptionStageProgress.value = markStageProgressDone(transcriptionStageProgress.value)
-    transcriptionMessage.value = `转录成功 · ${result.segments.length} 条字幕`
+    transcriptionMessage.value = `转录成功 · ${result.segments.length} 条字幕，可导出`
   } catch (error) {
     transcriptionError.value = stringifyError(error)
     transcriptionMessage.value = '转录失败'
@@ -1079,12 +1330,120 @@ const exportTranscription = async () => {
   }
 }
 
-const startTranslationProcessing = () => {
+const startTranslationProcessing = async () => {
   if (!canStartTranslationProcessing.value) {
     return
   }
 
-  translationMessage.value = '已选择字幕，等待接入处理流程'
+  if (!isTauriRuntime()) {
+    translationError.value = '请在桌面应用中开始处理字幕'
+    return
+  }
+
+  await flushPendingSave()
+  const subtitlePath = activeSubtitlePath.value
+  if (!subtitlePath) {
+    return
+  }
+
+  isTranslationProcessing.value = true
+  translationError.value = ''
+  subtitleInputError.value = ''
+  translationProgress.value = 0
+  translationStageProgress.value = {
+    ...(currentSettings.value.isSubtitleTranslationEnabled
+      ? { subtitleTranslation: { progress: 0, message: '等待开始翻译', status: 'pending' as TranscriptionStageStatus } }
+      : {}),
+    ...(currentSettings.value.isSubtitleTranslationEnabled && currentSettings.value.isPostTranslationOptimizationEnabled
+      ? {
+          postTranslationOptimization: {
+            progress: 0,
+            message: '等待翻译完成',
+            status: 'pending' as TranscriptionStageStatus,
+          },
+        }
+      : {}),
+  }
+  translationWarnings.value = []
+  translatedSubtitleSegments.value = []
+  translationText.value = ''
+  sourceTranslationText.value = ''
+  targetTranslationText.value = ''
+  lastTranslationRevision.value = 0
+  translationMessage.value = '准备处理字幕'
+
+  if (sourceSubtitleSegments.value.length === 0) {
+    await loadSubtitlePreview(subtitlePath)
+  }
+
+  try {
+    const result = await invoke<SubtitleTranslationResult>('start_subtitle_translation', {
+      request: {
+        filePath: subtitlePath,
+      },
+    })
+
+    lastTranslationRevision.value = Number.MAX_SAFE_INTEGER
+    sourceSubtitleSegments.value = result.sourceSegments
+    translatedSubtitleSegments.value = result.translatedSegments
+    translationText.value = result.subtitleText
+    sourceTranslationText.value = result.sourceSubtitleText
+    targetTranslationText.value = result.targetSubtitleText
+    translationWarnings.value = result.warnings ?? []
+    translationProgress.value = 100
+    translationStageProgress.value = markTranslationStageProgressDone(translationStageProgress.value)
+    translationMessage.value = `处理完成 · ${result.translatedSegments.length} 条字幕`
+  } catch (error) {
+    translationError.value = stringifyError(error)
+    translationMessage.value = '处理失败'
+    translationStageProgress.value = markActiveTranslationStageFailed(translationStageProgress.value)
+  } finally {
+    isTranslationProcessing.value = false
+  }
+}
+
+const exportTranslationResult = async () => {
+  if (!translationText.value || !isTauriRuntime()) {
+    return
+  }
+
+  const suggestedPath = buildTranslationExportPath()
+  const shouldExportSeparateFiles = selectedOutputMode.value === OutputMode.SourceAndTargetFiles
+
+  try {
+    const outputPath = await save({
+      title: shouldExportSeparateFiles ? '导出译文字幕' : '导出处理结果',
+      defaultPath: suggestedPath,
+      filters: [
+        {
+          name: `${translationFormatLabel.value} 字幕`,
+          extensions: [selectedTranslationFormat.value],
+        },
+      ],
+    })
+
+    if (!outputPath) {
+      return
+    }
+
+    const targetPath = ensureSubtitleExtension(outputPath, selectedTranslationFormat.value)
+    await invoke('save_transcription_file', {
+      path: targetPath,
+      content: shouldExportSeparateFiles ? targetTranslationText.value : translationText.value,
+    })
+
+    if (shouldExportSeparateFiles) {
+      await invoke('save_transcription_file', {
+        path: siblingExportPath(targetPath, '原文', selectedTranslationFormat.value),
+        content: sourceTranslationText.value,
+      })
+      translationMessage.value = '原文与译文已导出'
+    } else {
+      translationMessage.value = '结果已导出'
+    }
+  } catch (error) {
+    translationError.value = stringifyError(error)
+  }
 }
 
 const openDialog = (dialog: TranslateDialog) => {
@@ -1166,6 +1525,51 @@ const registerProgressListener = async () => {
       transcriptionStageProgress.value = payload.stageProgress
     }
   })
+}
+
+const registerSubtitleTranslationProgressListener = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  unlistenSubtitleTranslationProgress = await listen<SubtitleTranslationProgress>(
+    'subtitle-translation-progress',
+    (event) => {
+      const payload = event.payload
+
+      if (typeof payload.revision === 'number') {
+        if (payload.revision <= lastTranslationRevision.value) {
+          return
+        }
+
+        lastTranslationRevision.value = payload.revision
+        translationProgress.value = clampProgress(payload.progress)
+        translationMessage.value = payload.message
+        if (payload.stageProgress) {
+          translationStageProgress.value = payload.stageProgress
+        }
+
+        if (payload.sourceSegments) {
+          sourceSubtitleSegments.value = payload.sourceSegments
+        }
+
+        if (payload.translatedSegments) {
+          translatedSubtitleSegments.value = payload.translatedSegments
+        }
+
+        if (payload.warnings) {
+          translationWarnings.value = payload.warnings
+        }
+        return
+      }
+
+      translationProgress.value = clampProgress(payload.progress)
+      translationMessage.value = payload.message
+      if (payload.stageProgress) {
+        translationStageProgress.value = payload.stageProgress
+      }
+    },
+  )
 }
 
 const registerDragDropListener = async () => {
@@ -1255,11 +1659,31 @@ const buildExportPath = () => {
     return replaceExtension(lastOutputPath.value, selectedTranscriptionFormat.value)
   }
 
+  if (suggestedTranscriptionExportPath.value) {
+    return replaceExtension(suggestedTranscriptionExportPath.value, selectedTranscriptionFormat.value)
+  }
+
   if (!selectedVideoPath.value) {
     return `字幕.${selectedTranscriptionFormat.value}`
   }
 
   return replaceExtension(selectedVideoPath.value, selectedTranscriptionFormat.value)
+}
+
+const buildTranslationExportPath = () => {
+  const path = activeSubtitlePath.value
+  if (!path) {
+    return `翻译结果.${selectedTranslationFormat.value}`
+  }
+
+  const outputModeSuffix = selectedOutputMode.value === OutputMode.Bilingual ? '双语' : '译文'
+  const withoutExtension = path.replace(/\.[^/.\\]+$/, '')
+  return `${withoutExtension}-${outputModeSuffix}.${selectedTranslationFormat.value}`
+}
+
+const siblingExportPath = (path: string, suffix: string, extension: string) => {
+  const withoutExtension = path.replace(/\.[^/.\\]+$/, '')
+  return `${withoutExtension}-${suffix}.${extension}`
 }
 
 const replaceExtension = (path: string, extension: string) => {
@@ -1283,8 +1707,12 @@ const formatSegmentTime = (ms: number) => {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`
 }
 
-const transcriptionSegmentStatusLabel = (status?: TranscriptionSegmentStatus) => {
-  return status ? transcriptionSegmentStatusLabels[status] : transcriptionSegmentStatusLabels.raw
+const normalizeSegmentStatus = (status?: string): TranscriptionSegmentStatus => {
+  return status && status in transcriptionSegmentStatusLabels ? (status as TranscriptionSegmentStatus) : 'raw'
+}
+
+const transcriptionSegmentStatusLabel = (status?: TranscriptionSegmentStatus | string) => {
+  return transcriptionSegmentStatusLabels[normalizeSegmentStatus(status)]
 }
 
 const stringifyError = (error: unknown) => {
@@ -1306,12 +1734,14 @@ window.addEventListener('keydown', handleKeydown)
 onMounted(() => {
   void loadStoredSettings()
   void registerProgressListener()
+  void registerSubtitleTranslationProgressListener()
   void registerDragDropListener()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   unlistenTranscriptionProgress?.()
+  unlistenSubtitleTranslationProgress?.()
   unlistenDragDrop?.()
 
   if (saveSettingsTimer !== undefined) {
