@@ -4,13 +4,22 @@ use crate::settings::AppSettings;
 use crate::transcription::{TranscriptionSegment, TranscriptionWord};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 const MAX_SEGMENT_WORDS_CJK: usize = 25;
 const MAX_SEGMENT_WORDS_ENGLISH: usize = 18;
 const MAX_SPLIT_CHUNK_WORDS: usize = 500;
 const MAX_SPLIT_ATTEMPTS: usize = 2;
 const MAX_CORRECTION_ATTEMPTS: usize = 3;
+const RULE_SPLIT_GAP_MS: u64 = 500;
+const RULE_MAX_GAP_MS: u64 = 1500;
+const TIME_GAP_WINDOW_SIZE: usize = 5;
+const TIME_GAP_MULTIPLIER: u64 = 3;
+const MIN_TIME_GAP_GROUP_SIZE: usize = 5;
+const PREFIX_WORD_RATIO_NUMERATOR: usize = 6;
+const PREFIX_WORD_RATIO_DENOMINATOR: usize = 10;
+const SUFFIX_WORD_RATIO_NUMERATOR: usize = 4;
+const SUFFIX_WORD_RATIO_DENOMINATOR: usize = 10;
 
 #[derive(Debug)]
 pub struct SubtitleProcessingResult {
@@ -90,7 +99,8 @@ impl VideoPromptStrategy for GeneralPromptStrategy {
 2. CJK 文本每段不超过 {max_word_count_cjk} 字；拉丁语言每段不超过 {max_word_count_english} 词。
 3. 保持每段语义完整，避免过短碎片。
 4. 倒计时、关键信息揭示前、转折和强调位置可适当分割。
-5. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
+5. 如果自然句超过长度上限，必须继续在自然停顿点插入 <br>。
+6. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
         )
     }
 
@@ -101,20 +111,45 @@ impl VideoPromptStrategy for GeneralPromptStrategy {
 
 impl VideoPromptStrategy for TradingPromptStrategy {
     fn correction_system_prompt(&self) -> String {
-        r#"你是一位专业交易视频字幕校正专家。请在保持原意、语言和段落结构的前提下修正转录字幕。
+        r#"你是一位金融交易视频字幕校正专家，专门处理交易术语、价格行为和市场分析内容。请在保持原意、语言和段落结构的前提下修正转录字幕。
 
-规则:
-1. 只修正识别错误、错别字、明显口癖、非语言声音和标点格式。
-2. 不翻译、不改写、不扩写，不改变交易判断。
-3. 严格保留数字、价格、百分比、杠杆倍数、ticker、币种、时间周期和方向词。
-4. 优先修正常见交易术语误识别，例如做多、做空、止损、止盈、支撑、阻力、突破、回踩、K线、均线、成交量、仓位、现货、合约。
-5. 保持输入 JSON 的所有 key，不新增、不删除、不合并、不拆分条目。
-6. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。"#
+# 基础规则
+1. 只修正识别错误、错别字、明显口癖、非语言声音、重复转录错误和标点格式。
+2. 不翻译、不改写、不扩写，不改变交易判断、交易方向、风险提示或说话者语气。
+3. 保持原始语言：英文输入输出英文，中文输入输出中文，绝不跨语言翻译。
+4. 保持输入 JSON 的所有 key，不新增、不删除、不合并、不拆分条目。
+5. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
+6. 如果上下文不明确，宁可保留原文，也不要猜测或替换为同义表达。
+
+# 交易内容保护规则
+1. 严格保留数字、价格、百分比、比例、倍数、杠杆倍数、ticker、币种、货币对、交易所名称、时间周期和方向词。
+2. 保持金融记号准确，包括 $、%、x、EUR/USD、BTC/USDT、AAPL、1H、4H、1D、1W、1M 等。
+3. 标准化技术指标和平台名称：RSI、MACD、MA、EMA、SMA、Bollinger Bands、TradingView、MetaTrader、Interactive Brokers。
+4. 保留常见交易讲师和人名：Ali Moin Afshari、Al Brooks、Rose、Tim Fairweather、Tom Hougaard、Richard。
+5. 保持交易社区常用表达和术语，不要把 long/short、bullish/bearish、support/resistance、bar、setup 等改成非交易语境表达。
+
+# 重点交易术语
+优先保护并按上下文修正常见价格行为词汇：
+price action, trading setup, pullback, trend, breakout, reversal, channel, wedge, flag, support, resistance, swing high, swing low, bar pattern, signal, entry, exit, stop loss, profit target, always in long, always in short, scalp, context, premise, reasonable trade, management, risk reward, measured move, leg, spike, climax, exhaustion, gap, momentum, continuation, correction, inside bar, outside bar, pin bar, doji, hammer, shooting star, engulfing, bull trap, bear trap, failed breakout, double top, double bottom, head and shoulders, EMA, moving average, confluence zone, supply, demand, order flow, limit order, stop order, market order, position sizing, trend line, horizontal line, diagonal, strong, weak, pressure, vacuum, magnet, first pullback, second entry, high probability, micro double top, micro double bottom, micro E-mini, major trend, minor pullback, trading range, day structure, trading range day structure, day type, micro channel, micro gap, broad channel, tight channel, tight trading range, context transition, MTR, major trend reversal, follow through, Pro Trader Mentoring, I1R, pause bar, swing trade, countertrend scalp, countertrend, fade, strong bulls and bears, scratch, trap, trapped in a trade, trapped out of a trade, failed failure, second signal, double bottom bull flag, three push, wedge flag, barb wire, spike and channel, buying pressure, pressing their longs, pressing their shorts, micro measuring gap, 20 moving average gap bars, moving average gap bar, gap bar, second moving average gap bar setup, sell the close, buy the close。
+
+# 强制修正规则
+1. Al Brooks 价格行为语境中不存在 "macro channel" 或 "macro gap"。
+2. 如果 ASR 输出 "macro channel" / "macro gap"（包括大小写、连字符、复数等变体），必须修正为 "micro channel" / "micro gap"，绝不能保留 macro channel / macro gap。
+3. "macro E-mini" 必须修正为 "micro E-mini"。
+4. 根据上下文修正交易术语同音误识别：dog/dogy/dodgy→doji，mack d/mac d→MACD，are s i→RSI，e may→EMA，bowling/bollinger→Bollinger Bands。
+5. 仅在交易上下文清楚时修正误识别；除 macro→micro 的强制规则外，不确定时保留原 token。
+
+# 输出格式
+返回与输入 key 完全一致的 JSON 对象：
+{
+  "1": "校正后的字幕",
+  "2": "校正后的字幕"
+}"#
             .to_string()
     }
 
     fn correction_reference(&self) -> &'static str {
-        "交易视频内容。重点保护价格、比例、方向、周期、币种和交易术语，不擅自改变结论。"
+        "交易视频内容。重点保护价格、比例、方向、周期、币种、ticker、技术指标、价格行为术语和 Al Brooks 交易术语，不擅自改变结论。"
     }
 
     fn split_system_prompt(
@@ -130,7 +165,8 @@ impl VideoPromptStrategy for TradingPromptStrategy {
 2. CJK 文本每段不超过 {max_word_count_cjk} 字；拉丁语言每段不超过 {max_word_count_english} 词。
 3. 价格、百分比、杠杆、ticker、币种、K线周期、做多/做空、止损/止盈等关键信息不要拆散。
 4. 在交易观点切换、条件触发、风险提示、入场/出场说明处优先分割。
-5. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
+5. 如果自然句超过长度上限，必须继续在交易信息边界插入 <br>。
+6. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
         )
     }
 
@@ -719,9 +755,23 @@ async fn split_chunk_by_llm(
             }
         };
         let sentences = parse_split_response(&response);
+        let original_sentence_count = sentences.len();
 
-        match validate_split_result(&source_text, &sentences) {
-            Ok(()) => {
+        match normalize_split_sentences_by_rules(&source_text, &words, &sentences).and_then(
+            |sentences| validate_split_result(&source_text, &sentences).map(|()| sentences),
+        ) {
+            Ok(sentences) => {
+                if sentences.len() != original_sentence_count {
+                    log_session.info(
+                        "smart_segmentation_rule_repaired",
+                        "智能断句结果已按规则补充分割",
+                        json!({
+                            "attempt": attempt,
+                            "sourceChars": source_text.chars().count(),
+                            "sentenceCount": sentences.len(),
+                        }),
+                    );
+                }
                 return Ok(merge_word_units_by_sentences(&words, &sentences));
             }
             Err(error) => {
@@ -736,13 +786,38 @@ async fn split_chunk_by_llm(
                     }),
                 );
                 feedback = format!(
-                    "上一次结果无效: {error}\n请重新输出完整文本，只允许插入 <br>，不要解释。"
+                    "上一次结果无效: {error}\n请重新输出完整文本，只允许插入 <br>，每段必须满足长度上限，不要解释。"
                 );
             }
         }
     }
 
-    Err("LLM 断句结果多次校验失败".to_string())
+    let fallback_sentences = rule_split_word_units(&words);
+    match validate_split_result(&source_text, &fallback_sentences) {
+        Ok(()) => {
+            log_session.warn(
+                "smart_segmentation_rule_fallback_used",
+                "智能断句 LLM 多次校验失败，已使用规则断句兜底",
+                json!({
+                    "sourceChars": source_text.chars().count(),
+                    "sentenceCount": fallback_sentences.len(),
+                }),
+            );
+            Ok(merge_word_units_by_sentences(&words, &fallback_sentences))
+        }
+        Err(error) => {
+            log_session.warn(
+                "smart_segmentation_rule_fallback_failed",
+                "智能断句规则兜底失败",
+                json!({
+                    "sourceChars": source_text.chars().count(),
+                    "sentenceCount": fallback_sentences.len(),
+                    "error": &error,
+                }),
+            );
+            Err("LLM 断句结果多次校验失败".to_string())
+        }
+    }
 }
 
 async fn correct_chunk_by_llm(
@@ -997,6 +1072,60 @@ fn parse_split_response(response: &str) -> Vec<String> {
         .collect()
 }
 
+fn normalize_split_sentences_by_rules(
+    source_text: &str,
+    words: &[WordUnit],
+    sentences: &[String],
+) -> Result<Vec<String>, String> {
+    if sentences.is_empty() {
+        return Err("没有找到 <br> 分段结果".to_string());
+    }
+
+    let source_normalized = normalize_content(source_text);
+    let merged_normalized = normalize_content(&sentences.join(""));
+    if source_normalized != merged_normalized {
+        return Err("断句结果修改了原文内容".to_string());
+    }
+
+    let max_allowed = max_segment_words_for_text(source_text);
+    let mut normalized = Vec::new();
+    let mut word_index = 0usize;
+    for sentence in sentences {
+        let target_len = normalized_len(sentence);
+        if target_len == 0 {
+            continue;
+        }
+
+        let start_index = word_index;
+        let mut current_len = 0usize;
+        while word_index < words.len() && (current_len < target_len || word_index == start_index) {
+            current_len += normalized_len(&words[word_index].text).max(1);
+            word_index += 1;
+        }
+
+        if start_index >= word_index {
+            continue;
+        }
+
+        let group = &words[start_index..word_index];
+        let time_groups = group_word_units_by_time_gaps(group, RULE_MAX_GAP_MS, false);
+        for time_group in time_groups {
+            let text = join_word_units(&time_group);
+            if count_words(&text) > max_allowed {
+                normalized.extend(rule_split_word_units(&time_group));
+            } else {
+                normalized.push(text);
+            }
+        }
+    }
+
+    if word_index < words.len() {
+        normalized.extend(rule_split_word_units(&words[word_index..]));
+    }
+
+    Ok(normalized)
+}
+
 fn validate_split_result(source_text: &str, sentences: &[String]) -> Result<(), String> {
     if sentences.is_empty() {
         return Err("没有找到 <br> 分段结果".to_string());
@@ -1025,6 +1154,241 @@ fn validate_split_result(source_text: &str, sentences: &[String]) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn rule_split_word_units(words: &[WordUnit]) -> Vec<String> {
+    let mut result = Vec::new();
+    for group in group_word_units_by_time_gaps(words, RULE_SPLIT_GAP_MS, true) {
+        for common_group in split_word_units_by_common_words(&group) {
+            result.extend(split_long_word_units(&common_group));
+        }
+    }
+
+    result
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+fn group_word_units_by_time_gaps(
+    words: &[WordUnit],
+    max_gap_ms: u64,
+    check_large_gaps: bool,
+) -> Vec<Vec<WordUnit>> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut current_group = vec![words[0].clone()];
+    let mut recent_gaps: VecDeque<u64> = VecDeque::new();
+
+    for index in 1..words.len() {
+        let time_gap = words[index]
+            .start_time
+            .saturating_sub(words[index - 1].end_time);
+        let mut should_split = time_gap > max_gap_ms;
+
+        if check_large_gaps {
+            recent_gaps.push_back(time_gap);
+            if recent_gaps.len() > TIME_GAP_WINDOW_SIZE {
+                recent_gaps.pop_front();
+            }
+            if recent_gaps.len() == TIME_GAP_WINDOW_SIZE {
+                let gap_sum = recent_gaps.iter().sum::<u64>();
+                let average_gap = gap_sum / TIME_GAP_WINDOW_SIZE as u64;
+                if average_gap > 0
+                    && time_gap > average_gap.saturating_mul(TIME_GAP_MULTIPLIER)
+                    && current_group.len() > MIN_TIME_GAP_GROUP_SIZE
+                {
+                    should_split = true;
+                }
+            }
+        }
+
+        if should_split {
+            result.push(std::mem::take(&mut current_group));
+            recent_gaps.clear();
+        }
+
+        current_group.push(words[index].clone());
+    }
+
+    if !current_group.is_empty() {
+        result.push(current_group);
+    }
+
+    result
+}
+
+fn split_word_units_by_common_words(words: &[WordUnit]) -> Vec<Vec<WordUnit>> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut current_group = Vec::new();
+
+    for (index, word) in words.iter().enumerate() {
+        let max_word_count = max_segment_words_for_text(&word.text);
+        let prefix_threshold = ratio_threshold(
+            max_word_count,
+            PREFIX_WORD_RATIO_NUMERATOR,
+            PREFIX_WORD_RATIO_DENOMINATOR,
+        );
+        let suffix_threshold = ratio_threshold(
+            max_word_count,
+            SUFFIX_WORD_RATIO_NUMERATOR,
+            SUFFIX_WORD_RATIO_DENOMINATOR,
+        );
+
+        if !current_group.is_empty()
+            && count_word_units(&current_group) >= prefix_threshold
+            && is_prefix_split_word(&word.text)
+        {
+            result.push(std::mem::take(&mut current_group));
+        }
+
+        if index > 0
+            && !current_group.is_empty()
+            && count_word_units(&current_group) >= suffix_threshold
+            && is_suffix_split_word(&words[index - 1].text)
+        {
+            result.push(std::mem::take(&mut current_group));
+        }
+
+        current_group.push(word.clone());
+    }
+
+    if !current_group.is_empty() {
+        result.push(current_group);
+    }
+
+    result
+}
+
+fn split_long_word_units(words: &[WordUnit]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut queue = VecDeque::from([words.to_vec()]);
+
+    while let Some(current_words) = queue.pop_front() {
+        if current_words.is_empty() {
+            continue;
+        }
+
+        let merged_text = join_word_units(&current_words);
+        let max_word_count = max_segment_words_for_text(&merged_text);
+
+        if count_words(&merged_text) <= max_word_count || current_words.len() < 4 {
+            result.push(merged_text);
+            continue;
+        }
+
+        let split_index = best_rule_split_index(&current_words);
+        let first_words = current_words[..=split_index].to_vec();
+        let second_words = current_words[split_index + 1..].to_vec();
+
+        queue.push_back(first_words);
+        queue.push_back(second_words);
+    }
+
+    result
+}
+
+fn best_rule_split_index(words: &[WordUnit]) -> usize {
+    if words.len() < 2 {
+        return 0;
+    }
+
+    let gaps = words
+        .windows(2)
+        .map(|pair| pair[1].start_time.saturating_sub(pair[0].end_time))
+        .collect::<Vec<_>>();
+
+    if gaps.iter().all(|gap| *gap == gaps[0]) {
+        return words.len() / 2;
+    }
+
+    let start_index = (words.len() / 6).max(1);
+    let end_index = ((5 * words.len()) / 6).min(words.len().saturating_sub(2));
+    if start_index > end_index {
+        return words.len() / 2;
+    }
+
+    (start_index..=end_index)
+        .max_by_key(|index| gaps.get(*index).copied().unwrap_or(0))
+        .unwrap_or(words.len() / 2)
+}
+
+fn ratio_threshold(max_word_count: usize, numerator: usize, denominator: usize) -> usize {
+    max_word_count
+        .saturating_mul(numerator)
+        .checked_div(denominator.max(1))
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn is_prefix_split_word(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "and"
+            | "or"
+            | "but"
+            | "if"
+            | "then"
+            | "because"
+            | "as"
+            | "until"
+            | "while"
+            | "what"
+            | "when"
+            | "where"
+            | "nor"
+            | "yet"
+            | "so"
+            | "for"
+            | "however"
+            | "moreover"
+            | "和"
+            | "及"
+            | "与"
+            | "但"
+            | "而"
+            | "或"
+            | "因"
+            | "我"
+            | "你"
+            | "他"
+            | "她"
+            | "它"
+            | "咱"
+            | "您"
+            | "这"
+            | "那"
+            | "哪"
+    )
+}
+
+fn is_suffix_split_word(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let suffix_words = [
+        ".", ",", "!", "?", "。", "，", "！", "？", "的", "了", "着", "过", "吗", "呢", "吧", "啊",
+        "呀", "嘛", "啦", "mine", "yours", "hers", "its", "ours", "theirs", "either", "neither",
+    ];
+
+    suffix_words
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
 }
 
 fn max_segment_words_for_text(text: &str) -> usize {
@@ -1322,6 +1686,134 @@ mod tests {
     }
 
     #[test]
+    fn trading_correction_prompt_keeps_required_trading_terms() {
+        let prompt = TradingPromptStrategy.correction_system_prompt();
+
+        for expected in [
+            "macro channel",
+            "micro channel",
+            "macro gap",
+            "micro gap",
+            "macro E-mini",
+            "micro E-mini",
+            "doji",
+            "MACD",
+            "RSI",
+            "EMA",
+            "Bollinger Bands",
+            "Ali Moin Afshari",
+            "Al Brooks",
+            "sell the close",
+            "buy the close",
+        ] {
+            assert!(prompt.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn repairs_llm_sentence_that_crosses_large_time_gap() {
+        let words = vec![
+            WordUnit {
+                text: "hello".to_string(),
+                start_time: 0,
+                end_time: 300,
+            },
+            WordUnit {
+                text: "world".to_string(),
+                start_time: 300,
+                end_time: 600,
+            },
+            WordUnit {
+                text: "again".to_string(),
+                start_time: 2300,
+                end_time: 2600,
+            },
+        ];
+        let source = join_word_units(&words);
+        let sentences = vec![source.clone()];
+
+        let repaired = normalize_split_sentences_by_rules(&source, &words, &sentences).unwrap();
+
+        assert_eq!(repaired, vec!["hello world", "again"]);
+        assert!(validate_split_result(&source, &repaired).is_ok());
+    }
+
+    #[test]
+    fn rule_fallback_splits_long_english_on_common_word() {
+        let texts = [
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "but",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+        ];
+        let words = timed_words(&texts, 0, 100, 100);
+
+        let sentences = rule_split_word_units(&words);
+        let source = join_word_units(&words);
+
+        assert!(sentences.len() >= 2);
+        assert!(validate_split_result(&source, &sentences).is_ok());
+        assert!(sentences
+            .iter()
+            .all(|sentence| count_words(sentence) <= MAX_SEGMENT_WORDS_ENGLISH));
+    }
+
+    #[test]
+    fn rule_fallback_prefers_large_time_gap() {
+        let texts = [
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+        ];
+        let mut words = timed_words(&texts, 0, 100, 100);
+        for word in words.iter_mut().skip(10) {
+            word.start_time += 800;
+            word.end_time += 800;
+        }
+
+        let sentences = rule_split_word_units(&words);
+        let source = join_word_units(&words);
+
+        assert!(sentences.len() >= 2);
+        assert!(sentences[0].contains("ten"));
+        assert!(validate_split_result(&source, &sentences).is_ok());
+    }
+
+    #[test]
     fn merges_word_units_by_sentence_lengths() {
         let words = vec![
             WordUnit {
@@ -1367,5 +1859,20 @@ mod tests {
         assert_eq!(skipped, 1);
         assert!(!block_needs_split_ai(&blocks[0]));
         assert_eq!(blocks[0].display_segments[0].status, "segmented");
+    }
+
+    fn timed_words(texts: &[&str], start_time: u64, duration: u64, gap: u64) -> Vec<WordUnit> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let start = start_time + index as u64 * (duration + gap);
+                WordUnit {
+                    text: (*text).to_string(),
+                    start_time: start,
+                    end_time: start + duration,
+                }
+            })
+            .collect()
     }
 }
