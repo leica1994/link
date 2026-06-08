@@ -952,7 +952,7 @@ fn log_post_optimization_validation_failure(
 
 fn build_translation_system_prompt(settings: &AppSettings) -> String {
     let target_language = language_label(&settings.target_language);
-    let custom_prompt = translation_reference(settings);
+    let custom_prompt = translation_reference(&settings.video_content_type);
 
     if settings.needs_reflection_translation {
         return format!(
@@ -1011,14 +1011,14 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
 
 fn build_post_optimization_system_prompt(settings: &AppSettings) -> String {
     let target_language = language_label(&settings.target_language);
-    let custom_prompt = translation_reference(settings);
+    let custom_prompt = post_optimization_reference();
 
     format!(
         r#"你是一位专业字幕译后优化专家，专精于{target_language}字幕润色。请把同一批字幕行连成句子或段落理解，找出不通顺、生硬、前后衔接差或机器翻译腔的译文行，并在不改变时间轴和行数的前提下优化。
 
 <rules>
 1. 保持输入 JSON 的所有真实 key，不新增、不删除、不合并、不拆分条目，也不要把本批重新编号为 1..N。
-2. 只优化译文表达、语序、衔接和术语一致性，不改变原意、数字、专有名词、交易方向或风险提示。
+2. 只优化译文表达、语序、衔接和术语一致性，不改变原意、数字、专有名词、方向性判断或风险提示。
 3. 相邻字幕跨句衔接时，允许让单行译文更自然地承接前后文，但不要把一行内容搬到另一行。
 4. 如果某行已经通顺，保留该行。
 5. 你可以在内部分析哪些行不通顺，但不要输出分析、理由、评分、建议或嵌套对象。
@@ -1180,14 +1180,98 @@ fn build_key_mismatch_feedback(entries: &BTreeMap<String, String>, error: &str) 
     )
 }
 
-fn translation_reference(settings: &AppSettings) -> &'static str {
-    match settings.video_content_type.as_str() {
-        "trading" => {
-            "交易视频内容。严格保护价格、比例、方向、周期、币种、ticker、技术指标、交易术语和风险提示。long/short、support/resistance、bar、setup、price action 等可按语境保留或使用通行译法，不改变交易判断。"
-        }
-        _ => "通用视频内容。优先保证准确、自然、口语可读，术语按上下文保持一致。",
+fn translation_reference(video_content_type: &str) -> &'static str {
+    match video_content_type {
+        "trading" => TRADING_TRANSLATION_REFERENCE,
+        _ => GENERAL_TRANSLATION_REFERENCE,
     }
 }
+
+fn post_optimization_reference() -> &'static str {
+    POST_OPTIMIZATION_REFERENCE
+}
+
+const GENERAL_TRANSLATION_REFERENCE: &str =
+    "通用视频内容。优先保证准确、自然、口语可读，术语按上下文保持一致。";
+
+const POST_OPTIMIZATION_REFERENCE: &str = r#"译后优化与视频类型无关，只处理已经生成的译文。
+- 优化范围只限相邻字幕之间的衔接、重复开头、语序不顺和机器翻译腔。
+- 不重译、不扩写、不新增解释，不为了风格统一改写已经可接受的译文。
+- 保留原文对应的事实、数字、专有名词、术语、方向性判断和风险提示。
+- 如果上下文不足，优先保留当前译文，不猜测补充。"#;
+
+const TRADING_TRANSLATION_REFERENCE: &str = r#"交易视频内容。参考 VideoCaptioner 交易类提示词，以下交易相关规则必须保留并优先执行。
+
+# 翻译前补充矫正
+输入字幕已经过处理，但可能仍有遗漏错误。翻译时如发现明显不通顺或错误，请自动矫正后再翻译。
+1. 术语错误：macro channel->micro channel, macro gap->micro gap, mack d/mac d->MACD, are s i->RSI, e may->EMA, dog/dogy/dodgy->doji, bowling/bollinger->Bollinger Bands, macro E-mini->micro E-mini。
+2. 语法错误：主谓不一致、时态错误。
+3. 仅矫正明显错误，不过度修改，保持说话者原意和风格，直接输出矫正后的翻译，不标注修改。
+4. 示例：输入 "the macro channel is forming"，应自动识别 macro 应为 micro，并译为"微通道正在形成"。
+
+# TTS 语音优化要求
+翻译结果将用于 TTS 配音，请确保：
+- 外国人名只保留原名不添加音译，但人名前后的称谓/头衔必须翻译成目标语言并按目标语言习惯排列。
+- 避免中英文重复表达同一概念，使用口语化的交易者日常用语。
+- 注意前后字幕行的衔接通顺和良好断句。
+- TTS 不友好符号必须转换为可朗读的文字；所有符号转换都必须基于语义理解，而非机械匹配。
+- 比值冒号：`2:1`->"二比一"、`1:3`->"一比三"（风险收益比等比率语境）。
+- 斜杠表示分数/比例：`2/3`->"三分之二"、`1/4`->"四分之一"；货币对如 EUR/USD、股票代码等专有名词中的斜杠保留原样。
+- 货币符号：`$1945`->"1945美元"、`€50`->"50欧元"、`£30`->"30英镑"、`¥100`->"100日元"。
+- 百分号：整数百分比必须转换为完整中文数字表达，如 `100%`->"百分之百"、`50%`->"百分之五十"、`3%`->"百分之三"、`0%`->"百分之零"；小数百分比如 `2.5%`、`0.5%` 保持符号形式；负整数百分比如 `-3%`->"负百分之三"，负小数百分比如 `-2.5%` 保持原样。
+- 禁止使用"五五开"、"八成"、"九成"等口语化比例词，必须转换为标准百分比表达。
+- 数学运算符仅当上下文明确表示数学运算时转换：`+`->"加"、`-`->"减"、`x`/`×`->"乘以"、`÷`->"除以"、`=`->"等于"、`>`->"大于"、`<`->"小于"。
+- 型号/编号、化学式、日期/版本号、人名缩写、地点/机构名中的符号保持原样，如 F-14、Boeing-747、iPhone-15、RTX-4090、C-14、2024-01-15、Jean-Pierre、U.S.-China。
+- 数值范围或价格区间中的连接符转换为"到"或"至"，如 `100-200`、`4500~4600`。
+- 负号用作负数符号时转为"负"，如 `-1`->"负1"、`-0.5`->"负0.5"。
+- 倍数符号：`10x`->"十倍"、`2x`->"两倍"。
+- `°`->"度"；`S&P`->"标普"；其他语境的 `&`->"和"；`#1`->"第一"；冒号用于时间以外的语境时转为逗号或自然语言衔接。
+- 数字中的小数点必须保持原样，禁止转换为"点"字，例如 `3461.83`、`0.5`、`1.0850`。
+
+# Al Brooks 价格行为专用术语
+以下术语必须严格遵守：
+1. leg -> "推动"（禁：浪/腿）；second leg->第二次推动、leg up->向上推动。
+2. follow-through -> "跟随/跟进"（禁：跟风）；follow-through bar->跟随K线、good follow-through->良好的跟随。
+3. bar -> "K线"（禁：棒/柱/条）；outside bar 必须译为"外包K线"不可省略 K线；bar+数字必须独立翻译，如 "Bar 38 and bar 56"->"第38根K线和第56根K线"。signal bar->信号K线、trend bar->趋势K线、entry bar->入场K线、pullback bar->回调K线、inside bar->内包K线、mother bar->孕线、doji->十字星、shaved body->光头光脚K线、pause bar->停顿K线、breakout bar->突破K线、reversal bar->反转K线。
+4. 数字+point -> "X个点"；仅限数字+point组合，其他 point 按语义译。
+5. tick -> "跳动点"，数字+tick 需加量词"个"。
+6. spike -> "急速"（禁：尖峰/尖刺）；bear spike->空头急速、spike and channel->急速与通道。
+7. swing -> "波段"（禁：摆动/摇摆）；swing high->波段高点、swing low->波段低点、swing point->波段点、swing trade->波段交易。
+8. scalp -> "剥头皮"（禁：超短线/短线）；scalpers->剥头皮交易者、scalping->剥头皮交易、countertrend scalp->逆势剥头皮交易。
+9. trend -> "趋势"（禁：走势/潮流）；价格方向统一使用"上涨/下跌"，不用"上升/下降"。trend line->趋势线、trend reversal->趋势反转、trend channel line->趋势通道线、major trend line->主要趋势线、micro trend line->微趋势线、micro trend channel line->微趋势通道线、micro trend line breakout->微趋势线突破、trend channel line overshoot->过冲趋势通道线、trend channel line undershoot->不及趋势通道线、trend from the open->开盘趋势。
+10. bull/bear 必须根据语境选择合适翻译：
+   - 市场状态：bull market->牛市、bear market->熊市、bull trend->上涨趋势（禁：上升趋势/多头趋势/牛市趋势）、bear trend->下跌趋势（禁：下降趋势/空头趋势/熊市趋势）、bull channel->上涨通道、bear channel->下跌通道。
+   - 参与者/力量：bulls->多头、bears->空头、strong bulls->强势多头、strong bears->强势空头、strong bulls and bears->强势多头与强势空头。
+   - 情绪/观点：bullish->看涨/偏多、bearish->看跌/偏空、bullish on X->看好X、bearish bias->偏空结构。
+   - 信号/形态：bullish signal->看涨信号、bearish signal->看跌信号、bullish breakout->多头突破、bearish breakout->空头突破、bullish divergence->看涨背离/底背离、bearish divergence->看跌背离/顶背离、bullish engulfing->看涨吞没、bearish engulfing->看跌吞没。
+   - K线方向：bull bar->阳线、bear bar->阴线、bull body->阳线实体、bear body->阴线实体、body->实体。
+   - 盘面/陷阱：bullish order flow->买盘占优、bearish order flow->卖盘占优、bull trap->多头陷阱/诱多、bear trap->空头陷阱/诱空、bullish pressure->买盘压力、bearish pressure->卖盘压力。
+   - 反转：bull reversal->多头反转、bear reversal->空头反转。
+   - 高潮/抛售/反弹：bull climax->买入高潮、bear climax->抛售高潮、bear selloff->空头抛售、bear rally->下跌趋势中的反弹。
+   - 旗形形态：bull flag->牛旗、bear flag->熊旗、double bottom bull flag->双底牛旗、wedge flag->楔形旗形、final flag->末端旗形。
+   - 兜底规则：无法确定具体语境时，bear->空头、bull->多头，避免直译为熊/牛。
+11. always in -> "单边趋势"（禁：总是在做多/空）；always in long->单边上涨趋势、always in short->单边下跌趋势。
+12. breakout/pullback -> "突破/回调"；breakout mode->突破模式、breakout test->突破测试、breakout pullback->突破回调、pullback bar->回调K线、endless pullback->无尽的回调、second entry->二次入场点。
+13. reversal -> "反转"（禁：逆转/翻转）；trend reversal->趋势反转、double total reversal->双重完全反转、opening reversal->开盘反转、average reversal->平均反转、wedge reversal->楔形反转、gap reversal->缺口反转、major trend reversal->主要趋势反转。
+14. test/edge/risk -> test->测试、edge->优势、risk->风险；test of support->测试支撑、trading edge->交易优势、risk management->风险管理。
+15. context -> "背景/市场背景"（禁：语境）；in this context->在这个背景下、market context->市场背景、trading context->交易背景。
+16. setup -> "建仓形态"（禁：设置）；bullish setup->多头建仓形态、failed setup->失败建仓形态、this setup looks good->这个建仓形态不错。
+17. High/Low + 数字（Al Brooks 形态名）必须统一为中文序号：High 1->高一、High 2->高二、High 3->高三、High 4->高四；Low 1->低一、Low 2->低二、Low 3->低三、Low 4->低四。兼容 High-1/High1/high one/low two 等写法。示例：a High 2 buy signal->高二买入信号。禁：High 1/Low 1 原样保留；禁：高1/低2。
+18. tight 相关术语：tight->窄幅的（禁：紧的/紧密的）；tight channel->窄通道、tight trading range->窄幅交易区间、broad channel->宽通道。
+19. 收盘交易术语：sell the close->卖收盘、buy the close->买收盘；traders are selling the close->交易者在卖收盘、buying the close->买收盘。
+20. 其他关键术语：Measured Move/measured move->测量移动、climax->高潮、fractal->分形、nesting->嵌套、double bottom->双底、tradable->可交易的、reasonable->合理的、directional probability->方向概率、selling pressure->卖压、melt-up->暴涨、meltdown->崩盘、time frame->时间框架、micro->微型、withdrawal->撤回、pip->点、Surprise Bar->惊喜K线、countertrend->逆势、fade->逆势交易、scratch->打平、trap->被套、trapped in a trade->被套的交易、trapped out of a trade->被震仓的交易、failed failure->失败的突破失败、second signal->二次信号、double top->双重顶、micro double bottom->微型双重底、micro double top->微型双重顶、three push->三次推动/三推、wedge->楔形、trading range->交易区间、day structure->交易日结构、trading range day structure->交易区间日结构、day type->交易日类型、barb wire->铁丝网形态、micro channel->微通道、spike and channel->急速与通道、vacuum->真空、buying pressure->买盘、pressing their longs->多头加仓、pressing their shorts->空头加仓、gap->缺口、micro measuring gap->微型测量缺口、20 Moving Average gap bars->20均线缺口K线、moving average gap bar/gap bar->均线缺口K线/缺口K线、second moving average gap bar setup->二次均线缺口K线建仓形态、limit order->限价单、stop order->止损单、Discretionary Trading->主观交易、Systematic Trading->系统化交易、Mechanical Trading->机械交易、Rule-based Trading->规则化交易。
+
+# 金融翻译注意事项
+- 严禁增译：不得添加原文未明确表达的动作、因果、评价、推断或解释性话语，例如"再来一遍/也就是说/总结一下"。
+- 允许的润色仅限于语序微调与标点优化，不得引入新信息或改变原句事实。
+- 保持数字的精确性：价格、百分比、倍数等必须准确无误。
+- 技术指标保留英文缩写：RSI、MACD、MA、EMA、KDJ 等后面可加中文说明。
+- 保留股票代码、货币对、交易所名称的原文。
+- 时间周期标准化：1H->1小时、4H->4小时、Daily->日线、Weekly->周线。
+- 文化相关性：可适当使用金融行业常用表达，如"割韭菜"、"追涨杀跌"、"抄底"等。
+- 数字翻译原则：保持数字简洁，不随意添加"点"、"号"等单位，只在明确表示时间、温度等特定语境时才添加单位。
+- 连续数字/口头计数识别：带名词的枚举计数如 "one pullback, two pullback, three"、"one push, two push, three"、"one two three push" 应译为"三次回调：一、二、三"或"三次推动：一、二、三"；纯数字计数如 "one two three"、"1 2 3" 直接用顿号分隔为"一、二、三"；原文重复几次，译文也重复几次；若确认是单一数值而非计数，保持原样。
+- 严格保持字幕编号一一对应，不合并、不拆分、不新增、不删除字幕。"#;
 
 fn language_label(language_code: &str) -> String {
     match language_code {
@@ -2341,5 +2425,100 @@ mod tests {
         assert!(prompt.contains("复制 output_template 的完整 JSON object 外层结构和全部 key"));
         assert!(prompt.contains(r#""31":"译文 31""#));
         assert!(!prompt.contains(r#""1":"优化后的译文 1""#));
+    }
+
+    #[test]
+    fn trading_translation_prompt_keeps_video_captioner_trading_terms() {
+        let mut settings = test_settings();
+        settings.video_content_type = "trading".to_string();
+
+        let prompt = build_translation_system_prompt(&settings);
+
+        for expected in [
+            "macro channel->micro channel",
+            "macro gap->micro gap",
+            "macro E-mini->micro E-mini",
+            "dog/dogy/dodgy->doji",
+            "2:1`->\"二比一\"",
+            "EUR/USD",
+            "leg -> \"推动\"",
+            "follow-through -> \"跟随/跟进\"",
+            "bar -> \"K线\"",
+            "outside bar 必须译为\"外包K线\"",
+            "swing -> \"波段\"",
+            "scalp -> \"剥头皮\"",
+            "bull trend->上涨趋势",
+            "setup -> \"建仓形态\"",
+            "High 1->高一",
+            "sell the close->卖收盘",
+            "second moving average gap bar setup->二次均线缺口K线建仓形态",
+            "Discretionary Trading->主观交易",
+        ] {
+            assert!(prompt.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn trading_reflection_prompt_keeps_native_translation_contract() {
+        let mut settings = test_settings();
+        settings.video_content_type = "trading".to_string();
+        settings.needs_reflection_translation = true;
+
+        let prompt = build_translation_system_prompt(&settings);
+
+        assert!(prompt.contains("Al Brooks 价格行为专用术语"));
+        assert!(prompt.contains("native_translation"));
+        assert!(prompt.contains("macro channel->micro channel"));
+    }
+
+    #[test]
+    fn general_translation_prompt_does_not_use_trading_reference() {
+        let settings = test_settings();
+
+        let prompt = build_translation_system_prompt(&settings);
+
+        assert!(prompt.contains(GENERAL_TRANSLATION_REFERENCE));
+        assert!(!prompt.contains("Al Brooks 价格行为专用术语"));
+        assert!(!prompt.contains("macro channel->micro channel"));
+    }
+
+    #[test]
+    fn post_optimization_prompt_is_independent_from_video_type() {
+        let mut general_settings = test_settings();
+        general_settings.video_content_type = "general".to_string();
+
+        let mut trading_settings = test_settings();
+        trading_settings.video_content_type = "trading".to_string();
+
+        let general_prompt = build_post_optimization_system_prompt(&general_settings);
+        let trading_prompt = build_post_optimization_system_prompt(&trading_settings);
+
+        assert_eq!(general_prompt, trading_prompt);
+        assert!(general_prompt.contains("译后优化与视频类型无关"));
+        assert!(!general_prompt.contains("Al Brooks 价格行为专用术语"));
+        assert!(!general_prompt.contains("macro channel->micro channel"));
+    }
+
+    fn test_settings() -> AppSettings {
+        AppSettings {
+            theme: "light".to_string(),
+            transcription_model: "bilibili".to_string(),
+            source_language: "auto".to_string(),
+            transcription_format: "srt".to_string(),
+            translation_format: "srt".to_string(),
+            is_smart_segmentation_enabled: true,
+            selected_llm_service: "openai".to_string(),
+            llm_configs: std::collections::HashMap::new(),
+            translation_service: "llm".to_string(),
+            needs_reflection_translation: false,
+            translation_batch_size: 30,
+            translation_thread_count: 10,
+            video_content_type: "general".to_string(),
+            output_mode: "bilingual".to_string(),
+            is_subtitle_correction_enabled: true,
+            is_subtitle_translation_enabled: true,
+            is_post_translation_optimization_enabled: true,
+            target_language: "zh-Hans".to_string(),
+        }
     }
 }
