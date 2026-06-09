@@ -13,9 +13,13 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use stem_splitter_core::{split_file, SplitOptions};
-use tauri::{AppHandle, Emitter};
+use stem_splitter_core::{
+    set_download_progress_callback, set_split_progress_callback, split_file, SplitOptions,
+    SplitProgress,
+};
+use tauri::{AppHandle, Emitter, Manager};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
 use uuid::Uuid;
@@ -622,12 +626,24 @@ pub fn prepare_dubbing_material(
 }
 
 #[tauri::command]
-pub fn start_dubbing_task(
+pub async fn start_dubbing_task(
     app: AppHandle,
-    store: tauri::State<'_, SettingsStore>,
-    app_logger: tauri::State<'_, AppLogger>,
     request: StartDubbingTaskRequest,
 ) -> Result<DubbingTaskSnapshot, String> {
+    match tauri::async_runtime::spawn_blocking(move || start_dubbing_task_blocking(app, request))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("配音任务执行失败: {error}")),
+    }
+}
+
+fn start_dubbing_task_blocking(
+    app: AppHandle,
+    request: StartDubbingTaskRequest,
+) -> Result<DubbingTaskSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let app_logger = app.state::<AppLogger>();
     let log_session = app_logger.start_session("dubbing")?;
     log_session.info(
         "request_received",
@@ -809,42 +825,13 @@ pub fn start_dubbing_task(
     emit_dubbing_progress(&app, &snapshot);
 
     let media_input_snapshot = snapshot.clone();
-    let media_result = {
-        let mut emit_media_progress = |progress: u8, message: &str| -> Result<(), String> {
-            let now = Utc::now().to_rfc3339();
-            snapshot = store.with_connection(|connection| {
-                update_dubbing_task_state(
-                    connection,
-                    &request.task_id,
-                    DUBBING_STAGE_MEDIA_SEPARATION,
-                    DUBBING_STATUS_RUNNING,
-                    progress,
-                    message,
-                    "",
-                    None,
-                    &now,
-                )?;
-                upsert_dubbing_stage(
-                    connection,
-                    &request.task_id,
-                    DUBBING_STAGE_MEDIA_SEPARATION,
-                    progress,
-                    message,
-                    "active",
-                    json!({ "backgroundMusic": options.is_background_music_enabled }),
-                    &now,
-                )?;
-                read_dubbing_task_snapshot_by_id(connection, &request.task_id)
-            })?;
-            emit_dubbing_progress(&app, &snapshot);
-            Ok(())
-        };
-
-        run_media_separation(&media_input_snapshot, &options, &mut emit_media_progress)
-    };
+    let media_progress =
+        MediaSeparationProgress::new(app.clone(), request.task_id.clone(), options.clone());
+    let media_result = run_media_separation(&media_input_snapshot, &options, &media_progress);
 
     match media_result {
         Ok(media_result) => {
+            snapshot = media_progress.snapshot().unwrap_or(snapshot);
             let now = Utc::now().to_rfc3339();
             let warnings = deduplicate_warnings(
                 snapshot
@@ -1732,6 +1719,90 @@ fn emit_dubbing_progress(app: &AppHandle, snapshot: &DubbingTaskSnapshot) {
     let _ = app.emit(DUBBING_PROGRESS_EVENT, snapshot);
 }
 
+#[derive(Clone)]
+struct MediaSeparationProgress {
+    app: AppHandle,
+    task_id: String,
+    options: DubbingTaskOptions,
+    last_update: Arc<Mutex<(u8, String)>>,
+}
+
+impl MediaSeparationProgress {
+    fn new(app: AppHandle, task_id: String, options: DubbingTaskOptions) -> Self {
+        Self {
+            app,
+            task_id,
+            options,
+            last_update: Arc::new(Mutex::new((0, String::new()))),
+        }
+    }
+
+    fn set(&self, progress: u8, message: &str) -> Result<(), String> {
+        let progress = progress.min(99);
+        {
+            let mut last_update = self
+                .last_update
+                .lock()
+                .map_err(|error| format!("配音进度锁定失败: {error}"))?;
+            if progress < last_update.0 || (progress == last_update.0 && message == last_update.1) {
+                return Ok(());
+            }
+            *last_update = (progress, message.to_string());
+        }
+
+        emit_media_separation_progress(&self.app, &self.task_id, &self.options, progress, message)
+            .map(|_| ())
+    }
+
+    fn snapshot(&self) -> Option<DubbingTaskSnapshot> {
+        let store = self.app.state::<SettingsStore>();
+        store
+            .with_connection(|connection| {
+                read_dubbing_task_snapshot_by_id(connection, &self.task_id)
+            })
+            .ok()
+    }
+}
+
+fn emit_media_separation_progress(
+    app: &AppHandle,
+    task_id: &str,
+    options: &DubbingTaskOptions,
+    progress: u8,
+    message: &str,
+) -> Result<DubbingTaskSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let progress = progress.min(99);
+    let now = Utc::now().to_rfc3339();
+    let snapshot = store.with_connection(|connection| {
+        update_dubbing_task_state(
+            connection,
+            task_id,
+            DUBBING_STAGE_MEDIA_SEPARATION,
+            DUBBING_STATUS_RUNNING,
+            progress,
+            message,
+            "",
+            None,
+            &now,
+        )?;
+        upsert_dubbing_stage(
+            connection,
+            task_id,
+            DUBBING_STAGE_MEDIA_SEPARATION,
+            progress,
+            message,
+            "active",
+            json!({ "backgroundMusic": options.is_background_music_enabled }),
+            &now,
+        )?;
+        read_dubbing_task_snapshot_by_id(connection, task_id)
+    })?;
+    emit_dubbing_progress(app, &snapshot);
+
+    Ok(snapshot)
+}
+
 fn run_subtitle_preprocess(
     snapshot: &DubbingTaskSnapshot,
 ) -> Result<DubbingSubtitlePreprocessResult, String> {
@@ -1770,14 +1841,11 @@ fn run_subtitle_preprocess(
     })
 }
 
-fn run_media_separation<F>(
+fn run_media_separation(
     snapshot: &DubbingTaskSnapshot,
     options: &DubbingTaskOptions,
-    progress: &mut F,
-) -> Result<DubbingMediaSeparationResult, String>
-where
-    F: FnMut(u8, &str) -> Result<(), String>,
-{
+    progress: &MediaSeparationProgress,
+) -> Result<DubbingMediaSeparationResult, String> {
     let source_video = source_video_path(snapshot)?;
     let output_dir = PathBuf::from(&snapshot.work_dir).join("media_separation");
     fs::create_dir_all(&output_dir).map_err(|error| format!("无法创建音视频分离目录: {error}"))?;
@@ -1786,20 +1854,28 @@ where
     let muted_video_path = output_dir.join(format!("video_no_audio.{video_extension}"));
     let source_audio_path = output_dir.join("source_audio.wav");
 
-    progress(20, "分离无声视频")?;
+    progress.set(8, "准备音视频分离")?;
+    progress.set(20, "分离无声视频")?;
     export_video_without_audio(&source_video, &muted_video_path)?;
+    progress.set(40, "无声视频分离完成")?;
 
-    progress(55, "提取源音频")?;
+    progress.set(55, "提取源音频")?;
     extract_source_audio(&source_video, &source_audio_path)?;
+    progress.set(65, "源音频提取完成")?;
 
     let warnings = Vec::new();
     let background_music_path = if options.is_background_music_enabled {
-        progress(80, "分离背景音乐")?;
+        progress.set(68, "准备背景音乐分离")?;
         let background_music_path = output_dir.join("background_music.wav");
-        separate_background_music(&source_audio_path, &output_dir, &background_music_path)?;
+        separate_background_music(
+            &source_audio_path,
+            &output_dir,
+            &background_music_path,
+            progress,
+        )?;
         Some(background_music_path)
     } else {
-        progress(90, "跳过背景音乐分离")?;
+        progress.set(90, "跳过背景音乐分离")?;
         None
     };
 
@@ -1873,12 +1949,14 @@ fn separate_background_music(
     source_audio_path: &Path,
     output_dir: &Path,
     output_path: &Path,
+    progress: &MediaSeparationProgress,
 ) -> Result<(), String> {
     let stem_output_dir = output_dir.join("stems");
     fs::create_dir_all(&stem_output_dir)
         .map_err(|error| format!("无法创建背景音乐分离目录: {error}"))?;
 
-    let stem_paths = split_background_music_stems(source_audio_path, &stem_output_dir)?;
+    let stem_paths = split_background_music_stems(source_audio_path, &stem_output_dir, progress)?;
+    progress.set(97, "混合背景音乐音轨")?;
     mix_background_music_stems(&stem_paths, output_path)?;
     ensure_non_empty_file(output_path, "背景音乐分离结果为空")
 }
@@ -1886,8 +1964,11 @@ fn separate_background_music(
 fn split_background_music_stems(
     source_audio_path: &Path,
     output_dir: &Path,
+    progress: &MediaSeparationProgress,
 ) -> Result<StemSplitPaths, String> {
-    ensure_background_music_model_cached_from_mirror()?;
+    ensure_background_music_model_cached_from_mirror(progress)?;
+    progress.set(78, "启动背景音乐分离模型")?;
+    install_background_music_progress_callbacks(progress);
 
     let result = split_file(
         &path_to_string(source_audio_path),
@@ -1912,22 +1993,29 @@ fn split_background_music_stems(
     Ok(stem_paths)
 }
 
-fn ensure_background_music_model_cached_from_mirror() -> Result<(), String> {
+fn ensure_background_music_model_cached_from_mirror(
+    progress: &MediaSeparationProgress,
+) -> Result<(), String> {
     let cache_root = background_music_model_cache_root()?;
     set_stem_splitter_cache_dir(&cache_root);
     let model_path = background_music_model_cache_path(&cache_root)?;
 
+    progress.set(69, "检查背景音乐分离模型")?;
     if background_music_model_cache_is_valid(&model_path)? {
+        progress.set(77, "背景音乐分离模型已就绪")?;
         return Ok(());
     }
 
     if model_path.exists() {
+        progress.set(69, "更新背景音乐分离模型缓存")?;
         fs::remove_file(&model_path)
             .map_err(|error| format!("无法更新背景音乐分离模型缓存: {error}"))?;
     }
 
-    download_background_music_model_from_mirror(&model_path)?;
+    download_background_music_model_from_mirror(&model_path, progress)?;
+    progress.set(76, "校验背景音乐分离模型")?;
     if background_music_model_cache_is_valid(&model_path)? {
+        progress.set(77, "背景音乐分离模型已就绪")?;
         Ok(())
     } else {
         Err("背景音乐分离模型校验失败，请重试下载".to_string())
@@ -1983,7 +2071,10 @@ fn file_sha256_hex(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn download_background_music_model_from_mirror(output_path: &Path) -> Result<(), String> {
+fn download_background_music_model_from_mirror(
+    output_path: &Path,
+    progress: &MediaSeparationProgress,
+) -> Result<(), String> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("无法创建背景音乐分离模型缓存目录: {error}"))?;
@@ -2007,11 +2098,15 @@ fn download_background_music_model_from_mirror(output_path: &Path) -> Result<(),
             .map_err(|error| format!("无法下载背景音乐分离模型: {error}"))?
             .error_for_status()
             .map_err(|error| format!("背景音乐分离模型下载失败: {error}"))?;
+        let total = response
+            .content_length()
+            .unwrap_or(BACKGROUND_MUSIC_MODEL_SIZE_BYTES);
         let mut file = fs::File::create(&temp_path)
             .map_err(|error| format!("无法写入背景音乐分离模型缓存: {error}"))?;
         let mut downloaded = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
 
+        progress.set(70, "下载背景音乐分离模型 0%")?;
         loop {
             let bytes_read = response
                 .read(&mut buffer)
@@ -2022,6 +2117,13 @@ fn download_background_music_model_from_mirror(output_path: &Path) -> Result<(),
             file.write_all(&buffer[..bytes_read])
                 .map_err(|error| format!("无法保存背景音乐分离模型缓存: {error}"))?;
             downloaded += bytes_read as u64;
+            progress.set(
+                background_music_model_download_progress(downloaded, total),
+                &format!(
+                    "下载背景音乐分离模型 {}%",
+                    transfer_percent(downloaded, total)
+                ),
+            )?;
         }
         file.flush()
             .map_err(|error| format!("无法保存背景音乐分离模型缓存: {error}"))?;
@@ -2042,6 +2144,73 @@ fn download_background_music_model_from_mirror(output_path: &Path) -> Result<(),
     }
 
     result
+}
+
+fn install_background_music_progress_callbacks(progress: &MediaSeparationProgress) {
+    let download_progress = progress.clone();
+    set_download_progress_callback(move |downloaded, total| {
+        let total = if total == 0 {
+            BACKGROUND_MUSIC_MODEL_SIZE_BYTES
+        } else {
+            total
+        };
+        let _ = download_progress.set(
+            background_music_model_download_progress(downloaded, total),
+            &format!(
+                "下载背景音乐分离模型 {}%",
+                transfer_percent(downloaded, total)
+            ),
+        );
+    });
+
+    let split_progress = progress.clone();
+    set_split_progress_callback(move |event| {
+        if let Some((progress, message)) = background_music_split_progress_message(event) {
+            let _ = split_progress.set(progress, &message);
+        }
+    });
+}
+
+fn background_music_model_download_progress(downloaded: u64, total: u64) -> u8 {
+    let percent = transfer_percent(downloaded, total);
+    (70 + ((percent as u16 * 6) / 100) as u8).min(76)
+}
+
+fn transfer_percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+
+    ((done.min(total) as f64 / total as f64) * 100.0).round() as u64
+}
+
+fn background_music_split_progress_message(event: SplitProgress) -> Option<(u8, String)> {
+    match event {
+        SplitProgress::Stage(stage) => match stage {
+            "resolve_model" => Some((78, "解析背景音乐分离模型".to_string())),
+            "engine_preload" => Some((80, "加载背景音乐分离模型".to_string())),
+            "read_audio" => Some((82, "读取源音频".to_string())),
+            "infer" => Some((84, "分离背景音乐音轨".to_string())),
+            "write_stems" => Some((94, "写入分离音轨".to_string())),
+            "finalize" => Some((96, "整理分离结果".to_string())),
+            _ => None,
+        },
+        SplitProgress::Chunks { percent, .. } => {
+            let progress = (84.0 + (percent.clamp(0.0, 100.0) * 0.10)).round() as u8;
+            Some((
+                progress.min(94),
+                format!("分离背景音乐音轨 {:.0}%", percent),
+            ))
+        }
+        SplitProgress::Writing { stem, percent, .. } => {
+            let progress = (94.0 + (percent.clamp(0.0, 100.0) * 0.02)).round() as u8;
+            Some((
+                progress.min(96),
+                format!("写入{}音轨 {:.0}%", stem, percent),
+            ))
+        }
+        SplitProgress::Finished => Some((96, "背景音乐音轨分离完成".to_string())),
+    }
 }
 
 fn mix_background_music_stems(

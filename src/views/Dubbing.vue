@@ -197,7 +197,37 @@
               <span>{{ dubbingWarningMessage }}</span>
             </div>
 
-            <div v-if="preprocessedSubtitleSegments.length > 0" class="translate-preview translate-subtitle-list">
+            <div v-if="shouldShowMediaSeparationView" class="translate-preview dubbing-stage-page">
+              <div class="dubbing-stage-page-header">
+                <div class="dubbing-stage-page-copy">
+                  <span class="dubbing-stage-eyebrow">当前阶段</span>
+                  <strong>音视频分离</strong>
+                  <span>{{ mediaSeparationMessage }}</span>
+                </div>
+                <span class="dubbing-stage-percent">{{ mediaSeparationProgress }}%</span>
+              </div>
+
+              <div class="dubbing-stage-page-progress" aria-label="音视频分离进度">
+                <span
+                  class="dubbing-stage-page-bar"
+                  :style="{ width: `${mediaSeparationProgress}%` }"
+                  aria-hidden="true"
+                />
+              </div>
+
+              <div class="dubbing-media-steps" aria-label="音视频分离子步骤">
+                <div v-for="step in mediaSeparationSteps" :key="step.key" class="dubbing-media-step">
+                  <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                  <span class="dubbing-media-step-copy">
+                    <span class="dubbing-media-step-title">{{ step.label }}</span>
+                    <span class="dubbing-media-step-subtitle">{{ step.description }}</span>
+                  </span>
+                  <span class="dubbing-media-step-status">{{ dubbingStageStatusLabel(step.status) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div v-else-if="preprocessedSubtitleSegments.length > 0" class="translate-preview translate-subtitle-list">
               <div
                 v-for="(segment, index) in preprocessedSubtitleSegments"
                 :key="segment.uid || `dubbing-subtitle-${index}`"
@@ -662,6 +692,13 @@ type VisibleDubbingStage = {
   status: DubbingStageStatus
 }
 
+type DubbingMediaStep = {
+  key: string
+  label: string
+  description: string
+  status: DubbingStageStatus
+}
+
 const INDEX_TTS2_DEFAULT_ENDPOINT = 'http://127.0.0.1:7860'
 
 const dubbingTabs = [
@@ -773,6 +810,71 @@ const selectedMaterialSummary = computed(() => {
 })
 
 const preprocessedSubtitleSegments = computed(() => activeDubbingTask.value?.segments ?? [])
+
+const mediaSeparationStage = computed(() => activeDubbingTask.value?.stages.mediaSeparation ?? null)
+
+const mediaSeparationProgress = computed(() => {
+  return clampProgress(mediaSeparationStage.value?.progress ?? 0)
+})
+
+const mediaSeparationMessage = computed(() => {
+  return mediaSeparationStage.value?.message || '等待音视频分离'
+})
+
+const shouldShowMediaSeparationView = computed(() => {
+  const task = activeDubbingTask.value
+  const stage = mediaSeparationStage.value
+  if (!task || !stage || stage.status === 'pending') {
+    return false
+  }
+
+  if (task.currentStage === 'media-separation') {
+    return true
+  }
+
+  return stage.status === 'active' || stage.status === 'failed' || stage.status === 'interrupted' ||
+    (stage.status === 'done' && task.status === 'preprocessed')
+})
+
+const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
+  const progress = mediaSeparationProgress.value
+  const stageStatus = mediaSeparationStage.value?.status ?? 'pending'
+  const isTerminalProblem = stageStatus === 'failed' || stageStatus === 'interrupted'
+  const backgroundEnabled = isBackgroundMusicEnabled.value
+
+  return [
+    {
+      key: 'muted-video',
+      label: '无声视频',
+      description: '从源视频保留画面轨道',
+      status: mediaStepStatus(progress, 40, 20, stageStatus),
+    },
+    {
+      key: 'source-audio',
+      label: '源音频',
+      description: '提取并转为后续处理音频',
+      status: mediaStepStatus(progress, 65, 55, stageStatus),
+    },
+    {
+      key: 'background-model',
+      label: '分离模型',
+      description: backgroundEnabled ? '检查、下载或加载背景音乐分离模型' : '背景音乐已关闭',
+      status: backgroundEnabled ? mediaStepStatus(progress, 78, 69, stageStatus) : 'done',
+    },
+    {
+      key: 'background-music',
+      label: '背景音乐',
+      description: backgroundEnabled ? '分离伴奏音轨并混合输出' : '跳过背景音乐分离',
+      status: backgroundEnabled
+        ? mediaStepStatus(progress, 99, 80, stageStatus)
+        : progress >= 90 || stageStatus === 'done'
+          ? 'done'
+          : isTerminalProblem
+            ? stageStatus
+            : 'pending',
+    },
+  ]
+})
 
 const hasDubbingArtifact = (task: DubbingTaskSnapshot, kind: string) => {
   return task.artifacts.some((artifact) => artifact.kind === kind && Boolean(artifact.path))
@@ -1608,6 +1710,38 @@ const isPointInsideElement = (point: { x: number; y: number }, element: HTMLElem
 }
 
 const clampProgress = (value: number) => Math.min(Math.max(Math.round(value), 0), 100)
+
+const mediaStepStatus = (
+  progress: number,
+  doneAt: number,
+  activeAt: number,
+  stageStatus: DubbingStageStatus,
+): DubbingStageStatus => {
+  if (stageStatus === 'done' || progress >= doneAt) {
+    return 'done'
+  }
+
+  if (stageStatus === 'failed' || stageStatus === 'interrupted') {
+    return progress >= activeAt ? stageStatus : 'pending'
+  }
+
+  return progress >= activeAt ? 'active' : 'pending'
+}
+
+const dubbingStageStatusLabel = (status: DubbingStageStatus) => {
+  switch (status) {
+    case 'active':
+      return '处理中'
+    case 'done':
+      return '完成'
+    case 'failed':
+      return '失败'
+    case 'interrupted':
+      return '中断'
+    default:
+      return '等待'
+  }
+}
 
 const normalizeDubbingSegmentStatus = (status?: string): DubbingSubtitleSegmentStatus => {
   return status === 'done' || status === 'active' || status === 'failed' || status === 'raw' ? status : 'raw'
