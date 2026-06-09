@@ -1,10 +1,10 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
+use crate::app_paths;
 use crate::ai::AiService;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
@@ -48,15 +48,8 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    pub fn new(app: &AppHandle) -> Result<Self, String> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("无法获取应用数据目录: {error}"))?;
-
-        fs::create_dir_all(&data_dir).map_err(|error| format!("无法创建应用数据目录: {error}"))?;
-
-        let database_path = data_dir.join(DATABASE_FILE_NAME);
+    pub fn new(_app: &AppHandle) -> Result<Self, String> {
+        let database_path = app_paths::settings_database_path(DATABASE_FILE_NAME)?;
         let connection = Connection::open(database_path)
             .map_err(|error| format!("无法打开设置数据库: {error}"))?;
 

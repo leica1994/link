@@ -12,11 +12,12 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
 use uuid::Uuid;
 
+use crate::app_paths;
 use crate::app_log::AppLogger;
 use crate::settings::SettingsStore;
 use crate::transcription::{serialize_subtitle, SubtitleFormat, TranscriptionSegment};
@@ -1016,12 +1017,8 @@ fn normalized_pair_path(path: &Path) -> String {
     }
 }
 
-fn dubbing_work_dir(app: &AppHandle, pair_key: &str) -> Result<PathBuf, String> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取应用数据目录: {error}"))?;
-    Ok(data_dir.join("dubbing").join(pair_key))
+fn dubbing_work_dir(_app: &AppHandle, pair_key: &str) -> Result<PathBuf, String> {
+    Ok(app_paths::dubbing_dir()?.join(pair_key))
 }
 
 fn link_or_copy_if_stale(source: &Path, destination: &Path) -> Result<(), String> {

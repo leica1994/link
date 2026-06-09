@@ -1,4 +1,5 @@
 mod ai;
+mod app_paths;
 mod app_log;
 mod dubbing;
 mod settings;
@@ -14,7 +15,7 @@ use dubbing::{
 };
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
-use tauri::Manager;
+use tauri::{Manager, WebviewWindowBuilder};
 use transcription::{save_transcription_file, start_transcription};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -52,6 +53,18 @@ pub fn run() {
             app.manage(ai_service);
             app.manage(app_logger);
 
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .first()
+                .ok_or_else(|| setup_error("缺少主窗口配置"))?
+                .clone();
+            let webview_data_dir = app_paths::webview_data_dir().map_err(setup_error)?;
+            WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+                .data_directory(webview_data_dir)
+                .build()?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -74,4 +87,11 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn setup_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        message.into(),
+    ))
 }

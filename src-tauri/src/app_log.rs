@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+
+use crate::app_paths;
 
 #[derive(Clone)]
 pub struct AppLogger {
@@ -26,15 +28,10 @@ struct LogSessionInner {
 }
 
 impl AppLogger {
-    pub fn new(app: &AppHandle) -> Result<Self, String> {
-        let log_dir = app
-            .path()
-            .app_log_dir()
-            .map_err(|error| format!("无法获取日志目录: {error}"))?;
-
-        fs::create_dir_all(&log_dir).map_err(|error| format!("无法创建日志目录: {error}"))?;
-
-        Ok(Self { log_dir })
+    pub fn new(_app: &AppHandle) -> Result<Self, String> {
+        Ok(Self {
+            log_dir: app_paths::app_log_dir()?,
+        })
     }
 
     pub fn start_session(&self, scope: &str) -> Result<LogSession, String> {

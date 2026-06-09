@@ -1,4 +1,5 @@
 use crate::ai::AiService;
+use crate::app_paths;
 use crate::app_log::{AppLogger, LogSession};
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::{correct_subtitles, smart_segment_subtitles};
@@ -942,7 +943,18 @@ fn run_transcription(
             "outputFormat": output_format.to_string(),
         }),
     );
-    let audio_file = match NamedTempFile::new() {
+    let temp_dir = match app_paths::temp_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            log_session.error(
+                "temp_dir_create_failed",
+                "无法创建临时目录",
+                json!({ "error": &error }),
+            );
+            return Err(error);
+        }
+    };
+    let audio_file = match NamedTempFile::new_in(&temp_dir) {
         Ok(file) => file.into_temp_path().with_extension("wav"),
         Err(error) => {
             log_session.error(
@@ -1179,9 +1191,10 @@ fn convert_media_to_audio(input_path: &Path, output_path: &Path) -> Result<(), S
 }
 
 fn export_audio_clip(input_path: &Path, start_ms: u64, end_ms: u64) -> Result<TempPath, String> {
+    let temp_dir = app_paths::temp_dir()?;
     let output_file = tempfile::Builder::new()
         .suffix(".mp3")
-        .tempfile()
+        .tempfile_in(&temp_dir)
         .map_err(|error| format!("无法创建分段临时文件: {error}"))?
         .into_temp_path();
     let output_path: &Path = output_file.as_ref();
