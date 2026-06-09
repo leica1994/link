@@ -10,7 +10,7 @@ use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
 use dubbing::{
     add_dubbing_model, delete_dubbing_model, list_dubbing_models, list_dubbing_voices,
-    preview_dubbing_voice, set_dubbing_model_enabled,
+    prepare_dubbing_material, preview_dubbing_voice, set_dubbing_model_enabled, start_dubbing_task,
 };
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
@@ -69,6 +69,8 @@ pub fn run() {
             set_dubbing_model_enabled,
             delete_dubbing_model,
             preview_dubbing_voice,
+            prepare_dubbing_material,
+            start_dubbing_task,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

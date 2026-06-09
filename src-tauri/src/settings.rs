@@ -313,6 +313,48 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS dubbing_tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                pair_key TEXT NOT NULL UNIQUE,
+                video_path TEXT NOT NULL,
+                subtitle_path TEXT NOT NULL,
+                work_dir TEXT NOT NULL,
+                current_stage TEXT NOT NULL DEFAULT 'material',
+                status TEXT NOT NULL DEFAULT 'ready',
+                message TEXT NOT NULL DEFAULT '',
+                progress INTEGER NOT NULL DEFAULT 0,
+                options TEXT NOT NULL DEFAULT '{}',
+                warnings TEXT NOT NULL DEFAULT '[]',
+                error_message TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS dubbing_task_stages (
+                task_id TEXT NOT NULL,
+                stage_key TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                snapshot TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (task_id, stage_key),
+                FOREIGN KEY(task_id) REFERENCES dubbing_tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS dubbing_task_artifacts (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, kind),
+                FOREIGN KEY(task_id) REFERENCES dubbing_tasks(id) ON DELETE CASCADE
+            );
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;

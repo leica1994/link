@@ -9,7 +9,7 @@ export default createRouter({
   routes: [
     { path: '/', component: Home },
     { path: '/translate', component: Translate, meta: { keepAlive: true } },
-    { path: '/dubbing', component: Dubbing },
+    { path: '/dubbing', component: Dubbing, meta: { keepAlive: true } },
     { path: '/settings', component: Settings },
   ],
 })

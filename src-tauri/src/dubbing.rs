@@ -10,13 +10,16 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
 use uuid::Uuid;
 
+use crate::app_log::AppLogger;
 use crate::settings::SettingsStore;
+use crate::transcription::{serialize_subtitle, SubtitleFormat, TranscriptionSegment};
 
 const EDGE_TTS_ENGINE: &str = "edge-tts";
 const EDGE_TTS_ENGINE_LABEL: &str = "EDGE-TTS";
@@ -34,6 +37,27 @@ const INDEX_TTS2_ENGINE_LABEL: &str = "Index-TTS 2.0";
 const INDEX_TTS2_ENDPOINT: &str = "http://127.0.0.1:7860";
 const INDEX_TTS2_API_NAME: &str = "gen_single";
 const INDEX_TTS2_SAMPLE_AUDIO: &[u8] = include_bytes!("../assets/audio_sample.mp3");
+const DUBBING_PROGRESS_EVENT: &str = "dubbing-progress";
+const DUBBING_STAGE_MATERIAL: &str = "material";
+const DUBBING_STAGE_SUBTITLE_PREPROCESS: &str = "subtitle-preprocess";
+const DUBBING_STAGE_TTS_SYNTHESIS: &str = "tts-synthesis";
+const DUBBING_STAGE_AUDIO_MERGE: &str = "audio-merge";
+const DUBBING_STAGE_VIDEO_COMPOSE: &str = "video-compose";
+const DUBBING_STATUS_READY: &str = "ready";
+const DUBBING_STATUS_RUNNING: &str = "running";
+const DUBBING_STATUS_PREPROCESSED: &str = "preprocessed";
+const DUBBING_STATUS_FAILED: &str = "failed";
+const DUBBING_STATUS_INTERRUPTED: &str = "interrupted";
+const DUBBING_ARTIFACT_SOURCE_VIDEO: &str = "source-video";
+const DUBBING_ARTIFACT_SOURCE_SUBTITLE: &str = "source-subtitle";
+const DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE: &str = "preprocessed-subtitle";
+const DUBBING_VIDEO_EXTENSIONS: &[&str] =
+    &["mp4", "mov", "mkv", "avi", "flv", "wmv", "webm", "m4v"];
+const DUBBING_SUBTITLE_EXTENSIONS: &[&str] = &[
+    "srt", "vtt", "ass", "ssa", "lrc", "sbv", "smi", "sami", "ttml", "dfxp", "txt",
+];
+const MIN_DUBBING_SUBTITLE_DURATION_MS: u64 = 100;
+const DEFAULT_DUBBING_TEXT_DURATION_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +127,132 @@ pub struct PreviewDubbingVoiceRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PreviewDubbingVoiceResult {
     pub audio_data_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareDubbingMaterialRequest {
+    pub video_path: String,
+    pub subtitle_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartDubbingTaskRequest {
+    pub task_id: String,
+    #[serde(default)]
+    pub options: DubbingTaskOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DubbingTaskOptions {
+    pub tts_interval_ms: u32,
+    pub reference_audio_source: String,
+    pub is_background_music_enabled: bool,
+    pub background_music_volume: f64,
+}
+
+impl Default for DubbingTaskOptions {
+    fn default() -> Self {
+        Self {
+            tts_interval_ms: 150,
+            reference_audio_source: "existing-dubbing".to_string(),
+            is_background_music_enabled: true,
+            background_music_volume: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DubbingProgressStage {
+    pub progress: u8,
+    pub message: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DubbingStageProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material: Option<DubbingProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle_preprocess: Option<DubbingProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tts_synthesis: Option<DubbingProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_merge: Option<DubbingProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_compose: Option<DubbingProgressStage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DubbingTaskArtifact {
+    pub kind: String,
+    pub path: String,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DubbingTaskSnapshot {
+    pub id: String,
+    pub pair_key: String,
+    pub video_path: String,
+    pub subtitle_path: String,
+    pub work_dir: String,
+    pub current_stage: String,
+    pub status: String,
+    pub progress: u8,
+    pub message: String,
+    pub stages: DubbingStageProgress,
+    pub artifacts: Vec<DubbingTaskArtifact>,
+    pub segments: Vec<TranscriptionSegment>,
+    pub warnings: Vec<String>,
+    pub error_message: String,
+    pub revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+struct DubbingTaskRecord {
+    id: String,
+    pair_key: String,
+    video_path: String,
+    subtitle_path: String,
+    work_dir: String,
+    current_stage: String,
+    status: String,
+    progress: u8,
+    message: String,
+    warnings: Vec<String>,
+    error_message: String,
+    revision: u64,
+    created_at: String,
+    updated_at: String,
+}
+
+struct DubbingSubtitlePreprocessResult {
+    segments: Vec<TranscriptionSegment>,
+    output_path: PathBuf,
+    warnings: Vec<String>,
+}
+
+struct DubbingSubtitleInput {
+    segments: Vec<TranscriptionSegment>,
+    warnings: Vec<String>,
+}
+
+struct AssMergedCue {
+    start_time: u64,
+    end_time: u64,
+    primary: Vec<String>,
+    secondary: Vec<String>,
+    other: Vec<String>,
 }
 
 trait DubbingEngine {
@@ -218,6 +368,362 @@ pub fn list_dubbing_voices(
     request: ListDubbingVoicesRequest,
 ) -> Result<Vec<DubbingVoiceOption>, String> {
     engine_for(&request.engine)?.list_voices()
+}
+
+#[tauri::command]
+pub fn prepare_dubbing_material(
+    app: AppHandle,
+    store: tauri::State<'_, SettingsStore>,
+    request: PrepareDubbingMaterialRequest,
+) -> Result<DubbingTaskSnapshot, String> {
+    let video_path = canonical_material_path(&request.video_path, "视频文件不存在")?;
+    let subtitle_path = canonical_material_path(&request.subtitle_path, "字幕文件不存在")?;
+    ensure_supported_extension(&video_path, DUBBING_VIDEO_EXTENSIONS, "不支持的视频格式")?;
+    ensure_supported_extension(
+        &subtitle_path,
+        DUBBING_SUBTITLE_EXTENSIONS,
+        "不支持的字幕格式",
+    )?;
+
+    let pair_key = dubbing_pair_key(&video_path, &subtitle_path);
+    let work_dir = dubbing_work_dir(&app, &pair_key)?;
+    let source_dir = work_dir.join("source");
+    fs::create_dir_all(&source_dir).map_err(|error| format!("无法创建配音素材目录: {error}"))?;
+
+    let source_video_path = source_dir.join(format!(
+        "video.{}",
+        path_extension(&video_path).unwrap_or_else(|| "mp4".to_string())
+    ));
+    let source_subtitle_path = source_dir.join(format!(
+        "subtitle.{}",
+        path_extension(&subtitle_path).unwrap_or_else(|| "srt".to_string())
+    ));
+    link_or_copy_if_stale(&video_path, &source_video_path)?;
+    link_or_copy_if_stale(&subtitle_path, &source_subtitle_path)?;
+
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        let existing = read_dubbing_task_record_by_pair_key(connection, &pair_key)?;
+        let should_mark_interrupted = existing
+            .as_ref()
+            .is_some_and(|task| task.status == DUBBING_STATUS_RUNNING);
+        let interrupted_stage = existing
+            .as_ref()
+            .map(|task| task.current_stage.clone())
+            .unwrap_or_else(|| DUBBING_STAGE_MATERIAL.to_string());
+        let task_id = existing
+            .as_ref()
+            .map(|task| task.id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let status = existing
+            .as_ref()
+            .map(|task| {
+                if task.status == DUBBING_STATUS_RUNNING {
+                    DUBBING_STATUS_INTERRUPTED.to_string()
+                } else {
+                    task.status.clone()
+                }
+            })
+            .unwrap_or_else(|| DUBBING_STATUS_READY.to_string());
+        let current_stage = existing
+            .as_ref()
+            .map(|task| task.current_stage.clone())
+            .unwrap_or_else(|| DUBBING_STAGE_MATERIAL.to_string());
+        let progress = existing.as_ref().map(|task| task.progress).unwrap_or(100);
+        let message = existing
+            .as_ref()
+            .map(|task| {
+                if task.status == DUBBING_STATUS_RUNNING {
+                    "任务已中断，可继续配音".to_string()
+                } else {
+                    task.message.clone()
+                }
+            })
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "素材准备完成".to_string());
+        let error_message = existing
+            .as_ref()
+            .filter(|task| task.status != DUBBING_STATUS_RUNNING)
+            .map(|task| task.error_message.clone())
+            .unwrap_or_default();
+        let warnings = existing
+            .as_ref()
+            .map(|task| serde_json::to_string(&task.warnings).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let revision = existing.as_ref().map(|task| task.revision).unwrap_or(0) + 1;
+
+        if existing.is_some() {
+            connection
+                .execute(
+                    "
+                    UPDATE dubbing_tasks
+                    SET video_path = ?2,
+                        subtitle_path = ?3,
+                        work_dir = ?4,
+                        current_stage = ?5,
+                        status = ?6,
+                        message = ?7,
+                        progress = ?8,
+                        warnings = ?9,
+                        error_message = ?10,
+                        revision = ?11,
+                        updated_at = ?12
+                    WHERE id = ?1
+                    ",
+                    params![
+                        task_id,
+                        path_to_string(&video_path),
+                        path_to_string(&subtitle_path),
+                        path_to_string(&work_dir),
+                        current_stage,
+                        status,
+                        message,
+                        progress,
+                        warnings,
+                        error_message,
+                        revision,
+                        now,
+                    ],
+                )
+                .map_err(|error| format!("无法更新配音任务: {error}"))?;
+        } else {
+            connection
+                .execute(
+                    "
+                    INSERT INTO dubbing_tasks (
+                        id,
+                        pair_key,
+                        video_path,
+                        subtitle_path,
+                        work_dir,
+                        current_stage,
+                        status,
+                        message,
+                        progress,
+                        options,
+                        warnings,
+                        error_message,
+                        revision,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '{}', ?10, '', ?11, ?12, ?12)
+                    ",
+                    params![
+                        task_id,
+                        pair_key,
+                        path_to_string(&video_path),
+                        path_to_string(&subtitle_path),
+                        path_to_string(&work_dir),
+                        DUBBING_STAGE_MATERIAL,
+                        DUBBING_STATUS_READY,
+                        "素材准备完成",
+                        100,
+                        warnings,
+                        revision,
+                        now,
+                    ],
+                )
+                .map_err(|error| format!("无法创建配音任务: {error}"))?;
+        }
+
+        upsert_dubbing_stage(
+            connection,
+            &task_id,
+            DUBBING_STAGE_MATERIAL,
+            100,
+            "素材准备完成",
+            "done",
+            json!({}),
+            &now,
+        )?;
+        insert_dubbing_stage_if_missing(
+            connection,
+            &task_id,
+            DUBBING_STAGE_SUBTITLE_PREPROCESS,
+            0,
+            "等待开始字幕预处理",
+            "pending",
+            &now,
+        )?;
+        if should_mark_interrupted && interrupted_stage != DUBBING_STAGE_MATERIAL {
+            upsert_dubbing_stage(
+                connection,
+                &task_id,
+                &interrupted_stage,
+                progress,
+                "任务已中断，可继续配音",
+                "interrupted",
+                json!({}),
+                &now,
+            )?;
+        }
+        upsert_dubbing_artifact(
+            connection,
+            &task_id,
+            DUBBING_ARTIFACT_SOURCE_VIDEO,
+            &source_video_path,
+            material_metadata(&video_path)?,
+            &now,
+        )?;
+        upsert_dubbing_artifact(
+            connection,
+            &task_id,
+            DUBBING_ARTIFACT_SOURCE_SUBTITLE,
+            &source_subtitle_path,
+            material_metadata(&subtitle_path)?,
+            &now,
+        )?;
+
+        read_dubbing_task_snapshot_by_id(connection, &task_id)
+    })
+}
+
+#[tauri::command]
+pub fn start_dubbing_task(
+    app: AppHandle,
+    store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
+    request: StartDubbingTaskRequest,
+) -> Result<DubbingTaskSnapshot, String> {
+    let log_session = app_logger.start_session("dubbing")?;
+    log_session.info(
+        "request_received",
+        "收到配音预处理请求",
+        json!({ "taskId": &request.task_id }),
+    );
+    let options = request.options;
+    save_dubbing_task_options(&store, &request.task_id, &options)?;
+
+    if let Some(snapshot) = read_completed_subtitle_preprocess_snapshot(&store, &request.task_id)? {
+        log_session.info(
+            "subtitle_preprocess_reused",
+            "复用已完成的字幕预处理结果",
+            json!({ "taskId": &request.task_id }),
+        );
+        return Ok(snapshot);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let mut snapshot = store.with_connection(|connection| {
+        update_dubbing_task_state(
+            connection,
+            &request.task_id,
+            DUBBING_STAGE_SUBTITLE_PREPROCESS,
+            DUBBING_STATUS_RUNNING,
+            0,
+            "字幕预处理中",
+            "",
+            None,
+            &now,
+        )?;
+        upsert_dubbing_stage(
+            connection,
+            &request.task_id,
+            DUBBING_STAGE_SUBTITLE_PREPROCESS,
+            0,
+            "字幕预处理中",
+            "active",
+            json!({}),
+            &now,
+        )?;
+        read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+    })?;
+    emit_dubbing_progress(&app, &snapshot);
+
+    let result = run_subtitle_preprocess(&snapshot);
+    match result {
+        Ok(preprocess_result) => {
+            let now = Utc::now().to_rfc3339();
+            snapshot = store.with_connection(|connection| {
+                upsert_dubbing_artifact(
+                    connection,
+                    &request.task_id,
+                    DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE,
+                    &preprocess_result.output_path,
+                    json!({
+                        "format": "srt",
+                        "segmentCount": preprocess_result.segments.len(),
+                        "warnings": &preprocess_result.warnings,
+                    }),
+                    &now,
+                )?;
+                update_dubbing_task_state(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    DUBBING_STATUS_PREPROCESSED,
+                    100,
+                    "字幕预处理完成",
+                    "",
+                    Some(&preprocess_result.warnings),
+                    &now,
+                )?;
+                upsert_dubbing_stage(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    100,
+                    "字幕预处理完成",
+                    "done",
+                    json!({
+                        "segmentCount": preprocess_result.segments.len(),
+                        "outputPath": path_to_string(&preprocess_result.output_path),
+                        "warnings": &preprocess_result.warnings,
+                    }),
+                    &now,
+                )?;
+                read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+            })?;
+            emit_dubbing_progress(&app, &snapshot);
+            log_session.info(
+                "subtitle_preprocess_completed",
+                "字幕预处理完成",
+                json!({
+                    "taskId": &request.task_id,
+                    "segmentCount": snapshot.segments.len(),
+                }),
+            );
+            Ok(snapshot)
+        }
+        Err(error) => {
+            let now = Utc::now().to_rfc3339();
+            let failed_snapshot = store.with_connection(|connection| {
+                update_dubbing_task_state(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    DUBBING_STATUS_FAILED,
+                    0,
+                    "字幕预处理失败",
+                    &error,
+                    None,
+                    &now,
+                )?;
+                upsert_dubbing_stage(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    0,
+                    "字幕预处理失败",
+                    "failed",
+                    json!({ "error": &error }),
+                    &now,
+                )?;
+                read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+            })?;
+            emit_dubbing_progress(&app, &failed_snapshot);
+            log_session.error(
+                "subtitle_preprocess_failed",
+                "字幕预处理失败",
+                json!({
+                    "taskId": &request.task_id,
+                    "error": &error,
+                }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -460,6 +966,1444 @@ fn map_dubbing_model(row: &Row<'_>) -> rusqlite::Result<DubbingModel> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
     })
+}
+
+fn canonical_material_path(path: &str, missing_message: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(missing_message.to_string());
+    }
+
+    fs::canonicalize(&path).map_err(|error| format!("无法读取素材路径: {error}"))
+}
+
+fn ensure_supported_extension(
+    path: &Path,
+    supported_extensions: &[&str],
+    message: &str,
+) -> Result<(), String> {
+    let extension = path_extension(path).ok_or_else(|| message.to_string())?;
+    if supported_extensions.iter().any(|value| *value == extension) {
+        Ok(())
+    } else {
+        Err(message.to_string())
+    }
+}
+
+fn path_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn dubbing_pair_key(video_path: &Path, subtitle_path: &Path) -> String {
+    let raw = format!(
+        "{}\0{}",
+        normalized_pair_path(video_path),
+        normalized_pair_path(subtitle_path)
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn normalized_pair_path(path: &Path) -> String {
+    let value = path_to_string(path);
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+fn dubbing_work_dir(app: &AppHandle, pair_key: &str) -> Result<PathBuf, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录: {error}"))?;
+    Ok(data_dir.join("dubbing").join(pair_key))
+}
+
+fn link_or_copy_if_stale(source: &Path, destination: &Path) -> Result<(), String> {
+    if is_same_size_file(source, destination)? {
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建素材目录: {error}"))?;
+    }
+
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| format!("无法更新素材缓存: {error}"))?;
+    }
+
+    match fs::hard_link(source, destination) {
+        Ok(_) => Ok(()),
+        Err(_) => fs::copy(source, destination)
+            .map(|_| ())
+            .map_err(|error| format!("无法复制素材到配音工作目录: {error}")),
+    }
+}
+
+fn is_same_size_file(source: &Path, destination: &Path) -> Result<bool, String> {
+    if !destination.is_file() {
+        return Ok(false);
+    }
+
+    let source_metadata =
+        fs::metadata(source).map_err(|error| format!("无法读取素材信息: {error}"))?;
+    let destination_metadata =
+        fs::metadata(destination).map_err(|error| format!("无法读取素材缓存信息: {error}"))?;
+
+    Ok(source_metadata.len() == destination_metadata.len())
+}
+
+fn material_metadata(path: &Path) -> Result<Value, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("无法读取素材信息: {error}"))?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+
+    Ok(json!({
+        "size": metadata.len(),
+        "modifiedMs": modified_ms,
+    }))
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn read_dubbing_task_record_by_pair_key(
+    connection: &rusqlite::Connection,
+    pair_key: &str,
+) -> Result<Option<DubbingTaskRecord>, String> {
+    connection
+        .query_row(
+            "
+            SELECT id, pair_key, video_path, subtitle_path, work_dir, current_stage, status,
+                   progress, message, warnings, error_message, revision, created_at, updated_at
+            FROM dubbing_tasks
+            WHERE pair_key = ?1
+            ",
+            params![pair_key],
+            map_dubbing_task_record,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取配音任务: {error}"))
+}
+
+fn read_dubbing_task_record_by_id(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<DubbingTaskRecord, String> {
+    connection
+        .query_row(
+            "
+            SELECT id, pair_key, video_path, subtitle_path, work_dir, current_stage, status,
+                   progress, message, warnings, error_message, revision, created_at, updated_at
+            FROM dubbing_tasks
+            WHERE id = ?1
+            ",
+            params![task_id],
+            map_dubbing_task_record,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取配音任务: {error}"))?
+        .ok_or_else(|| "未找到配音任务".to_string())
+}
+
+fn map_dubbing_task_record(row: &Row<'_>) -> rusqlite::Result<DubbingTaskRecord> {
+    let warnings_text: String = row.get(9)?;
+    let warnings = serde_json::from_str::<Vec<String>>(&warnings_text).unwrap_or_default();
+    let progress = row.get::<_, i64>(7)?.clamp(0, 100) as u8;
+    let revision = row.get::<_, i64>(11)?.max(0) as u64;
+
+    Ok(DubbingTaskRecord {
+        id: row.get(0)?,
+        pair_key: row.get(1)?,
+        video_path: row.get(2)?,
+        subtitle_path: row.get(3)?,
+        work_dir: row.get(4)?,
+        current_stage: row.get(5)?,
+        status: row.get(6)?,
+        progress,
+        message: row.get(8)?,
+        warnings,
+        error_message: row.get(10)?,
+        revision,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn read_dubbing_task_snapshot_by_id(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<DubbingTaskSnapshot, String> {
+    let record = read_dubbing_task_record_by_id(connection, task_id)?;
+    let artifacts = read_dubbing_artifacts(connection, task_id)?;
+    let segments = read_preprocessed_segments(&artifacts);
+
+    Ok(DubbingTaskSnapshot {
+        id: record.id,
+        pair_key: record.pair_key,
+        video_path: record.video_path,
+        subtitle_path: record.subtitle_path,
+        work_dir: record.work_dir,
+        current_stage: record.current_stage,
+        status: record.status,
+        progress: record.progress,
+        message: record.message,
+        stages: read_dubbing_stages(connection, task_id)?,
+        artifacts,
+        segments,
+        warnings: record.warnings,
+        error_message: record.error_message,
+        revision: record.revision,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    })
+}
+
+fn read_dubbing_stages(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<DubbingStageProgress, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT stage_key, progress, message, status
+            FROM dubbing_task_stages
+            WHERE task_id = ?1
+            ",
+        )
+        .map_err(|error| format!("无法读取配音阶段: {error}"))?;
+    let rows = statement
+        .query_map(params![task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                DubbingProgressStage {
+                    progress: row.get::<_, i64>(1)?.clamp(0, 100) as u8,
+                    message: row.get(2)?,
+                    status: row.get(3)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("无法读取配音阶段: {error}"))?;
+
+    let mut stages = DubbingStageProgress::default();
+    for row in rows {
+        let (stage_key, stage) = row.map_err(|error| format!("无法解析配音阶段: {error}"))?;
+        set_dubbing_stage(&mut stages, &stage_key, stage);
+    }
+
+    Ok(stages)
+}
+
+fn set_dubbing_stage(
+    stages: &mut DubbingStageProgress,
+    stage_key: &str,
+    stage: DubbingProgressStage,
+) {
+    match stage_key {
+        DUBBING_STAGE_MATERIAL => stages.material = Some(stage),
+        DUBBING_STAGE_SUBTITLE_PREPROCESS => stages.subtitle_preprocess = Some(stage),
+        DUBBING_STAGE_TTS_SYNTHESIS => stages.tts_synthesis = Some(stage),
+        DUBBING_STAGE_AUDIO_MERGE => stages.audio_merge = Some(stage),
+        DUBBING_STAGE_VIDEO_COMPOSE => stages.video_compose = Some(stage),
+        _ => {}
+    }
+}
+
+fn read_dubbing_artifacts(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Vec<DubbingTaskArtifact>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT kind, path, metadata, created_at, updated_at
+            FROM dubbing_task_artifacts
+            WHERE task_id = ?1
+            ORDER BY created_at ASC
+            ",
+        )
+        .map_err(|error| format!("无法读取配音中间文件: {error}"))?;
+    let rows = statement
+        .query_map(params![task_id], |row| {
+            let metadata_text: String = row.get(2)?;
+            Ok(DubbingTaskArtifact {
+                kind: row.get(0)?,
+                path: row.get(1)?,
+                metadata: serde_json::from_str(&metadata_text).unwrap_or_else(|_| json!({})),
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("无法读取配音中间文件: {error}"))?;
+
+    let mut artifacts = Vec::new();
+    for row in rows {
+        artifacts.push(row.map_err(|error| format!("无法解析配音中间文件: {error}"))?);
+    }
+
+    Ok(artifacts)
+}
+
+fn upsert_dubbing_stage(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    stage_key: &str,
+    progress: u8,
+    message: &str,
+    status: &str,
+    snapshot: Value,
+    updated_at: &str,
+) -> Result<(), String> {
+    let snapshot =
+        serde_json::to_string(&snapshot).map_err(|error| format!("无法序列化阶段快照: {error}"))?;
+    connection
+        .execute(
+            "
+            INSERT INTO dubbing_task_stages (task_id, stage_key, progress, message, status, snapshot, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(task_id, stage_key) DO UPDATE SET
+                progress = excluded.progress,
+                message = excluded.message,
+                status = excluded.status,
+                snapshot = excluded.snapshot,
+                updated_at = excluded.updated_at
+            ",
+            params![task_id, stage_key, progress, message, status, snapshot, updated_at],
+        )
+        .map_err(|error| format!("无法保存配音阶段: {error}"))?;
+
+    Ok(())
+}
+
+fn insert_dubbing_stage_if_missing(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    stage_key: &str,
+    progress: u8,
+    message: &str,
+    status: &str,
+    updated_at: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "
+            INSERT OR IGNORE INTO dubbing_task_stages (task_id, stage_key, progress, message, status, snapshot, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6)
+            ",
+            params![task_id, stage_key, progress, message, status, updated_at],
+        )
+        .map_err(|error| format!("无法初始化配音阶段: {error}"))?;
+
+    Ok(())
+}
+
+fn upsert_dubbing_artifact(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    kind: &str,
+    path: &Path,
+    metadata: Value,
+    updated_at: &str,
+) -> Result<(), String> {
+    let metadata = serde_json::to_string(&metadata)
+        .map_err(|error| format!("无法序列化中间文件信息: {error}"))?;
+    connection
+        .execute(
+            "
+            INSERT INTO dubbing_task_artifacts (id, task_id, kind, path, metadata, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(task_id, kind) DO UPDATE SET
+                path = excluded.path,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                task_id,
+                kind,
+                path_to_string(path),
+                metadata,
+                updated_at,
+            ],
+        )
+        .map_err(|error| format!("无法保存配音中间文件: {error}"))?;
+
+    Ok(())
+}
+
+fn save_dubbing_task_options(
+    store: &SettingsStore,
+    task_id: &str,
+    options: &DubbingTaskOptions,
+) -> Result<(), String> {
+    let options_text =
+        serde_json::to_string(options).map_err(|error| format!("无法序列化配音参数: {error}"))?;
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        let changed = connection
+            .execute(
+                "
+                UPDATE dubbing_tasks
+                SET options = ?2, updated_at = ?3
+                WHERE id = ?1
+                ",
+                params![task_id, options_text, now],
+            )
+            .map_err(|error| format!("无法保存配音参数: {error}"))?;
+        if changed == 0 {
+            Err("未找到配音任务".to_string())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn read_completed_subtitle_preprocess_snapshot(
+    store: &SettingsStore,
+    task_id: &str,
+) -> Result<Option<DubbingTaskSnapshot>, String> {
+    let snapshot = store
+        .with_connection(|connection| read_dubbing_task_snapshot_by_id(connection, task_id))?;
+    if is_subtitle_preprocess_done(&snapshot) {
+        Ok(Some(snapshot))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_subtitle_preprocess_done(snapshot: &DubbingTaskSnapshot) -> bool {
+    let stage_done = snapshot
+        .stages
+        .subtitle_preprocess
+        .as_ref()
+        .is_some_and(|stage| stage.status == "done");
+    let artifact_exists = snapshot.artifacts.iter().any(|artifact| {
+        artifact.kind == DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE
+            && Path::new(&artifact.path).is_file()
+    });
+
+    stage_done && artifact_exists
+}
+
+fn update_dubbing_task_state(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    current_stage: &str,
+    status: &str,
+    progress: u8,
+    message: &str,
+    error_message: &str,
+    warnings: Option<&[String]>,
+    updated_at: &str,
+) -> Result<(), String> {
+    let warnings_text = warnings
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("无法序列化配音警告: {error}"))?;
+    let changed = connection
+        .execute(
+            "
+            UPDATE dubbing_tasks
+            SET current_stage = ?2,
+                status = ?3,
+                progress = ?4,
+                message = ?5,
+                error_message = ?6,
+                warnings = COALESCE(?7, warnings),
+                revision = revision + 1,
+                updated_at = ?8
+            WHERE id = ?1
+            ",
+            params![
+                task_id,
+                current_stage,
+                status,
+                progress,
+                message,
+                error_message,
+                warnings_text,
+                updated_at,
+            ],
+        )
+        .map_err(|error| format!("无法更新配音任务状态: {error}"))?;
+
+    if changed == 0 {
+        Err("未找到配音任务".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn emit_dubbing_progress(app: &AppHandle, snapshot: &DubbingTaskSnapshot) {
+    let _ = app.emit(DUBBING_PROGRESS_EVENT, snapshot);
+}
+
+fn run_subtitle_preprocess(
+    snapshot: &DubbingTaskSnapshot,
+) -> Result<DubbingSubtitlePreprocessResult, String> {
+    let source_subtitle = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_SOURCE_SUBTITLE)
+        .map(|artifact| PathBuf::from(&artifact.path))
+        .unwrap_or_else(|| PathBuf::from(&snapshot.subtitle_path));
+    let mut input = load_dubbing_subtitle_input(&source_subtitle)?;
+    let mut segments = normalize_dubbing_segments(input.segments, &mut input.warnings)?;
+    if segments.is_empty() {
+        return Err("字幕内容为空".to_string());
+    }
+
+    segments.sort_by_key(|segment| (segment.start_time, segment.end_time));
+    for (index, segment) in segments.iter_mut().enumerate() {
+        if segment.end_time <= segment.start_time {
+            return Err(format!("第 {} 条字幕时间轴无效", index + 1));
+        }
+        segment.uid = format!("dubbing-subtitle-{index}");
+        segment.status = "done".to_string();
+    }
+
+    let output_dir = PathBuf::from(&snapshot.work_dir).join("subtitle_preprocess");
+    fs::create_dir_all(&output_dir).map_err(|error| format!("无法创建字幕预处理目录: {error}"))?;
+    let output_path = output_dir.join("subtitle_tts.srt");
+    let subtitle_text = serialize_subtitle(&segments, SubtitleFormat::Srt);
+    fs::write(&output_path, subtitle_text)
+        .map_err(|error| format!("无法保存预处理字幕: {error}"))?;
+
+    Ok(DubbingSubtitlePreprocessResult {
+        segments,
+        output_path,
+        warnings: deduplicate_warnings(input.warnings),
+    })
+}
+
+fn read_preprocessed_segments(artifacts: &[DubbingTaskArtifact]) -> Vec<TranscriptionSegment> {
+    artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE)
+        .and_then(|artifact| load_dubbing_subtitle_segments(Path::new(&artifact.path)).ok())
+        .map(|mut segments| {
+            for (index, segment) in segments.iter_mut().enumerate() {
+                segment.uid = format!("dubbing-subtitle-{index}");
+                segment.status = "done".to_string();
+            }
+            segments
+        })
+        .unwrap_or_default()
+}
+
+fn load_dubbing_subtitle_segments(path: &Path) -> Result<Vec<TranscriptionSegment>, String> {
+    let mut input = load_dubbing_subtitle_input(path)?;
+    normalize_dubbing_segments(input.segments, &mut input.warnings)
+}
+
+fn load_dubbing_subtitle_input(path: &Path) -> Result<DubbingSubtitleInput, String> {
+    if !path.is_file() {
+        return Err("字幕文件不存在".to_string());
+    }
+
+    let extension = path_extension(path).unwrap_or_default();
+    if !DUBBING_SUBTITLE_EXTENSIONS
+        .iter()
+        .any(|supported| *supported == extension)
+    {
+        return Err("不支持的字幕格式".to_string());
+    }
+
+    let content = read_subtitle_text(path)?;
+    let segments = match extension.as_str() {
+        "srt" => parse_srt(&content),
+        "vtt" => parse_vtt(&content),
+        "ass" | "ssa" => parse_ass(&content),
+        "lrc" => parse_lrc(&content),
+        "sbv" => parse_sbv(&content),
+        "smi" | "sami" => parse_sami(&content),
+        "ttml" | "dfxp" => parse_ttml(&content),
+        "txt" => parse_txt(&content),
+        _ => Err("不支持的字幕格式".to_string()),
+    }?;
+
+    Ok(DubbingSubtitleInput {
+        segments,
+        warnings: Vec::new(),
+    })
+}
+
+fn read_subtitle_text(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| format!("无法读取字幕文件: {error}"))?;
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16(&bytes[2..], true)
+            .ok_or_else(|| "无法按 UTF-16 LE 读取字幕文件".to_string());
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16(&bytes[2..], false)
+            .ok_or_else(|| "无法按 UTF-16 BE 读取字幕文件".to_string());
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(bytes[3..].to_vec())
+            .map_err(|error| format!("无法按 UTF-8 读取字幕文件: {error}"));
+    }
+    if let Ok(text) = String::from_utf8(bytes.clone()) {
+        return Ok(text);
+    }
+
+    let (decoded, _, _) = encoding_rs::GBK.decode(&bytes);
+    Ok(decoded.into_owned())
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
+}
+
+fn normalize_dubbing_segments(
+    segments: Vec<TranscriptionSegment>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<TranscriptionSegment>, String> {
+    let mut normalized = Vec::new();
+
+    for (index, segment) in segments.into_iter().enumerate() {
+        let text = clean_tts_subtitle_text(&segment.text);
+        if text.is_empty() {
+            warnings.push(format!("第 {} 条字幕清理后为空，已跳过", index + 1));
+            continue;
+        }
+
+        let start_time = segment.start_time;
+        let mut end_time = segment.end_time;
+        if end_time <= start_time {
+            end_time = start_time + MIN_DUBBING_SUBTITLE_DURATION_MS;
+            warnings.push(format!(
+                "第 {} 条字幕时间轴无效，已补齐为 {} 毫秒",
+                index + 1,
+                MIN_DUBBING_SUBTITLE_DURATION_MS
+            ));
+        }
+
+        normalized.push(TranscriptionSegment {
+            text,
+            start_time,
+            end_time,
+            uid: String::new(),
+            status: String::new(),
+            words: Vec::new(),
+        });
+    }
+
+    normalized.sort_by_key(|segment| (segment.start_time, segment.end_time));
+
+    if normalized.is_empty() {
+        Err("字幕内容为空".to_string())
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn parse_srt(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut segments = Vec::new();
+
+    for block in normalized.split("\n\n") {
+        let lines = block
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            continue;
+        }
+
+        let Some(time_line_index) = lines.iter().position(|line| line.contains("-->")) else {
+            continue;
+        };
+        let (start_time, end_time) = parse_time_range(lines[time_line_index])?;
+        let text = lines[time_line_index + 1..].join("\n").trim().to_string();
+        push_subtitle_segment_raw(&mut segments, text, start_time, end_time);
+    }
+
+    Ok(segments)
+}
+
+fn parse_vtt(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut segments = Vec::new();
+    let mut block_lines = Vec::new();
+    let mut is_note_block = false;
+    let mut is_metadata_block = false;
+
+    for line in normalized.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            push_vtt_block(&mut segments, &block_lines)?;
+            block_lines.clear();
+            is_note_block = false;
+            is_metadata_block = false;
+        } else if trimmed.starts_with("NOTE") {
+            is_note_block = true;
+        } else if trimmed.starts_with("STYLE") || trimmed.starts_with("REGION") {
+            is_metadata_block = true;
+        } else if !is_note_block && !is_metadata_block && !trimmed.starts_with("WEBVTT") {
+            block_lines.push(trimmed.to_string());
+        }
+    }
+
+    push_vtt_block(&mut segments, &block_lines)?;
+    Ok(segments)
+}
+
+fn push_vtt_block(
+    segments: &mut Vec<TranscriptionSegment>,
+    lines: &[String],
+) -> Result<(), String> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let Some(time_line_index) = lines.iter().position(|line| line.contains("-->")) else {
+        return Ok(());
+    };
+    let (start_time, end_time) = parse_time_range(&lines[time_line_index])?;
+    let text = lines[time_line_index + 1..].join("\n").trim().to_string();
+    push_subtitle_segment_raw(segments, text, start_time, end_time);
+    Ok(())
+}
+
+fn parse_ass(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let mut cues: HashMap<(u64, u64), AssMergedCue> = HashMap::new();
+    let mut in_events = false;
+    let mut start_index = 1usize;
+    let mut end_index = 2usize;
+    let mut style_index = 3usize;
+    let mut text_index = 9usize;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("[Events]") {
+            in_events = true;
+            continue;
+        }
+
+        if !in_events {
+            continue;
+        }
+
+        if trimmed.starts_with('[') {
+            in_events = false;
+            continue;
+        }
+
+        if trimmed.to_ascii_lowercase().starts_with("format:") {
+            let format = trimmed
+                .split_once(':')
+                .map(|(_, value)| value)
+                .unwrap_or_default();
+            for (index, field) in format.split(',').map(str::trim).enumerate() {
+                match field.to_ascii_lowercase().as_str() {
+                    "start" => start_index = index,
+                    "end" => end_index = index,
+                    "style" => style_index = index,
+                    "text" => text_index = index,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if !trimmed.to_ascii_lowercase().starts_with("dialogue:") {
+            continue;
+        }
+
+        let payload = trimmed
+            .split_once(':')
+            .map(|(_, value)| value.trim_start())
+            .unwrap_or_default();
+        let fields = split_ass_dialogue_fields(payload, text_index + 1);
+        let Some(start_text) = fields.get(start_index) else {
+            continue;
+        };
+        let Some(end_text) = fields.get(end_index) else {
+            continue;
+        };
+        let Some(text) = fields.get(text_index) else {
+            continue;
+        };
+        let start_time = parse_ass_time(start_text)?;
+        let end_time = parse_ass_time(end_text)?;
+        let style = fields
+            .get(style_index)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let cue = cues
+            .entry((start_time, end_time))
+            .or_insert_with(|| AssMergedCue {
+                start_time,
+                end_time,
+                primary: Vec::new(),
+                secondary: Vec::new(),
+                other: Vec::new(),
+            });
+        let text = clean_ass_text(text);
+
+        if style == "secondary" {
+            cue.secondary.push(text);
+        } else if style == "default" {
+            cue.primary.push(text);
+        } else {
+            cue.other.push(text);
+        }
+    }
+
+    let mut segments = Vec::new();
+    let mut merged_cues = cues.into_values().collect::<Vec<_>>();
+    merged_cues.sort_by_key(|cue| (cue.start_time, cue.end_time));
+    for cue in merged_cues {
+        let text = cue
+            .secondary
+            .into_iter()
+            .chain(cue.primary)
+            .chain(cue.other)
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        push_subtitle_segment_raw(&mut segments, text, cue.start_time, cue.end_time);
+    }
+
+    Ok(segments)
+}
+
+fn split_ass_dialogue_fields(payload: &str, expected_fields: usize) -> Vec<String> {
+    if expected_fields <= 1 {
+        return vec![payload.to_string()];
+    }
+
+    let mut fields = Vec::with_capacity(expected_fields);
+    let mut rest = payload;
+    for _ in 0..expected_fields.saturating_sub(1) {
+        if let Some((field, next)) = rest.split_once(',') {
+            fields.push(field.trim().to_string());
+            rest = next;
+        } else {
+            fields.push(rest.trim().to_string());
+            rest = "";
+        }
+    }
+    fields.push(rest.trim().to_string());
+    fields
+}
+
+fn clean_ass_text(text: &str) -> String {
+    let mut cleaned = String::new();
+    let mut in_override = false;
+
+    for character in text.replace("\\N", "\n").replace("\\n", "\n").chars() {
+        match character {
+            '{' => in_override = true,
+            '}' => in_override = false,
+            _ if !in_override => cleaned.push(character),
+            _ => {}
+        }
+    }
+
+    cleaned.trim().to_string()
+}
+
+fn parse_lrc(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut cues = Vec::<(u64, String)>::new();
+
+    for line in normalized.lines() {
+        let mut rest = line.trim();
+        let mut starts = Vec::new();
+        while rest.starts_with('[') {
+            let Some(end_index) = rest.find(']') else {
+                break;
+            };
+            let tag = &rest[1..end_index];
+            if let Some(start_time) = parse_lrc_time_tag(tag) {
+                starts.push(start_time);
+                rest = rest[end_index + 1..].trim_start();
+            } else {
+                break;
+            }
+        }
+
+        if starts.is_empty() {
+            continue;
+        }
+
+        let text = rest.trim().to_string();
+        for start_time in starts {
+            cues.push((start_time, text.clone()));
+        }
+    }
+
+    cues.sort_by_key(|(start_time, _)| *start_time);
+    let mut segments = Vec::new();
+    for index in 0..cues.len() {
+        let (start_time, text) = &cues[index];
+        let end_time = cues
+            .get(index + 1)
+            .map(|(next_start, _)| *next_start)
+            .filter(|next_start| next_start > start_time)
+            .unwrap_or(*start_time + DEFAULT_DUBBING_TEXT_DURATION_MS);
+        push_subtitle_segment_raw(&mut segments, text.clone(), *start_time, end_time);
+    }
+
+    Ok(segments)
+}
+
+fn parse_lrc_time_tag(tag: &str) -> Option<u64> {
+    if tag.contains(':') && tag.chars().any(|character| character.is_ascii_digit()) {
+        parse_subtitle_time(tag).ok()
+    } else {
+        None
+    }
+}
+
+fn parse_sbv(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut segments = Vec::new();
+
+    for block in normalized.split("\n\n") {
+        let lines = block
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if lines.len() < 2 {
+            continue;
+        }
+
+        let Some((start_text, end_text)) = lines[0].split_once(',') else {
+            continue;
+        };
+        let start_time = parse_subtitle_time(start_text.trim())?;
+        let end_time = parse_subtitle_time(end_text.trim())?;
+        let text = lines[1..].join("\n");
+        push_subtitle_segment_raw(&mut segments, text, start_time, end_time);
+    }
+
+    Ok(segments)
+}
+
+fn parse_sami(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let positions = find_case_insensitive_positions(content, "<sync");
+    let mut cues = Vec::<(u64, String)>::new();
+
+    for (index, start_position) in positions.iter().enumerate() {
+        let next_position = positions
+            .get(index + 1)
+            .copied()
+            .unwrap_or_else(|| content.len());
+        let Some(tag_end_relative) = content[*start_position..next_position].find('>') else {
+            continue;
+        };
+        let tag_end = *start_position + tag_end_relative;
+        let tag = &content[*start_position..=tag_end];
+        let Some(start_time) = parse_numeric_attribute_ms(tag, "start") else {
+            continue;
+        };
+        let text = clean_markup_text(&content[tag_end + 1..next_position]);
+        cues.push((start_time, text));
+    }
+
+    cues.sort_by_key(|(start_time, _)| *start_time);
+    let mut segments = Vec::new();
+    for index in 0..cues.len() {
+        let (start_time, text) = &cues[index];
+        let end_time = cues
+            .get(index + 1)
+            .map(|(next_start, _)| *next_start)
+            .filter(|next_start| next_start > start_time)
+            .unwrap_or(*start_time + DEFAULT_DUBBING_TEXT_DURATION_MS);
+        push_subtitle_segment_raw(&mut segments, text.clone(), *start_time, end_time);
+    }
+
+    Ok(segments)
+}
+
+fn parse_ttml(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = find_case_insensitive(&content[cursor..], "<p") {
+        let start = cursor + relative_start;
+        let Some(relative_tag_end) = content[start..].find('>') else {
+            break;
+        };
+        let tag_end = start + relative_tag_end;
+        let tag = &content[start..=tag_end];
+        let Some(start_time) = attr_value_case_insensitive(tag, "begin")
+            .and_then(|value| parse_ttml_time_value(&value))
+        else {
+            cursor = tag_end + 1;
+            continue;
+        };
+        let end_time = attr_value_case_insensitive(tag, "end")
+            .and_then(|value| parse_ttml_time_value(&value))
+            .or_else(|| {
+                attr_value_case_insensitive(tag, "dur")
+                    .and_then(|value| parse_ttml_time_value(&value))
+                    .map(|duration| start_time + duration)
+            })
+            .unwrap_or(start_time + DEFAULT_DUBBING_TEXT_DURATION_MS);
+        let content_start = tag_end + 1;
+        let Some(relative_end) = find_case_insensitive(&content[content_start..], "</p>") else {
+            break;
+        };
+        let content_end = content_start + relative_end;
+        let text = clean_markup_text(&content[content_start..content_end]);
+        push_subtitle_segment_raw(&mut segments, text, start_time, end_time);
+        cursor = content_end + 4;
+    }
+
+    Ok(segments)
+}
+
+fn parse_txt(content: &str) -> Result<Vec<TranscriptionSegment>, String> {
+    let normalized = content
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut segments = Vec::new();
+    let mut start_time = 0_u64;
+
+    for line in normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let end_time = start_time + DEFAULT_DUBBING_TEXT_DURATION_MS;
+        push_subtitle_segment_raw(&mut segments, line.to_string(), start_time, end_time);
+        start_time = end_time;
+    }
+
+    Ok(segments)
+}
+
+fn push_subtitle_segment_raw(
+    segments: &mut Vec<TranscriptionSegment>,
+    text: String,
+    start_time: u64,
+    end_time: u64,
+) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+
+    segments.push(TranscriptionSegment {
+        text,
+        start_time,
+        end_time,
+        uid: String::new(),
+        status: String::new(),
+        words: Vec::new(),
+    });
+}
+
+fn parse_time_range(line: &str) -> Result<(u64, u64), String> {
+    let (start, end) = line
+        .split_once("-->")
+        .ok_or_else(|| format!("无效时间轴: {line}"))?;
+    let end = end.split_whitespace().next().unwrap_or_default();
+
+    Ok((
+        parse_subtitle_time(start.trim())?,
+        parse_subtitle_time(end.trim())?,
+    ))
+}
+
+fn parse_subtitle_time(text: &str) -> Result<u64, String> {
+    let normalized = text.trim().replace(',', ".");
+    let parts = normalized.split(':').collect::<Vec<_>>();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(format!("无效字幕时间: {text}"));
+    }
+
+    let (hours, minutes, seconds_text) = if parts.len() == 3 {
+        (
+            parts[0]
+                .parse::<u64>()
+                .map_err(|_| format!("无效字幕时间: {text}"))?,
+            parts[1]
+                .parse::<u64>()
+                .map_err(|_| format!("无效字幕时间: {text}"))?,
+            parts[2],
+        )
+    } else {
+        (
+            0,
+            parts[0]
+                .parse::<u64>()
+                .map_err(|_| format!("无效字幕时间: {text}"))?,
+            parts[1],
+        )
+    };
+
+    let (seconds, millis) = parse_seconds_millis(seconds_text)?;
+    Ok((((hours * 60 + minutes) * 60 + seconds) * 1000) + millis)
+}
+
+fn parse_ass_time(text: &str) -> Result<u64, String> {
+    parse_subtitle_time(text)
+}
+
+fn parse_seconds_millis(text: &str) -> Result<(u64, u64), String> {
+    let (seconds_text, fraction_text) = text.split_once('.').unwrap_or((text, ""));
+    let seconds = seconds_text
+        .parse::<u64>()
+        .map_err(|_| format!("无效字幕秒数: {text}"))?;
+    let millis = if fraction_text.is_empty() {
+        0
+    } else {
+        let mut fraction = fraction_text.chars().take(3).collect::<String>();
+        while fraction.len() < 3 {
+            fraction.push('0');
+        }
+        fraction
+            .parse::<u64>()
+            .map_err(|_| format!("无效字幕毫秒: {text}"))?
+    };
+
+    Ok((seconds, millis))
+}
+
+fn parse_ttml_time_value(text: &str) -> Option<u64> {
+    let trimmed = text.trim().trim_matches('"').trim_matches('\'').trim();
+    if let Some(value) = trimmed.strip_suffix("ms") {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|milliseconds| milliseconds.max(0.0).round() as u64);
+    }
+    if let Some(value) = trimmed.strip_suffix('s') {
+        return value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|seconds| (seconds.max(0.0) * 1000.0).round() as u64);
+    }
+    if trimmed.contains(':') {
+        return parse_subtitle_time(trimmed).ok();
+    }
+
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .map(|seconds| (seconds.max(0.0) * 1000.0).round() as u64)
+}
+
+fn parse_numeric_attribute_ms(tag: &str, attribute: &str) -> Option<u64> {
+    attr_value_case_insensitive(tag, attribute).and_then(|value| {
+        value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+fn attr_value_case_insensitive(tag: &str, attribute: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let attribute = attribute.to_ascii_lowercase();
+    let start = lower.find(&attribute)?;
+    let mut index = start + attribute.len();
+    let chars = tag[index..].char_indices().collect::<Vec<_>>();
+    for (offset, character) in chars {
+        if character.is_whitespace() {
+            index = start + attribute.len() + offset + character.len_utf8();
+            continue;
+        }
+        if character == '=' {
+            index = start + attribute.len() + offset + character.len_utf8();
+            break;
+        }
+        return None;
+    }
+
+    let value = &tag[index..];
+    let value = value.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    if first == '"' || first == '\'' {
+        let rest = &value[first.len_utf8()..];
+        let end = rest.find(first)?;
+        return Some(rest[..end].to_string());
+    }
+
+    Some(
+        value
+            .chars()
+            .take_while(|character| {
+                !character.is_whitespace() && *character != '>' && *character != '/'
+            })
+            .collect(),
+    )
+}
+
+fn clean_tts_subtitle_text(text: &str) -> String {
+    let text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("\\N", "\n")
+        .replace("\\n", "\n")
+        .replace("\\h", " ");
+    let text = strip_ass_overrides(&text);
+    let text = strip_markup_tags(&text);
+    let text = html_escape::decode_html_entities(&text).to_string();
+    let text = strip_markup_tags(&text);
+    let mut lines = text
+        .lines()
+        .map(clean_tts_text_line)
+        .filter(|line| !line.is_empty() && !is_pure_bracket_content(line))
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    if let Some(first_chinese_line) = lines.iter().position(|line| contains_chinese(line)) {
+        if first_chinese_line > 0 {
+            lines = lines[first_chinese_line..].to_vec();
+        }
+    }
+
+    let text = lines.join("\n");
+    let text = oralize_trading_units(&text);
+    ensure_sentence_punctuation(&collapse_repeated_punctuation(&text))
+}
+
+fn clean_markup_text(text: &str) -> String {
+    let text = strip_markup_tags(text);
+    let text = html_escape::decode_html_entities(&text).to_string();
+    let text = strip_markup_tags(&text);
+    text.replace('\u{00a0}', " ").trim().to_string()
+}
+
+fn clean_tts_text_line(line: &str) -> String {
+    let mut cleaned = String::new();
+    let mut previous_space = false;
+
+    for character in line.chars() {
+        if matches!(
+            character,
+            '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\u{0000}'..='\u{0008}'
+                | '\u{000b}' | '\u{000c}' | '\u{000e}'..='\u{001f}' | '\u{007f}'
+        ) {
+            continue;
+        }
+
+        let normalized = match character {
+            '"' | '\'' | '‘' | '’' | '“' | '”' | '「' | '」' | '『' | '』' | '《' | '》' => {
+                ' '
+            }
+            '—' | '–' => '，',
+            _ => character,
+        };
+
+        if normalized.is_whitespace() {
+            if !previous_space {
+                cleaned.push(' ');
+                previous_space = true;
+            }
+        } else {
+            cleaned.push(normalized);
+            previous_space = false;
+        }
+    }
+
+    cleaned.trim().to_string()
+}
+
+fn strip_ass_overrides(text: &str) -> String {
+    strip_between(text, '{', '}')
+}
+
+fn strip_markup_tags(text: &str) -> String {
+    strip_between(text, '<', '>')
+}
+
+fn strip_between(text: &str, open: char, close: char) -> String {
+    let mut output = String::new();
+    let mut depth = 0_u32;
+
+    for character in text.chars() {
+        if character == open {
+            depth = depth.saturating_add(1);
+            continue;
+        }
+        if character == close && depth > 0 {
+            depth -= 1;
+            continue;
+        }
+        if depth == 0 {
+            output.push(character);
+        }
+    }
+
+    output
+}
+
+fn is_pure_bracket_content(text: &str) -> bool {
+    let value = text.trim();
+    if value.chars().count() < 2 {
+        return false;
+    }
+
+    let pairs = [
+        ('(', ')'),
+        ('[', ']'),
+        ('{', '}'),
+        ('<', '>'),
+        ('（', '）'),
+        ('【', '】'),
+        ('「', '」'),
+        ('『', '』'),
+    ];
+    pairs.iter().any(|(open, close)| {
+        value.starts_with(*open)
+            && value.ends_with(*close)
+            && value
+                .trim_start_matches(*open)
+                .trim_end_matches(*close)
+                .trim()
+                .chars()
+                .any(|character| character.is_alphanumeric() || contains_chinese_char(character))
+    })
+}
+
+fn contains_chinese(text: &str) -> bool {
+    text.chars().any(contains_chinese_char)
+}
+
+fn contains_chinese_char(character: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&character)
+}
+
+fn oralize_trading_units(text: &str) -> String {
+    let mut result = text.to_string();
+    for unit in [
+        "tick", "ticks", "Tick", "Ticks", "pip", "pips", "Pip", "Pips",
+    ] {
+        result = result.replace(&format!("二{unit}"), &format!("两{unit}"));
+        result = result.replace(&format!("二 {unit}"), &format!("两 {unit}"));
+    }
+    result
+}
+
+fn ensure_sentence_punctuation(text: &str) -> String {
+    let stripped = text.trim();
+    if stripped.is_empty() {
+        return String::new();
+    }
+
+    let closing_marks = "」』】）》〉］｝)}’”'\"";
+    let core = stripped.trim_end_matches(|character| closing_marks.contains(character));
+    let suffix = &stripped[core.len()..];
+    if core.is_empty() || ends_with_sentence_punctuation(core) {
+        return stripped.to_string();
+    }
+
+    let punctuation = if contains_chinese(core) { "。" } else { "." };
+    format!("{core}{punctuation}{suffix}")
+}
+
+fn ends_with_sentence_punctuation(text: &str) -> bool {
+    text.ends_with("……")
+        || text.ends_with("?!")
+        || text.ends_with("!?")
+        || text
+            .chars()
+            .last()
+            .is_some_and(|character| "。！？!?.,;:；：".contains(character))
+}
+
+fn collapse_repeated_punctuation(text: &str) -> String {
+    let mut output = String::new();
+    let mut previous = None;
+
+    for character in text.chars() {
+        if previous == Some(character) && "。！？!?.,;:；：".contains(character) {
+            continue;
+        }
+        output.push(character);
+        previous = Some(character);
+    }
+
+    while output.contains("………") {
+        output = output.replace("………", "……");
+    }
+
+    output
+}
+
+fn deduplicate_warnings(warnings: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    warnings
+        .into_iter()
+        .filter(|warning| seen.insert(warning.clone()))
+        .collect()
+}
+
+fn find_case_insensitive_positions(text: &str, pattern: &str) -> Vec<usize> {
+    let lower_text = text.to_ascii_lowercase();
+    let lower_pattern = pattern.to_ascii_lowercase();
+    let mut positions = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(relative_position) = lower_text[cursor..].find(&lower_pattern) {
+        let position = cursor + relative_position;
+        positions.push(position);
+        cursor = position + lower_pattern.len();
+    }
+
+    positions
+}
+
+fn find_case_insensitive(text: &str, pattern: &str) -> Option<usize> {
+    text.to_ascii_lowercase()
+        .find(&pattern.to_ascii_lowercase())
 }
 
 fn engine_label(engine: &str) -> &'static str {
@@ -1746,5 +3690,64 @@ fn preview_text_for_voice(model_key: &str, locale: Option<&str>) -> &'static str
         "vi" => "Xin chào, đây là bản nghe thử giọng nói.",
         "zh" => "你好，这是一段配音试听。",
         _ => "1 2 3 4 5.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_srt_for_dubbing_preprocess() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,500\nHello world\n\n2\n00:00:03,000 --> 00:00:04,000\nNext\n";
+        let segments = parse_srt(srt).unwrap();
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start_time, 1000);
+        assert_eq!(segments[0].end_time, 2500);
+        assert_eq!(segments[0].text, "Hello world");
+    }
+
+    #[test]
+    fn parses_ass_for_dubbing_preprocess() {
+        let ass = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,{\\i1}Hello\\Nworld\n";
+        let segments = parse_ass(ass).unwrap();
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_time, 1000);
+        assert_eq!(segments[0].end_time, 2500);
+        assert_eq!(segments[0].text, "Hello\nworld");
+    }
+
+    #[test]
+    fn repairs_invalid_subtitle_timing_for_dubbing_preprocess() {
+        let segments = parse_srt("1\n00:00:02,000 --> 00:00:01,000\nBackwards\n").unwrap();
+        let mut warnings = Vec::new();
+        let normalized = normalize_dubbing_segments(segments, &mut warnings).unwrap();
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].start_time, 2000);
+        assert_eq!(normalized[0].end_time, 2100);
+        assert_eq!(normalized[0].text, "Backwards.");
+        assert!(warnings[0].contains("时间轴无效"));
+    }
+
+    #[test]
+    fn pair_key_is_stable_for_same_paths() {
+        let first = dubbing_pair_key(
+            Path::new("C:/Videos/intro.mp4"),
+            Path::new("C:/Videos/intro.srt"),
+        );
+        let second = dubbing_pair_key(
+            Path::new("C:/Videos/intro.mp4"),
+            Path::new("C:/Videos/intro.srt"),
+        );
+        let third = dubbing_pair_key(
+            Path::new("C:/Videos/intro.mp4"),
+            Path::new("C:/Videos/other.srt"),
+        );
+
+        assert_eq!(first, second);
+        assert_ne!(first, third);
     }
 }

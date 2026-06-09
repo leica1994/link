@@ -1227,6 +1227,68 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
   white-space: nowrap;
 }
 
+.dubbing-stage-preview {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 0;
+}
+
+.dubbing-stage-row {
+  display: grid;
+  grid-template-columns: 16px minmax(92px, 0.35fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 52px;
+  padding: 0 16px;
+  color: var(--text);
+}
+
+.dubbing-stage-row + .dubbing-stage-row {
+  border-top: 1px solid var(--hairline);
+}
+
+.dubbing-stage-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--text-subtle);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--text-subtle) 18%, transparent);
+}
+
+.dubbing-stage-mark.active {
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+.dubbing-stage-mark.done {
+  background: #2f8a55;
+  box-shadow: 0 0 0 4px rgba(47, 138, 85, 0.18);
+}
+
+.dubbing-stage-mark.failed,
+.dubbing-stage-mark.interrupted {
+  background: #b83b3b;
+  box-shadow: 0 0 0 4px rgba(184, 59, 59, 0.18);
+}
+
+.dubbing-stage-label {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.2;
+}
+
+.dubbing-stage-message {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dubbing-section-header {
   display: flex;
   align-items: center;
