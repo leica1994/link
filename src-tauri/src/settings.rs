@@ -137,6 +137,18 @@ impl SettingsStore {
         })
     }
 
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|error| format!("设置数据库锁定失败: {error}"))?;
+
+        operation(&connection)
+    }
+
     fn save(&self, settings: &AppSettings) -> Result<(), String> {
         let mut connection = self
             .connection
@@ -287,6 +299,20 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 model TEXT NOT NULL DEFAULT '',
                 reasoning_effort TEXT NOT NULL DEFAULT 'off',
                 is_streaming INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS dubbing_models (
+                id TEXT PRIMARY KEY NOT NULL,
+                engine TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                locale TEXT NOT NULL DEFAULT '',
+                gender TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(engine, model_key)
             );
             ",
         )

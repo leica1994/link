@@ -1,5 +1,6 @@
 mod ai;
 mod app_log;
+mod dubbing;
 mod settings;
 mod subtitle_ai;
 mod subtitle_translation;
@@ -7,6 +8,10 @@ mod transcription;
 
 use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
+use dubbing::{
+    add_dubbing_model, delete_dubbing_model, list_dubbing_models, list_dubbing_voices,
+    preview_dubbing_voice, set_dubbing_model_enabled,
+};
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
 use tauri::Manager;
@@ -58,6 +63,12 @@ pub fn run() {
             save_transcription_file,
             load_subtitle_preview,
             start_subtitle_translation,
+            list_dubbing_models,
+            list_dubbing_voices,
+            add_dubbing_model,
+            set_dubbing_model_enabled,
+            delete_dubbing_model,
+            preview_dubbing_voice,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
