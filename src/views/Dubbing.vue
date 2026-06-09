@@ -537,7 +537,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { DragDropEvent } from '@tauri-apps/api/webview'
 import { open } from '@tauri-apps/plugin-dialog'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import {
   Boxes,
   ChevronRight,
@@ -557,6 +558,12 @@ import {
   Volume2,
   X,
 } from 'lucide-vue-next'
+import {
+  type AppSettings,
+  ReferenceAudioSource,
+  normalizeSettings,
+  referenceAudioSourceOptions,
+} from '../settingsModel'
 
 defineOptions({ name: 'Dubbing' })
 
@@ -569,11 +576,6 @@ enum DubbingEngineKind {
   EdgeTts = 'edge-tts',
   NanoAiTts = 'nano-ai-tts',
   IndexTts2 = 'index-tts-2',
-}
-
-enum ReferenceAudioSource {
-  ExistingDubbing = 'existing-dubbing',
-  CustomAudioFile = 'custom-audio-file',
 }
 
 type DubbingVoiceOption = {
@@ -608,6 +610,7 @@ type DubbingProgressStage = {
 type DubbingStageProgress = {
   material?: DubbingProgressStage
   subtitlePreprocess?: DubbingProgressStage
+  mediaSeparation?: DubbingProgressStage
   ttsSynthesis?: DubbingProgressStage
   audioMerge?: DubbingProgressStage
   videoCompose?: DubbingProgressStage
@@ -672,12 +675,8 @@ const dubbingEngineOptions = [
   { value: DubbingEngineKind.IndexTts2, label: 'Index-TTS 2.0' },
 ] as const
 
-const referenceAudioSourceOptions = [
-  { value: ReferenceAudioSource.ExistingDubbing, label: '克隆现有配音' },
-  { value: ReferenceAudioSource.CustomAudioFile, label: '自定义音频文件' },
-] as const
-
 const activeTab = ref<DubbingTab>(DubbingTab.Workflow)
+const currentSettings = ref<AppSettings>(normalizeSettings({}))
 const dubbingModels = ref<DubbingModel[]>([])
 const voices = ref<DubbingVoiceOption[]>([])
 const selectedEngine = ref<DubbingEngineKind>(DubbingEngineKind.EdgeTts)
@@ -709,11 +708,14 @@ const dialogError = ref('')
 const updatingModelIds = ref<string[]>([])
 const previewingKey = ref('')
 const modelPendingDelete = ref<DubbingModel | null>(null)
+const isSettingsLoaded = ref(false)
 let previewAudio: HTMLAudioElement | null = null
 let previewAudioUrl = ''
 let materialPrepareToken = 0
 let unlistenSourceDragDrop: UnlistenFn | undefined
 let unlistenDubbingProgress: UnlistenFn | undefined
+let isApplyingStoredSettings = false
+let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 const dubbingVideoExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v']
@@ -772,6 +774,21 @@ const selectedMaterialSummary = computed(() => {
 
 const preprocessedSubtitleSegments = computed(() => activeDubbingTask.value?.segments ?? [])
 
+const hasDubbingArtifact = (task: DubbingTaskSnapshot, kind: string) => {
+  return task.artifacts.some((artifact) => artifact.kind === kind && Boolean(artifact.path))
+}
+
+const isMediaSeparationDone = computed(() => {
+  const task = activeDubbingTask.value
+  if (!task || task.stages.mediaSeparation?.status !== 'done') {
+    return false
+  }
+
+  const hasCoreArtifacts = hasDubbingArtifact(task, 'muted-video') && hasDubbingArtifact(task, 'source-audio')
+  const hasBackgroundMusic = !isBackgroundMusicEnabled.value || hasDubbingArtifact(task, 'background-music')
+  return hasCoreArtifacts && hasBackgroundMusic
+})
+
 const visibleDubbingStages = computed<VisibleDubbingStage[]>(() => {
   const stages = activeDubbingTask.value?.stages
   if (!stages) {
@@ -781,6 +798,7 @@ const visibleDubbingStages = computed<VisibleDubbingStage[]>(() => {
   return [
     { key: 'material', label: '素材准备', stage: stages.material },
     { key: 'subtitle-preprocess', label: '字幕预处理', stage: stages.subtitlePreprocess },
+    { key: 'media-separation', label: '音视频分离', stage: stages.mediaSeparation },
     { key: 'tts-synthesis', label: 'TTS 配音', stage: stages.ttsSynthesis },
     { key: 'audio-merge', label: '音频合成', stage: stages.audioMerge },
     { key: 'video-compose', label: '视频合成', stage: stages.videoCompose },
@@ -839,6 +857,10 @@ const dubbingStatusText = computed(() => {
   }
 
   if (activeDubbingTask.value.status === 'preprocessed') {
+    if (isMediaSeparationDone.value) {
+      return '音视频分离完成'
+    }
+
     return '字幕预处理完成'
   }
 
@@ -870,7 +892,10 @@ const canStartDubbing = computed(() => {
     return false
   }
 
-  return ['ready', 'failed', 'interrupted'].includes(activeDubbingTask.value.status)
+  return (
+    ['ready', 'failed', 'interrupted'].includes(activeDubbingTask.value.status) ||
+    (activeDubbingTask.value.status === 'preprocessed' && !isMediaSeparationDone.value)
+  )
 })
 
 const startDubbingButtonText = computed(() => {
@@ -886,8 +911,93 @@ const startDubbingButtonText = computed(() => {
     return '继续配音'
   }
 
+  if (activeDubbingTask.value?.status === 'preprocessed' && !isMediaSeparationDone.value) {
+    return '继续分离'
+  }
+
   return '开始配音'
 })
+
+const createSettingsSnapshot = (): AppSettings => ({
+  ...currentSettings.value,
+  dubbingTtsIntervalMs: ttsIntervalMs.value,
+  dubbingReferenceAudioSource: selectedReferenceAudioSource.value,
+  dubbingIsBackgroundMusicEnabled: isBackgroundMusicEnabled.value,
+  dubbingBackgroundMusicVolume: backgroundMusicVolume.value,
+})
+
+const applySettings = (settings: AppSettings) => {
+  isApplyingStoredSettings = true
+
+  currentSettings.value = settings
+  ttsIntervalMs.value = settings.dubbingTtsIntervalMs
+  selectedReferenceAudioSource.value = settings.dubbingReferenceAudioSource
+  isBackgroundMusicEnabled.value = settings.dubbingIsBackgroundMusicEnabled
+  backgroundMusicVolume.value = settings.dubbingBackgroundMusicVolume
+
+  nextTick(() => {
+    isApplyingStoredSettings = false
+  })
+}
+
+const saveSettingsNow = async () => {
+  if (!isSettingsLoaded.value || isApplyingStoredSettings) {
+    return
+  }
+
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  try {
+    await invoke('save_settings', { settings: createSettingsSnapshot() })
+  } catch (error) {
+    console.error('保存配音参数失败', error)
+  }
+}
+
+const flushPendingSave = async () => {
+  if (saveSettingsTimer !== undefined) {
+    window.clearTimeout(saveSettingsTimer)
+    saveSettingsTimer = undefined
+  }
+
+  await saveSettingsNow()
+}
+
+const scheduleSaveSettings = () => {
+  if (!isSettingsLoaded.value || isApplyingStoredSettings) {
+    return
+  }
+
+  if (saveSettingsTimer !== undefined) {
+    window.clearTimeout(saveSettingsTimer)
+  }
+
+  saveSettingsTimer = window.setTimeout(() => {
+    saveSettingsTimer = undefined
+    void saveSettingsNow()
+  }, 260)
+}
+
+const loadStoredSettings = async () => {
+  if (!isTauriRuntime()) {
+    applySettings(normalizeSettings({}))
+    await nextTick()
+    isSettingsLoaded.value = true
+    return
+  }
+
+  try {
+    const storedSettings = await invoke<Partial<AppSettings>>('load_settings')
+    applySettings(normalizeSettings(storedSettings))
+  } catch (error) {
+    console.error('加载配音参数失败', error)
+  } finally {
+    await nextTick()
+    isSettingsLoaded.value = true
+  }
+}
 
 const selectTab = (tab: DubbingTab) => {
   activeTab.value = tab
@@ -1559,15 +1669,35 @@ const stringifyError = (error: unknown, fallback: string) => {
   return fallback
 }
 
+watch(createSettingsSnapshot, scheduleSaveSettings, { deep: true })
+
 onMounted(() => {
+  void loadStoredSettings()
   void loadModels()
   void registerDubbingProgressListener()
   void registerSourceDragDropListener()
   window.addEventListener('keydown', handleKeydown)
 })
 
+onActivated(() => {
+  if (isSettingsLoaded.value) {
+    void loadStoredSettings()
+  }
+})
+
+onBeforeRouteLeave(async () => {
+  await flushPendingSave()
+})
+
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+
+  if (saveSettingsTimer !== undefined) {
+    window.clearTimeout(saveSettingsTimer)
+    saveSettingsTimer = undefined
+    void saveSettingsNow()
+  }
+
   unlistenDubbingProgress?.()
   unlistenSourceDragDrop?.()
   stopPreviewAudio()

@@ -319,6 +319,87 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="dubbing-settings-title">
+        <div id="dubbing-settings-title" class="section-heading">
+          <MicVocal aria-hidden="true" />
+          <span>配音参数</span>
+        </div>
+
+        <div class="settings-panel">
+          <div class="setting-row">
+            <Timer class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">TTS 间隔</div>
+              <div class="setting-subtitle">分段语音停顿时长</div>
+            </div>
+            <div class="setting-range-control dubbing-range-control">
+              <span class="setting-range-value dubbing-range-value">{{ dubbingTtsIntervalMs }} 毫秒</span>
+              <input
+                v-model.number="dubbingTtsIntervalMs"
+                class="setting-range"
+                type="range"
+                min="0"
+                max="1000"
+                step="10"
+                aria-label="TTS 间隔"
+              />
+            </div>
+          </div>
+
+          <button class="setting-row setting-row-button" type="button" @click="openReferenceAudioDialog">
+            <FileMusic class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <span class="setting-copy">
+              <span class="setting-title">参考音频</span>
+              <span class="setting-subtitle">选择参考音频来源</span>
+            </span>
+            <span class="setting-inline-action">
+              <span class="setting-value">{{ referenceAudioSourceLabel }}</span>
+              <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+            </span>
+          </button>
+
+          <div class="setting-row">
+            <Music class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">背景音乐</div>
+              <div class="setting-subtitle">开启后分离源视频伴奏并跟随变速同步混入最终视频</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: dubbingIsBackgroundMusicEnabled }"
+              type="button"
+              :aria-pressed="dubbingIsBackgroundMusicEnabled"
+              @click="dubbingIsBackgroundMusicEnabled = !dubbingIsBackgroundMusicEnabled"
+            >
+              <span class="setting-toggle-label">{{ dubbingIsBackgroundMusicEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <Volume2 class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">背景音乐音量</div>
+              <div class="setting-subtitle">背景音乐混入音量</div>
+            </div>
+            <div class="setting-range-control dubbing-range-control">
+              <span class="setting-range-value dubbing-range-value">{{ dubbingBackgroundMusicVolume.toFixed(1) }}</span>
+              <input
+                v-model.number="dubbingBackgroundMusicVolume"
+                class="setting-range"
+                type="range"
+                min="0"
+                max="1"
+                step="0.1"
+                aria-label="背景音乐音量"
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="log-settings-title">
         <div id="log-settings-title" class="section-heading">
           <FolderOpen aria-hidden="true" />
@@ -547,6 +628,37 @@
       </div>
 
       <div
+        v-if="isReferenceAudioDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeReferenceAudioDialog"
+      >
+        <section
+          class="settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reference-audio-dialog-title"
+        >
+          <h2 id="reference-audio-dialog-title" class="dialog-title">参考音频</h2>
+          <div class="dialog-options" role="radiogroup" aria-label="参考音频">
+            <button
+              v-for="option in referenceAudioSourceOptions"
+              :key="option.value"
+              class="dialog-option"
+              :class="{ active: selectedReferenceAudioSource === option.value }"
+              type="button"
+              role="radio"
+              :aria-checked="selectedReferenceAudioSource === option.value"
+              @click="selectReferenceAudioSource(option.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span>{{ option.label }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <div
         v-if="isTargetLanguageDialogOpen"
         class="dialog-backdrop"
         role="presentation"
@@ -594,6 +706,7 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import {
   AlignJustify,
   Bot,
@@ -603,6 +716,7 @@ import {
   CircleHelp,
   Eye,
   EyeOff,
+  FileMusic,
   Film,
   FolderOpen,
   Gauge,
@@ -610,7 +724,9 @@ import {
   Languages,
   Link as LinkIcon,
   ListChecks,
+  MicVocal,
   Moon,
+  Music,
   Pencil,
   Plug,
   RefreshCw,
@@ -618,6 +734,8 @@ import {
   Server,
   SlidersHorizontal,
   Sun,
+  Timer,
+  Volume2,
   WandSparkles,
 } from 'lucide-vue-next'
 import { useTheme } from '../composables/useTheme'
@@ -672,6 +790,11 @@ enum OutputMode {
   SourceAndTargetFiles = 'source-and-target-files',
 }
 
+enum ReferenceAudioSource {
+  ExistingDubbing = 'existing-dubbing',
+  CustomAudioFile = 'custom-audio-file',
+}
+
 type TargetLanguageOption = {
   value: string
   label: string
@@ -706,6 +829,10 @@ type AppSettings = {
   isSubtitleTranslationEnabled: boolean
   isPostTranslationOptimizationEnabled: boolean
   targetLanguage: string
+  dubbingTtsIntervalMs: number
+  dubbingReferenceAudioSource: ReferenceAudioSource
+  dubbingIsBackgroundMusicEnabled: boolean
+  dubbingBackgroundMusicVolume: number
 }
 
 type LlmConnectionCheckResult = {
@@ -1013,6 +1140,11 @@ const outputModeOptions = [
   { value: OutputMode.SourceAndTargetFiles, label: '原文与译文文件' },
 ] as const
 
+const referenceAudioSourceOptions = [
+  { value: ReferenceAudioSource.ExistingDubbing, label: '克隆现有配音' },
+  { value: ReferenceAudioSource.CustomAudioFile, label: '自定义音频文件' },
+] as const
+
 const targetLanguageOptions: TargetLanguageOption[] = [
   { value: 'zh-Hans', label: '简体中文' },
   { value: 'zh-Hant', label: '繁体中文' },
@@ -1104,6 +1236,17 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
     targetLanguageOptions.some((option) => option.value === settings.targetLanguage)
       ? settings.targetLanguage
       : 'zh-Hans',
+  dubbingTtsIntervalMs: readNumberSetting(settings.dubbingTtsIntervalMs, 150, 0, 1000),
+  dubbingReferenceAudioSource: readOptionValue(
+    settings.dubbingReferenceAudioSource,
+    referenceAudioSourceOptions,
+    ReferenceAudioSource.ExistingDubbing,
+  ),
+  dubbingIsBackgroundMusicEnabled:
+    typeof settings.dubbingIsBackgroundMusicEnabled === 'boolean'
+      ? settings.dubbingIsBackgroundMusicEnabled
+      : true,
+  dubbingBackgroundMusicVolume: readNumberSetting(settings.dubbingBackgroundMusicVolume, 0.5, 0, 1),
 })
 
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
@@ -1134,6 +1277,11 @@ const isPostTranslationOptimizationEnabled = ref(true)
 const selectedTargetLanguage = ref('zh-Hans')
 const isTargetLanguageDialogOpen = ref(false)
 const targetLanguageSearch = ref('')
+const dubbingTtsIntervalMs = ref(150)
+const selectedReferenceAudioSource = ref<ReferenceAudioSource>(ReferenceAudioSource.ExistingDubbing)
+const isReferenceAudioDialogOpen = ref(false)
+const dubbingIsBackgroundMusicEnabled = ref(true)
+const dubbingBackgroundMusicVolume = ref(0.5)
 const logDirectoryError = ref('')
 const isSettingsLoaded = ref(false)
 let isApplyingStoredSettings = false
@@ -1224,6 +1372,10 @@ const targetLanguageLabel = computed(() => {
   return targetLanguageOptions.find((option) => option.value === selectedTargetLanguage.value)?.label ?? ''
 })
 
+const referenceAudioSourceLabel = computed(() => {
+  return referenceAudioSourceOptions.find((option) => option.value === selectedReferenceAudioSource.value)?.label ?? ''
+})
+
 const filteredTargetLanguageOptions = computed(() => {
   const query = targetLanguageSearch.value.trim().toLowerCase()
 
@@ -1255,6 +1407,10 @@ const createSettingsSnapshot = (): AppSettings => ({
   isSubtitleTranslationEnabled: isSubtitleTranslationEnabled.value,
   isPostTranslationOptimizationEnabled: isPostTranslationOptimizationEnabled.value,
   targetLanguage: selectedTargetLanguage.value,
+  dubbingTtsIntervalMs: dubbingTtsIntervalMs.value,
+  dubbingReferenceAudioSource: selectedReferenceAudioSource.value,
+  dubbingIsBackgroundMusicEnabled: dubbingIsBackgroundMusicEnabled.value,
+  dubbingBackgroundMusicVolume: dubbingBackgroundMusicVolume.value,
 })
 
 const applySettings = (settings: AppSettings) => {
@@ -1278,6 +1434,10 @@ const applySettings = (settings: AppSettings) => {
   isSubtitleTranslationEnabled.value = settings.isSubtitleTranslationEnabled
   isPostTranslationOptimizationEnabled.value = settings.isPostTranslationOptimizationEnabled
   selectedTargetLanguage.value = settings.targetLanguage
+  dubbingTtsIntervalMs.value = settings.dubbingTtsIntervalMs
+  selectedReferenceAudioSource.value = settings.dubbingReferenceAudioSource
+  dubbingIsBackgroundMusicEnabled.value = settings.dubbingIsBackgroundMusicEnabled
+  dubbingBackgroundMusicVolume.value = settings.dubbingBackgroundMusicVolume
   resetLlmConnectionStatus()
 
   nextTick(() => {
@@ -1286,6 +1446,10 @@ const applySettings = (settings: AppSettings) => {
 }
 
 const saveSettingsNow = async () => {
+  if (!isSettingsLoaded.value || isApplyingStoredSettings) {
+    return
+  }
+
   if (!isTauriRuntime()) {
     return
   }
@@ -1451,6 +1615,19 @@ const selectVideoContentType = (type: VideoContentType) => {
   closeVideoContentTypeDialog()
 }
 
+const openReferenceAudioDialog = () => {
+  isReferenceAudioDialogOpen.value = true
+}
+
+const closeReferenceAudioDialog = () => {
+  isReferenceAudioDialogOpen.value = false
+}
+
+const selectReferenceAudioSource = (source: ReferenceAudioSource) => {
+  selectedReferenceAudioSource.value = source
+  closeReferenceAudioDialog()
+}
+
 const openTargetLanguageDialog = () => {
   targetLanguageSearch.value = ''
   isTargetLanguageDialogOpen.value = true
@@ -1472,6 +1649,7 @@ const handleKeydown = (event: KeyboardEvent) => {
     closeReasoningEffortDialog()
     closeTranslationServiceDialog()
     closeVideoContentTypeDialog()
+    closeReferenceAudioDialog()
     closeTargetLanguageDialog()
   }
 }
@@ -1494,6 +1672,10 @@ window.addEventListener('keydown', handleKeydown)
 
 onMounted(() => {
   void loadStoredSettings()
+})
+
+onBeforeRouteLeave(async () => {
+  await flushPendingSave()
 })
 
 onBeforeUnmount(() => {

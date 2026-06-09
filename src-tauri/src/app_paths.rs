@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 const DATA_DIR_NAME: &str = "data";
 const DUBBING_DIR_NAME: &str = "dubbing";
 const LOG_DIR_NAME: &str = "logs";
+const MODELS_DIR_NAME: &str = "models";
+const STEM_SPLITTER_DIR_NAME: &str = "stem-splitter-core";
 const TEMP_DIR_NAME: &str = "temp";
 const WEBVIEW_DIR_NAME: &str = "webview";
 
@@ -46,8 +48,18 @@ pub fn temp_dir() -> Result<PathBuf, String> {
     Ok(temp_dir)
 }
 
+pub fn stem_splitter_cache_dir() -> Result<PathBuf, String> {
+    let cache_dir = ensure_app_data_dir()?
+        .join(MODELS_DIR_NAME)
+        .join(STEM_SPLITTER_DIR_NAME);
+    fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("无法创建音频分离模型缓存目录: {error}"))?;
+    Ok(cache_dir)
+}
+
 pub fn webview_data_dir() -> Result<PathBuf, String> {
     let webview_dir = ensure_app_data_dir()?.join(WEBVIEW_DIR_NAME);
-    fs::create_dir_all(&webview_dir).map_err(|error| format!("无法创建 WebView 缓存目录: {error}"))?;
+    fs::create_dir_all(&webview_dir)
+        .map_err(|error| format!("无法创建 WebView 缓存目录: {error}"))?;
     Ok(webview_dir)
 }

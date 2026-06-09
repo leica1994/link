@@ -42,6 +42,11 @@ export enum OutputMode {
   SourceAndTargetFiles = 'source-and-target-files',
 }
 
+export enum ReferenceAudioSource {
+  ExistingDubbing = 'existing-dubbing',
+  CustomAudioFile = 'custom-audio-file',
+}
+
 export type TargetLanguageOption = {
   value: string
   label: string
@@ -76,6 +81,10 @@ export type AppSettings = {
   isSubtitleTranslationEnabled: boolean
   isPostTranslationOptimizationEnabled: boolean
   targetLanguage: string
+  dubbingTtsIntervalMs: number
+  dubbingReferenceAudioSource: ReferenceAudioSource
+  dubbingIsBackgroundMusicEnabled: boolean
+  dubbingBackgroundMusicVolume: number
 }
 
 export const transcriptionModelOptions = [
@@ -118,6 +127,11 @@ export const outputModeOptions = [
   { value: OutputMode.TargetOnly, label: '仅译文字幕' },
   { value: OutputMode.Bilingual, label: '双语字幕' },
   { value: OutputMode.SourceAndTargetFiles, label: '原文与译文文件' },
+] as const
+
+export const referenceAudioSourceOptions = [
+  { value: ReferenceAudioSource.ExistingDubbing, label: '克隆现有配音' },
+  { value: ReferenceAudioSource.CustomAudioFile, label: '自定义音频文件' },
 ] as const
 
 const languageDisplayNames = new Intl.DisplayNames(['zh-Hans'], { type: 'language' })
@@ -482,6 +496,17 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
     targetLanguageOptions.some((option) => option.value === settings.targetLanguage)
       ? settings.targetLanguage
       : 'zh-Hans',
+  dubbingTtsIntervalMs: readNumberSetting(settings.dubbingTtsIntervalMs, 150, 0, 1000),
+  dubbingReferenceAudioSource: readOptionValue(
+    settings.dubbingReferenceAudioSource,
+    referenceAudioSourceOptions,
+    ReferenceAudioSource.ExistingDubbing,
+  ),
+  dubbingIsBackgroundMusicEnabled:
+    typeof settings.dubbingIsBackgroundMusicEnabled === 'boolean'
+      ? settings.dubbingIsBackgroundMusicEnabled
+      : true,
+  dubbingBackgroundMusicVolume: readNumberSetting(settings.dubbingBackgroundMusicVolume, 0.5, 0, 1),
 })
 
 export const getOptionLabel = <T extends string>(

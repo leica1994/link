@@ -8,17 +8,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use stem_splitter_core::{split_file, SplitOptions};
 use tauri::{AppHandle, Emitter};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
 use uuid::Uuid;
 
-use crate::app_paths;
 use crate::app_log::AppLogger;
+use crate::app_paths;
 use crate::settings::SettingsStore;
 use crate::transcription::{serialize_subtitle, SubtitleFormat, TranscriptionSegment};
 
@@ -41,6 +44,7 @@ const INDEX_TTS2_SAMPLE_AUDIO: &[u8] = include_bytes!("../assets/audio_sample.mp
 const DUBBING_PROGRESS_EVENT: &str = "dubbing-progress";
 const DUBBING_STAGE_MATERIAL: &str = "material";
 const DUBBING_STAGE_SUBTITLE_PREPROCESS: &str = "subtitle-preprocess";
+const DUBBING_STAGE_MEDIA_SEPARATION: &str = "media-separation";
 const DUBBING_STAGE_TTS_SYNTHESIS: &str = "tts-synthesis";
 const DUBBING_STAGE_AUDIO_MERGE: &str = "audio-merge";
 const DUBBING_STAGE_VIDEO_COMPOSE: &str = "video-compose";
@@ -52,6 +56,9 @@ const DUBBING_STATUS_INTERRUPTED: &str = "interrupted";
 const DUBBING_ARTIFACT_SOURCE_VIDEO: &str = "source-video";
 const DUBBING_ARTIFACT_SOURCE_SUBTITLE: &str = "source-subtitle";
 const DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE: &str = "preprocessed-subtitle";
+const DUBBING_ARTIFACT_MUTED_VIDEO: &str = "muted-video";
+const DUBBING_ARTIFACT_SOURCE_AUDIO: &str = "source-audio";
+const DUBBING_ARTIFACT_BACKGROUND_MUSIC: &str = "background-music";
 const DUBBING_VIDEO_EXTENSIONS: &[&str] =
     &["mp4", "mov", "mkv", "avi", "flv", "wmv", "webm", "m4v"];
 const DUBBING_SUBTITLE_EXTENSIONS: &[&str] = &[
@@ -59,6 +66,16 @@ const DUBBING_SUBTITLE_EXTENSIONS: &[&str] = &[
 ];
 const MIN_DUBBING_SUBTITLE_DURATION_MS: u64 = 100;
 const DEFAULT_DUBBING_TEXT_DURATION_MS: u64 = 3_000;
+const BACKGROUND_MUSIC_MODEL: &str = "htdemucs_ort_v1";
+const BACKGROUND_MUSIC_MODEL_MANIFEST_URL: &str =
+    "https://hf-mirror.com/gentij/htdemucs-ort/resolve/main/manifest.json";
+const BACKGROUND_MUSIC_MODEL_ARTIFACT_URL: &str =
+    "https://hf-mirror.com/gentij/htdemucs-ort/resolve/main/htdemucs.ort";
+const BACKGROUND_MUSIC_MODEL_CACHE_FILE: &str = "HTDemucs-ORT-09dc1655.ort";
+const STEM_SPLITTER_CACHE_DIR_ENV: &str = "STEM_SPLITTER_CORE_CACHE_DIR";
+const BACKGROUND_MUSIC_MODEL_SHA256: &str =
+    "09dc165512d8ef7480bcb2cacea9dda82d571f8dbf421d8c44a2ca5568bec729";
+const BACKGROUND_MUSIC_MODEL_SIZE_BYTES: u64 = 209_884_896;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -181,6 +198,8 @@ pub struct DubbingStageProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_preprocess: Option<DubbingProgressStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_separation: Option<DubbingProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tts_synthesis: Option<DubbingProgressStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_merge: Option<DubbingProgressStage>,
@@ -241,6 +260,19 @@ struct DubbingSubtitlePreprocessResult {
     segments: Vec<TranscriptionSegment>,
     output_path: PathBuf,
     warnings: Vec<String>,
+}
+
+struct DubbingMediaSeparationResult {
+    muted_video_path: PathBuf,
+    source_audio_path: PathBuf,
+    background_music_path: Option<PathBuf>,
+    warnings: Vec<String>,
+}
+
+struct StemSplitPaths {
+    drums_path: PathBuf,
+    bass_path: PathBuf,
+    other_path: PathBuf,
 }
 
 struct DubbingSubtitleInput {
@@ -547,6 +579,15 @@ pub fn prepare_dubbing_material(
             "pending",
             &now,
         )?;
+        insert_dubbing_stage_if_missing(
+            connection,
+            &task_id,
+            DUBBING_STAGE_MEDIA_SEPARATION,
+            0,
+            "等待音视频分离",
+            "pending",
+            &now,
+        )?;
         if should_mark_interrupted && interrupted_stage != DUBBING_STAGE_MATERIAL {
             upsert_dubbing_stage(
                 connection,
@@ -590,30 +631,165 @@ pub fn start_dubbing_task(
     let log_session = app_logger.start_session("dubbing")?;
     log_session.info(
         "request_received",
-        "收到配音预处理请求",
-        json!({ "taskId": &request.task_id }),
+        "收到配音任务请求",
+        json!({
+            "taskId": &request.task_id,
+            "backgroundMusic": request.options.is_background_music_enabled,
+        }),
     );
     let options = request.options;
     save_dubbing_task_options(&store, &request.task_id, &options)?;
 
-    if let Some(snapshot) = read_completed_subtitle_preprocess_snapshot(&store, &request.task_id)? {
+    let mut snapshot = store.with_connection(|connection| {
+        read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+    })?;
+
+    if is_media_separation_done(&snapshot, &options) {
         log_session.info(
-            "subtitle_preprocess_reused",
-            "复用已完成的字幕预处理结果",
+            "media_separation_reused",
+            "复用已完成的音视频分离结果",
             json!({ "taskId": &request.task_id }),
         );
         return Ok(snapshot);
     }
 
+    if is_subtitle_preprocess_done(&snapshot) {
+        log_session.info(
+            "subtitle_preprocess_reused",
+            "复用已完成的字幕预处理结果",
+            json!({ "taskId": &request.task_id }),
+        );
+    } else {
+        let now = Utc::now().to_rfc3339();
+        snapshot = store.with_connection(|connection| {
+            update_dubbing_task_state(
+                connection,
+                &request.task_id,
+                DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                DUBBING_STATUS_RUNNING,
+                0,
+                "字幕预处理中",
+                "",
+                None,
+                &now,
+            )?;
+            upsert_dubbing_stage(
+                connection,
+                &request.task_id,
+                DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                0,
+                "字幕预处理中",
+                "active",
+                json!({}),
+                &now,
+            )?;
+            read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+        })?;
+        emit_dubbing_progress(&app, &snapshot);
+
+        let result = run_subtitle_preprocess(&snapshot);
+        match result {
+            Ok(preprocess_result) => {
+                let now = Utc::now().to_rfc3339();
+                snapshot = store.with_connection(|connection| {
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE,
+                        &preprocess_result.output_path,
+                        json!({
+                            "format": "srt",
+                            "segmentCount": preprocess_result.segments.len(),
+                            "warnings": &preprocess_result.warnings,
+                        }),
+                        &now,
+                    )?;
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                        DUBBING_STATUS_RUNNING,
+                        100,
+                        "字幕预处理完成",
+                        "",
+                        Some(&preprocess_result.warnings),
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                        100,
+                        "字幕预处理完成",
+                        "done",
+                        json!({
+                            "segmentCount": preprocess_result.segments.len(),
+                            "outputPath": path_to_string(&preprocess_result.output_path),
+                            "warnings": &preprocess_result.warnings,
+                        }),
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &snapshot);
+                log_session.info(
+                    "subtitle_preprocess_completed",
+                    "字幕预处理完成",
+                    json!({
+                        "taskId": &request.task_id,
+                        "segmentCount": snapshot.segments.len(),
+                    }),
+                );
+            }
+            Err(error) => {
+                let now = Utc::now().to_rfc3339();
+                let failed_snapshot = store.with_connection(|connection| {
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                        DUBBING_STATUS_FAILED,
+                        0,
+                        "字幕预处理失败",
+                        &error,
+                        None,
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                        0,
+                        "字幕预处理失败",
+                        "failed",
+                        json!({ "error": &error }),
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &failed_snapshot);
+                log_session.error(
+                    "subtitle_preprocess_failed",
+                    "字幕预处理失败",
+                    json!({
+                        "taskId": &request.task_id,
+                        "error": &error,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    }
+
     let now = Utc::now().to_rfc3339();
-    let mut snapshot = store.with_connection(|connection| {
+    snapshot = store.with_connection(|connection| {
         update_dubbing_task_state(
             connection,
             &request.task_id,
-            DUBBING_STAGE_SUBTITLE_PREPROCESS,
+            DUBBING_STAGE_MEDIA_SEPARATION,
             DUBBING_STATUS_RUNNING,
             0,
-            "字幕预处理中",
+            "音视频分离中",
             "",
             None,
             &now,
@@ -621,56 +797,132 @@ pub fn start_dubbing_task(
         upsert_dubbing_stage(
             connection,
             &request.task_id,
-            DUBBING_STAGE_SUBTITLE_PREPROCESS,
+            DUBBING_STAGE_MEDIA_SEPARATION,
             0,
-            "字幕预处理中",
+            "音视频分离中",
             "active",
-            json!({}),
+            json!({ "backgroundMusic": options.is_background_music_enabled }),
             &now,
         )?;
         read_dubbing_task_snapshot_by_id(connection, &request.task_id)
     })?;
     emit_dubbing_progress(&app, &snapshot);
 
-    let result = run_subtitle_preprocess(&snapshot);
-    match result {
-        Ok(preprocess_result) => {
+    let media_input_snapshot = snapshot.clone();
+    let media_result = {
+        let mut emit_media_progress = |progress: u8, message: &str| -> Result<(), String> {
             let now = Utc::now().to_rfc3339();
             snapshot = store.with_connection(|connection| {
-                upsert_dubbing_artifact(
-                    connection,
-                    &request.task_id,
-                    DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE,
-                    &preprocess_result.output_path,
-                    json!({
-                        "format": "srt",
-                        "segmentCount": preprocess_result.segments.len(),
-                        "warnings": &preprocess_result.warnings,
-                    }),
-                    &now,
-                )?;
                 update_dubbing_task_state(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
-                    DUBBING_STATUS_PREPROCESSED,
-                    100,
-                    "字幕预处理完成",
+                    DUBBING_STAGE_MEDIA_SEPARATION,
+                    DUBBING_STATUS_RUNNING,
+                    progress,
+                    message,
                     "",
-                    Some(&preprocess_result.warnings),
+                    None,
                     &now,
                 )?;
                 upsert_dubbing_stage(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    DUBBING_STAGE_MEDIA_SEPARATION,
+                    progress,
+                    message,
+                    "active",
+                    json!({ "backgroundMusic": options.is_background_music_enabled }),
+                    &now,
+                )?;
+                read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+            })?;
+            emit_dubbing_progress(&app, &snapshot);
+            Ok(())
+        };
+
+        run_media_separation(&media_input_snapshot, &options, &mut emit_media_progress)
+    };
+
+    match media_result {
+        Ok(media_result) => {
+            let now = Utc::now().to_rfc3339();
+            let warnings = deduplicate_warnings(
+                snapshot
+                    .warnings
+                    .iter()
+                    .cloned()
+                    .chain(media_result.warnings.clone())
+                    .collect(),
+            );
+            snapshot = store.with_connection(|connection| {
+                upsert_dubbing_artifact(
+                    connection,
+                    &request.task_id,
+                    DUBBING_ARTIFACT_MUTED_VIDEO,
+                    &media_result.muted_video_path,
+                    json!({
+                        "source": DUBBING_ARTIFACT_SOURCE_VIDEO,
+                        "videoOnly": true,
+                    }),
+                    &now,
+                )?;
+                upsert_dubbing_artifact(
+                    connection,
+                    &request.task_id,
+                    DUBBING_ARTIFACT_SOURCE_AUDIO,
+                    &media_result.source_audio_path,
+                    json!({
+                        "format": "wav",
+                        "sampleRate": 44100,
+                    }),
+                    &now,
+                )?;
+                if let Some(background_music_path) = &media_result.background_music_path {
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_BACKGROUND_MUSIC,
+                        background_music_path,
+                        json!({
+                            "format": "wav",
+                            "method": "stem-splitter-core",
+                            "model": BACKGROUND_MUSIC_MODEL,
+                            "stems": ["drums", "bass", "other"],
+                            "volume": options.background_music_volume,
+                        }),
+                        &now,
+                    )?;
+                } else {
+                    delete_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_BACKGROUND_MUSIC,
+                    )?;
+                }
+                update_dubbing_task_state(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_MEDIA_SEPARATION,
+                    DUBBING_STATUS_PREPROCESSED,
                     100,
-                    "字幕预处理完成",
+                    "音视频分离完成",
+                    "",
+                    Some(&warnings),
+                    &now,
+                )?;
+                upsert_dubbing_stage(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_MEDIA_SEPARATION,
+                    100,
+                    "音视频分离完成",
                     "done",
                     json!({
-                        "segmentCount": preprocess_result.segments.len(),
-                        "outputPath": path_to_string(&preprocess_result.output_path),
-                        "warnings": &preprocess_result.warnings,
+                        "mutedVideoPath": path_to_string(&media_result.muted_video_path),
+                        "sourceAudioPath": path_to_string(&media_result.source_audio_path),
+                        "backgroundMusicPath": media_result.background_music_path.as_ref().map(|path| path_to_string(path)),
+                        "backgroundMusic": options.is_background_music_enabled,
+                        "warnings": &media_result.warnings,
                     }),
                     &now,
                 )?;
@@ -678,11 +930,11 @@ pub fn start_dubbing_task(
             })?;
             emit_dubbing_progress(&app, &snapshot);
             log_session.info(
-                "subtitle_preprocess_completed",
-                "字幕预处理完成",
+                "media_separation_completed",
+                "音视频分离完成",
                 json!({
                     "taskId": &request.task_id,
-                    "segmentCount": snapshot.segments.len(),
+                    "backgroundMusic": options.is_background_music_enabled,
                 }),
             );
             Ok(snapshot)
@@ -693,10 +945,10 @@ pub fn start_dubbing_task(
                 update_dubbing_task_state(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    DUBBING_STAGE_MEDIA_SEPARATION,
                     DUBBING_STATUS_FAILED,
                     0,
-                    "字幕预处理失败",
+                    "音视频分离失败",
                     &error,
                     None,
                     &now,
@@ -704,9 +956,9 @@ pub fn start_dubbing_task(
                 upsert_dubbing_stage(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_SUBTITLE_PREPROCESS,
+                    DUBBING_STAGE_MEDIA_SEPARATION,
                     0,
-                    "字幕预处理失败",
+                    "音视频分离失败",
                     "failed",
                     json!({ "error": &error }),
                     &now,
@@ -715,8 +967,8 @@ pub fn start_dubbing_task(
             })?;
             emit_dubbing_progress(&app, &failed_snapshot);
             log_session.error(
-                "subtitle_preprocess_failed",
-                "字幕预处理失败",
+                "media_separation_failed",
+                "音视频分离失败",
                 json!({
                     "taskId": &request.task_id,
                     "error": &error,
@@ -1209,6 +1461,7 @@ fn set_dubbing_stage(
     match stage_key {
         DUBBING_STAGE_MATERIAL => stages.material = Some(stage),
         DUBBING_STAGE_SUBTITLE_PREPROCESS => stages.subtitle_preprocess = Some(stage),
+        DUBBING_STAGE_MEDIA_SEPARATION => stages.media_separation = Some(stage),
         DUBBING_STAGE_TTS_SYNTHESIS => stages.tts_synthesis = Some(stage),
         DUBBING_STAGE_AUDIO_MERGE => stages.audio_merge = Some(stage),
         DUBBING_STAGE_VIDEO_COMPOSE => stages.video_compose = Some(stage),
@@ -1338,6 +1591,21 @@ fn upsert_dubbing_artifact(
     Ok(())
 }
 
+fn delete_dubbing_artifact(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    kind: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM dubbing_task_artifacts WHERE task_id = ?1 AND kind = ?2",
+            params![task_id, kind],
+        )
+        .map_err(|error| format!("无法删除配音中间文件记录: {error}"))?;
+
+    Ok(())
+}
+
 fn save_dubbing_task_options(
     store: &SettingsStore,
     task_id: &str,
@@ -1365,19 +1633,6 @@ fn save_dubbing_task_options(
     })
 }
 
-fn read_completed_subtitle_preprocess_snapshot(
-    store: &SettingsStore,
-    task_id: &str,
-) -> Result<Option<DubbingTaskSnapshot>, String> {
-    let snapshot = store
-        .with_connection(|connection| read_dubbing_task_snapshot_by_id(connection, task_id))?;
-    if is_subtitle_preprocess_done(&snapshot) {
-        Ok(Some(snapshot))
-    } else {
-        Ok(None)
-    }
-}
-
 fn is_subtitle_preprocess_done(snapshot: &DubbingTaskSnapshot) -> bool {
     let stage_done = snapshot
         .stages
@@ -1390,6 +1645,38 @@ fn is_subtitle_preprocess_done(snapshot: &DubbingTaskSnapshot) -> bool {
     });
 
     stage_done && artifact_exists
+}
+
+fn is_media_separation_done(snapshot: &DubbingTaskSnapshot, options: &DubbingTaskOptions) -> bool {
+    let stage_done = snapshot
+        .stages
+        .media_separation
+        .as_ref()
+        .is_some_and(|stage| stage.status == "done");
+    let required_artifacts = [DUBBING_ARTIFACT_MUTED_VIDEO, DUBBING_ARTIFACT_SOURCE_AUDIO]
+        .into_iter()
+        .all(|kind| dubbing_artifact_file_exists(snapshot, kind));
+    let background_ready =
+        !options.is_background_music_enabled || background_music_artifact_file_exists(snapshot);
+
+    stage_done && required_artifacts && background_ready
+}
+
+fn background_music_artifact_file_exists(snapshot: &DubbingTaskSnapshot) -> bool {
+    snapshot.artifacts.iter().any(|artifact| {
+        artifact.kind == DUBBING_ARTIFACT_BACKGROUND_MUSIC
+            && Path::new(&artifact.path).is_file()
+            && artifact.metadata.get("method").and_then(Value::as_str) == Some("stem-splitter-core")
+            && artifact.metadata.get("model").and_then(Value::as_str)
+                == Some(BACKGROUND_MUSIC_MODEL)
+    })
+}
+
+fn dubbing_artifact_file_exists(snapshot: &DubbingTaskSnapshot, kind: &str) -> bool {
+    snapshot
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == kind && Path::new(&artifact.path).is_file())
 }
 
 fn update_dubbing_task_state(
@@ -1481,6 +1768,341 @@ fn run_subtitle_preprocess(
         output_path,
         warnings: deduplicate_warnings(input.warnings),
     })
+}
+
+fn run_media_separation<F>(
+    snapshot: &DubbingTaskSnapshot,
+    options: &DubbingTaskOptions,
+    progress: &mut F,
+) -> Result<DubbingMediaSeparationResult, String>
+where
+    F: FnMut(u8, &str) -> Result<(), String>,
+{
+    let source_video = source_video_path(snapshot)?;
+    let output_dir = PathBuf::from(&snapshot.work_dir).join("media_separation");
+    fs::create_dir_all(&output_dir).map_err(|error| format!("无法创建音视频分离目录: {error}"))?;
+
+    let video_extension = path_extension(&source_video).unwrap_or_else(|| "mp4".to_string());
+    let muted_video_path = output_dir.join(format!("video_no_audio.{video_extension}"));
+    let source_audio_path = output_dir.join("source_audio.wav");
+
+    progress(20, "分离无声视频")?;
+    export_video_without_audio(&source_video, &muted_video_path)?;
+
+    progress(55, "提取源音频")?;
+    extract_source_audio(&source_video, &source_audio_path)?;
+
+    let warnings = Vec::new();
+    let background_music_path = if options.is_background_music_enabled {
+        progress(80, "分离背景音乐")?;
+        let background_music_path = output_dir.join("background_music.wav");
+        separate_background_music(&source_audio_path, &output_dir, &background_music_path)?;
+        Some(background_music_path)
+    } else {
+        progress(90, "跳过背景音乐分离")?;
+        None
+    };
+
+    Ok(DubbingMediaSeparationResult {
+        muted_video_path,
+        source_audio_path,
+        background_music_path,
+        warnings: deduplicate_warnings(warnings),
+    })
+}
+
+fn source_video_path(snapshot: &DubbingTaskSnapshot) -> Result<PathBuf, String> {
+    let source_video = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_SOURCE_VIDEO)
+        .map(|artifact| PathBuf::from(&artifact.path))
+        .unwrap_or_else(|| PathBuf::from(&snapshot.video_path));
+
+    if source_video.is_file() {
+        Ok(source_video)
+    } else {
+        Err("视频素材缓存不存在".to_string())
+    }
+}
+
+fn export_video_without_audio(input_path: &Path, output_path: &Path) -> Result<(), String> {
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-map")
+            .arg("0:v:0")
+            .arg("-c:v")
+            .arg("copy")
+            .arg("-an")
+            .arg("-sn")
+            .arg("-y")
+            .arg(output_path),
+        "无声视频分离失败",
+    )
+}
+
+fn extract_source_audio(input_path: &Path, output_path: &Path) -> Result<(), String> {
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-vn")
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-y")
+            .arg(output_path),
+        "源音频提取失败",
+    )
+}
+
+fn separate_background_music(
+    source_audio_path: &Path,
+    output_dir: &Path,
+    output_path: &Path,
+) -> Result<(), String> {
+    let stem_output_dir = output_dir.join("stems");
+    fs::create_dir_all(&stem_output_dir)
+        .map_err(|error| format!("无法创建背景音乐分离目录: {error}"))?;
+
+    let stem_paths = split_background_music_stems(source_audio_path, &stem_output_dir)?;
+    mix_background_music_stems(&stem_paths, output_path)?;
+    ensure_non_empty_file(output_path, "背景音乐分离结果为空")
+}
+
+fn split_background_music_stems(
+    source_audio_path: &Path,
+    output_dir: &Path,
+) -> Result<StemSplitPaths, String> {
+    ensure_background_music_model_cached_from_mirror()?;
+
+    let result = split_file(
+        &path_to_string(source_audio_path),
+        SplitOptions {
+            output_dir: path_to_string(output_dir),
+            model_name: BACKGROUND_MUSIC_MODEL.to_string(),
+            manifest_url_override: Some(BACKGROUND_MUSIC_MODEL_MANIFEST_URL.to_string()),
+        },
+    )
+    .map_err(|error| format!("背景音乐分离失败: {error}"))?;
+
+    let stem_paths = StemSplitPaths {
+        drums_path: PathBuf::from(result.drums_path),
+        bass_path: PathBuf::from(result.bass_path),
+        other_path: PathBuf::from(result.other_path),
+    };
+
+    ensure_non_empty_file(&stem_paths.drums_path, "鼓组分离结果为空")?;
+    ensure_non_empty_file(&stem_paths.bass_path, "贝斯分离结果为空")?;
+    ensure_non_empty_file(&stem_paths.other_path, "其他伴奏分离结果为空")?;
+
+    Ok(stem_paths)
+}
+
+fn ensure_background_music_model_cached_from_mirror() -> Result<(), String> {
+    let cache_root = background_music_model_cache_root()?;
+    set_stem_splitter_cache_dir(&cache_root);
+    let model_path = background_music_model_cache_path(&cache_root)?;
+
+    if background_music_model_cache_is_valid(&model_path)? {
+        return Ok(());
+    }
+
+    if model_path.exists() {
+        fs::remove_file(&model_path)
+            .map_err(|error| format!("无法更新背景音乐分离模型缓存: {error}"))?;
+    }
+
+    download_background_music_model_from_mirror(&model_path)?;
+    if background_music_model_cache_is_valid(&model_path)? {
+        Ok(())
+    } else {
+        Err("背景音乐分离模型校验失败，请重试下载".to_string())
+    }
+}
+
+fn background_music_model_cache_root() -> Result<PathBuf, String> {
+    app_paths::stem_splitter_cache_dir()
+}
+
+fn set_stem_splitter_cache_dir(cache_root: &Path) {
+    env::set_var(STEM_SPLITTER_CACHE_DIR_ENV, cache_root);
+}
+
+fn background_music_model_cache_path(cache_root: &Path) -> Result<PathBuf, String> {
+    let cache_dir = cache_root.join("models");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("无法创建背景音乐分离模型缓存目录: {error}"))?;
+
+    Ok(cache_dir.join(BACKGROUND_MUSIC_MODEL_CACHE_FILE))
+}
+
+fn background_music_model_cache_is_valid(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("无法读取背景音乐分离模型缓存: {error}"))?;
+    if metadata.len() != BACKGROUND_MUSIC_MODEL_SIZE_BYTES {
+        return Ok(false);
+    }
+
+    Ok(file_sha256_hex(path)? == BACKGROUND_MUSIC_MODEL_SHA256)
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("无法读取背景音乐分离模型缓存: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("无法校验背景音乐分离模型缓存: {error}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn download_background_music_model_from_mirror(output_path: &Path) -> Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建背景音乐分离模型缓存目录: {error}"))?;
+    }
+
+    let temp_path = output_path.with_extension("part");
+    if temp_path.exists() {
+        fs::remove_file(&temp_path)
+            .map_err(|error| format!("无法清理背景音乐分离模型临时文件: {error}"))?;
+    }
+
+    let result = (|| {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(60 * 60))
+            .build()
+            .map_err(|error| format!("无法创建背景音乐分离模型下载客户端: {error}"))?;
+        let mut response = client
+            .get(BACKGROUND_MUSIC_MODEL_ARTIFACT_URL)
+            .send()
+            .map_err(|error| format!("无法下载背景音乐分离模型: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("背景音乐分离模型下载失败: {error}"))?;
+        let mut file = fs::File::create(&temp_path)
+            .map_err(|error| format!("无法写入背景音乐分离模型缓存: {error}"))?;
+        let mut downloaded = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+
+        loop {
+            let bytes_read = response
+                .read(&mut buffer)
+                .map_err(|error| format!("无法读取背景音乐分离模型下载数据: {error}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..bytes_read])
+                .map_err(|error| format!("无法保存背景音乐分离模型缓存: {error}"))?;
+            downloaded += bytes_read as u64;
+        }
+        file.flush()
+            .map_err(|error| format!("无法保存背景音乐分离模型缓存: {error}"))?;
+
+        if downloaded != BACKGROUND_MUSIC_MODEL_SIZE_BYTES {
+            return Err(format!(
+                "背景音乐分离模型下载不完整，期望 {} 字节，实际 {} 字节",
+                BACKGROUND_MUSIC_MODEL_SIZE_BYTES, downloaded
+            ));
+        }
+
+        fs::rename(&temp_path, output_path)
+            .map_err(|error| format!("无法更新背景音乐分离模型缓存: {error}"))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    result
+}
+
+fn mix_background_music_stems(
+    stem_paths: &StemSplitPaths,
+    output_path: &Path,
+) -> Result<(), String> {
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(&stem_paths.drums_path)
+            .arg("-i")
+            .arg(&stem_paths.bass_path)
+            .arg("-i")
+            .arg(&stem_paths.other_path)
+            .arg("-filter_complex")
+            .arg("[0:a][1:a][2:a]amix=inputs=3:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[aout]")
+            .arg("-map")
+            .arg("[aout]")
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-y")
+            .arg(output_path),
+        "背景音乐混合失败",
+    )
+}
+
+fn ensure_non_empty_file(path: &Path, message: &str) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("{message}: {error}"))?;
+    if metadata.len() == 0 {
+        Err(message.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn run_ffmpeg_command(command: &mut Command, failure_message: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("{failure_message}: 无法启动 ffmpeg: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("{failure_message}: {}", stderr.trim()))
+    }
 }
 
 fn read_preprocessed_segments(artifacts: &[DubbingTaskArtifact]) -> Vec<TranscriptionSegment> {
