@@ -31,7 +31,152 @@
         class="translate-panel"
         role="tabpanel"
         :aria-labelledby="`${DubbingTab.Workflow}-tab`"
-      />
+      >
+        <div class="translate-grid">
+          <section class="settings-section" aria-labelledby="dubbing-source-title">
+            <div id="dubbing-source-title" class="section-heading">
+              <Video aria-hidden="true" />
+              <span>素材输入</span>
+            </div>
+
+            <div class="settings-panel translate-drop-panel">
+              <div
+                ref="sourceDropZoneRef"
+                class="translate-drop-zone"
+                :class="{ 'drag-active': isSourceDragActive }"
+                @dragenter.prevent="isSourceDragActive = true"
+                @dragover.prevent
+                @dragleave.prevent="clearSourceDragTarget"
+                @drop.prevent="handleSourceBrowserDrop"
+              >
+                <UploadCloud class="translate-drop-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="translate-drop-copy">
+                  <span class="translate-drop-title">选择或拖入视频和字幕素材</span>
+                  <span class="translate-drop-subtitle">支持常见视频格式及常见字幕格式</span>
+                </div>
+                <button class="settings-action" type="button" @click="selectMaterialFiles">选择素材</button>
+              </div>
+
+              <div class="translate-file-strip" aria-label="当前素材">
+                <FileVideo :stroke-width="2.1" aria-hidden="true" />
+                <span>{{ selectedMaterialSummary }}</span>
+              </div>
+
+              <div v-if="sourceInputError" class="translate-alert" role="alert">
+                <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+                <span>{{ sourceInputError }}</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section" aria-labelledby="dubbing-options-title">
+            <div id="dubbing-options-title" class="section-heading">
+              <SlidersHorizontal aria-hidden="true" />
+              <span>配音参数</span>
+            </div>
+
+            <div class="settings-panel">
+              <div class="setting-row">
+                <Timer class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">TTS 间隔</div>
+                  <div class="setting-subtitle">分段语音停顿时长</div>
+                </div>
+                <div class="setting-range-control dubbing-range-control">
+                  <span class="setting-range-value dubbing-range-value">{{ ttsIntervalMs }} 毫秒</span>
+                  <input
+                    v-model.number="ttsIntervalMs"
+                    class="setting-range"
+                    type="range"
+                    min="0"
+                    max="1000"
+                    step="10"
+                    aria-label="TTS 间隔"
+                  />
+                </div>
+              </div>
+
+              <button class="setting-row setting-row-button" type="button" @click="openReferenceAudioDialog">
+                <FileMusic class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">参考音频</span>
+                  <span class="setting-subtitle">选择参考音频来源</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ referenceAudioSourceLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <div class="setting-row">
+                <Music class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">背景音乐</div>
+                  <div class="setting-subtitle">开启后分离源视频伴奏并跟随变速同步混入最终视频</div>
+                </div>
+                <button
+                  class="setting-toggle"
+                  :class="{ active: isBackgroundMusicEnabled }"
+                  type="button"
+                  :aria-pressed="isBackgroundMusicEnabled"
+                  @click="isBackgroundMusicEnabled = !isBackgroundMusicEnabled"
+                >
+                  <span class="setting-toggle-label">{{ isBackgroundMusicEnabled ? '开' : '关' }}</span>
+                  <span class="setting-toggle-track" aria-hidden="true">
+                    <span class="setting-toggle-thumb" />
+                  </span>
+                </button>
+              </div>
+
+              <div class="setting-row">
+                <Volume2 class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">背景音乐音量</div>
+                  <div class="setting-subtitle">背景音乐混入音量</div>
+                </div>
+                <div class="setting-range-control dubbing-range-control">
+                  <span class="setting-range-value dubbing-range-value">{{ backgroundMusicVolume.toFixed(1) }}</span>
+                  <input
+                    v-model.number="backgroundMusicVolume"
+                    class="setting-range"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    aria-label="背景音乐音量"
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section class="settings-section translate-output-section" aria-labelledby="dubbing-output-title">
+          <div id="dubbing-output-title" class="section-heading">
+            <ListVideo aria-hidden="true" />
+            <span>配音结果</span>
+          </div>
+
+          <div class="settings-panel translate-result-panel">
+            <div class="translate-status-bar">
+              <div class="translate-status">
+                <span class="translate-status-dot" aria-hidden="true" />
+                <span>等待素材</span>
+              </div>
+              <div class="translate-actions">
+                <button class="settings-action" type="button" disabled>开始配音</button>
+                <button class="settings-action" type="button" disabled>导出视频</button>
+              </div>
+            </div>
+
+            <div class="translate-preview translate-preview-empty">
+              <MicVocal class="translate-empty-icon" :stroke-width="2.1" aria-hidden="true" />
+              <span class="translate-empty-title">暂无配音内容</span>
+              <span class="translate-empty-subtitle">选择视频和字幕后，配音任务的字幕、音频和合成状态会显示在这里</span>
+            </div>
+          </div>
+        </section>
+      </section>
 
       <section
         v-else
@@ -135,6 +280,37 @@
     </main>
 
     <Teleport to="body">
+      <div
+        v-if="isReferenceAudioDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeReferenceAudioDialog"
+      >
+        <section
+          class="settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reference-audio-dialog-title"
+        >
+          <h2 id="reference-audio-dialog-title" class="dialog-title">参考音频</h2>
+          <div class="dialog-options" role="radiogroup" aria-label="参考音频">
+            <button
+              v-for="option in referenceAudioSourceOptions"
+              :key="option.value"
+              class="dialog-option"
+              :class="{ active: selectedReferenceAudioSource === option.value }"
+              type="button"
+              role="radio"
+              :aria-checked="selectedReferenceAudioSource === option.value"
+              @click="selectReferenceAudioSource(option.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span>{{ option.label }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
+
       <div v-if="isAddModelDialogOpen" class="dialog-backdrop" role="presentation" @click.self="closeAddModelDialog">
         <section
           class="settings-dialog dubbing-dialog"
@@ -295,8 +471,28 @@
 
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
+import type { DragDropEvent } from '@tauri-apps/api/webview'
+import { open } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Boxes, CircleAlert, MicVocal, Plus, Search, Trash2, Volume2, X } from 'lucide-vue-next'
+import {
+  Boxes,
+  ChevronRight,
+  CircleAlert,
+  FileMusic,
+  FileVideo,
+  ListVideo,
+  MicVocal,
+  Music,
+  Plus,
+  Search,
+  SlidersHorizontal,
+  Timer,
+  Trash2,
+  UploadCloud,
+  Video,
+  Volume2,
+  X,
+} from 'lucide-vue-next'
 
 enum DubbingTab {
   Workflow = 'dubbing-workflow',
@@ -307,6 +503,11 @@ enum DubbingEngineKind {
   EdgeTts = 'edge-tts',
   NanoAiTts = 'nano-ai-tts',
   IndexTts2 = 'index-tts-2',
+}
+
+enum ReferenceAudioSource {
+  ExistingDubbing = 'existing-dubbing',
+  CustomAudioFile = 'custom-audio-file',
 }
 
 type DubbingVoiceOption = {
@@ -343,10 +544,25 @@ const dubbingEngineOptions = [
   { value: DubbingEngineKind.IndexTts2, label: 'Index-TTS 2.0' },
 ] as const
 
+const referenceAudioSourceOptions = [
+  { value: ReferenceAudioSource.ExistingDubbing, label: '克隆现有配音' },
+  { value: ReferenceAudioSource.CustomAudioFile, label: '自定义音频文件' },
+] as const
+
 const activeTab = ref<DubbingTab>(DubbingTab.Workflow)
 const dubbingModels = ref<DubbingModel[]>([])
 const voices = ref<DubbingVoiceOption[]>([])
 const selectedEngine = ref<DubbingEngineKind>(DubbingEngineKind.EdgeTts)
+const selectedReferenceAudioSource = ref<ReferenceAudioSource>(ReferenceAudioSource.ExistingDubbing)
+const isReferenceAudioDialogOpen = ref(false)
+const ttsIntervalMs = ref(150)
+const isBackgroundMusicEnabled = ref(true)
+const backgroundMusicVolume = ref(0.5)
+const sourceDropZoneRef = ref<HTMLElement | null>(null)
+const isSourceDragActive = ref(false)
+const selectedMaterialVideoPath = ref('')
+const selectedMaterialSubtitlePath = ref('')
+const sourceInputError = ref('')
 const selectedVoiceKey = ref('')
 const voiceSearch = ref('')
 const indexTts2Endpoint = ref(INDEX_TTS2_DEFAULT_ENDPOINT)
@@ -362,8 +578,11 @@ const previewingKey = ref('')
 const modelPendingDelete = ref<DubbingModel | null>(null)
 let previewAudio: HTMLAudioElement | null = null
 let previewAudioUrl = ''
+let unlistenSourceDragDrop: (() => void) | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
+const dubbingVideoExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v']
+const dubbingSubtitleExtensions = ['srt', 'vtt', 'ass', 'ssa', 'lrc', 'txt']
 
 const addedVoiceKeys = computed(() => {
   return new Set(
@@ -397,8 +616,132 @@ const canSubmitSelectedVoice = computed(() => {
   return Boolean(selectedVoice.value) && (!isIndexTts2Selected.value || indexTts2Endpoint.value.trim())
 })
 
+const referenceAudioSourceLabel = computed(() => {
+  return referenceAudioSourceOptions.find((option) => option.value === selectedReferenceAudioSource.value)?.label ?? ''
+})
+
+const selectedMaterialSummary = computed(() => {
+  if (!selectedMaterialVideoPath.value && !selectedMaterialSubtitlePath.value) {
+    return '未选择素材'
+  }
+
+  const videoLabel = selectedMaterialVideoPath.value
+    ? `视频：${fileNameFromPath(selectedMaterialVideoPath.value)}`
+    : '未选择视频'
+  const subtitleLabel = selectedMaterialSubtitlePath.value
+    ? `字幕：${fileNameFromPath(selectedMaterialSubtitlePath.value)}`
+    : '未选择字幕'
+
+  return `${videoLabel} · ${subtitleLabel}`
+})
+
 const selectTab = (tab: DubbingTab) => {
   activeTab.value = tab
+}
+
+const selectMaterialFiles = async () => {
+  if (!isTauriRuntime()) {
+    sourceInputError.value = '请在桌面应用中选择素材'
+    return
+  }
+
+  try {
+    const selected = await open({
+      title: '选择视频和字幕素材',
+      multiple: true,
+      filters: [
+        {
+          name: '视频和字幕素材',
+          extensions: [...dubbingVideoExtensions, ...dubbingSubtitleExtensions],
+        },
+        {
+          name: '视频文件',
+          extensions: dubbingVideoExtensions,
+        },
+        {
+          name: '字幕文件',
+          extensions: dubbingSubtitleExtensions,
+        },
+      ],
+    })
+
+    if (!selected) {
+      return
+    }
+
+    applyMaterialFiles(Array.isArray(selected) ? selected : [selected])
+  } catch (error) {
+    sourceInputError.value = stringifyError(error, '选择素材失败')
+  }
+}
+
+const applyMaterialFiles = (paths: string[]) => {
+  const unsupportedPaths: string[] = []
+  let hasAcceptedFile = false
+
+  paths.forEach((path) => {
+    if (applyMaterialFile(path)) {
+      hasAcceptedFile = true
+      return
+    }
+
+    unsupportedPaths.push(path)
+  })
+
+  if (hasAcceptedFile) {
+    sourceInputError.value = ''
+  }
+
+  if (unsupportedPaths.length > 0) {
+    sourceInputError.value = `不支持的素材：${fileNameFromPath(unsupportedPaths[0])}`
+  }
+}
+
+const applyMaterialFile = (path: string) => {
+  const extension = fileExtension(path)
+
+  if (dubbingVideoExtensions.includes(extension)) {
+    selectedMaterialVideoPath.value = path
+    return true
+  }
+
+  if (dubbingSubtitleExtensions.includes(extension)) {
+    selectedMaterialSubtitlePath.value = path
+    return true
+  }
+
+  return false
+}
+
+const handleSourceBrowserDrop = (event: DragEvent) => {
+  isSourceDragActive.value = false
+
+  const paths = Array.from(event.dataTransfer?.files ?? [])
+    .map((file) => (file as File & { path?: string }).path)
+    .filter((path): path is string => Boolean(path))
+
+  if (paths.length === 0) {
+    return
+  }
+
+  applyMaterialFiles(paths)
+}
+
+const clearSourceDragTarget = () => {
+  isSourceDragActive.value = false
+}
+
+const openReferenceAudioDialog = () => {
+  isReferenceAudioDialogOpen.value = true
+}
+
+const closeReferenceAudioDialog = () => {
+  isReferenceAudioDialogOpen.value = false
+}
+
+const selectReferenceAudioSource = (source: ReferenceAudioSource) => {
+  selectedReferenceAudioSource.value = source
+  closeReferenceAudioDialog()
 }
 
 const selectEngine = (engine: DubbingEngineKind) => {
@@ -709,8 +1052,87 @@ const setPreviewError = (message: string) => {
   modelsError.value = message
 }
 
+const registerSourceDragDropListener = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  const [{ getCurrentWebview }, { getCurrentWindow }] = await Promise.all([
+    import('@tauri-apps/api/webview'),
+    import('@tauri-apps/api/window'),
+  ])
+  const webview = getCurrentWebview()
+  const currentWindow = getCurrentWindow()
+
+  unlistenSourceDragDrop = await webview.onDragDropEvent(async (event) => {
+    const payload = event.payload
+
+    if (payload.type === 'leave') {
+      isSourceDragActive.value = false
+      return
+    }
+
+    if (payload.type === 'over') {
+      isSourceDragActive.value = isSourceDropEvent(payload, await currentWindow.scaleFactor())
+      return
+    }
+
+    if (payload.type !== 'enter' && payload.type !== 'drop') {
+      return
+    }
+
+    const isInsideDropZone = isSourceDropEvent(payload, await currentWindow.scaleFactor())
+    isSourceDragActive.value = isInsideDropZone
+
+    if (payload.type !== 'drop') {
+      return
+    }
+
+    isSourceDragActive.value = false
+
+    if (isInsideDropZone) {
+      applyMaterialFiles(payload.paths)
+    }
+  })
+}
+
+const isSourceDropEvent = (
+  payload: Extract<DragDropEvent, { type: 'enter' | 'over' | 'drop' }>,
+  scaleFactor: number,
+) => {
+  const logicalPosition = payload.position.toLogical(scaleFactor)
+  return isPointInsideElement(
+    {
+      x: logicalPosition.x,
+      y: logicalPosition.y,
+    },
+    sourceDropZoneRef.value,
+  )
+}
+
+const isPointInsideElement = (point: { x: number; y: number }, element: HTMLElement | null) => {
+  if (!element) {
+    return false
+  }
+
+  const rect = element.getBoundingClientRect()
+  return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom
+}
+
+const fileNameFromPath = (path: string) => {
+  const normalizedPath = path.replace(/\\/g, '/')
+  return normalizedPath.split('/').filter(Boolean).pop() ?? path
+}
+
+const fileExtension = (path: string) => {
+  const fileName = fileNameFromPath(path)
+  const extension = fileName.split('.').pop()
+  return extension ? extension.toLowerCase() : ''
+}
+
 const handleKeydown = (event: KeyboardEvent) => {
   if (event.key === 'Escape') {
+    closeReferenceAudioDialog()
     closeAddModelDialog()
     closeDeleteConfirmDialog()
   }
@@ -730,11 +1152,13 @@ const stringifyError = (error: unknown, fallback: string) => {
 
 onMounted(() => {
   void loadModels()
+  void registerSourceDragDropListener()
   window.addEventListener('keydown', handleKeydown)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+  unlistenSourceDragDrop?.()
   stopPreviewAudio()
 })
 </script>

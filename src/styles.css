@@ -1217,6 +1217,16 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
   color: var(--text-subtle);
 }
 
+.dubbing-range-control {
+  width: min(360px, 38vw);
+  grid-template-columns: 72px minmax(150px, 1fr);
+}
+
+.dubbing-range-value {
+  min-width: 72px;
+  white-space: nowrap;
+}
+
 .dubbing-section-header {
   display: flex;
   align-items: center;
