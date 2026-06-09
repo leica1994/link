@@ -5,10 +5,9 @@
       <Sidebar />
       <main class="app-content">
         <RouterView v-slot="{ Component, route }">
-          <KeepAlive>
-            <component :is="Component" v-if="route.meta.keepAlive" />
+          <KeepAlive :include="keepAliveComponentNames">
+            <component :is="Component" :key="route.name || route.path" />
           </KeepAlive>
-          <component :is="Component" v-if="!route.meta.keepAlive" />
         </RouterView>
       </main>
     </div>
@@ -19,4 +18,6 @@
 import TitleBar from './components/TitleBar.vue'
 import Sidebar from './components/Sidebar.vue'
 import { RouterView } from 'vue-router'
+
+const keepAliveComponentNames = ['Translate', 'Dubbing']
 </script>

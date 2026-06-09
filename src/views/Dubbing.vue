@@ -558,6 +558,8 @@ import {
   X,
 } from 'lucide-vue-next'
 
+defineOptions({ name: 'Dubbing' })
+
 enum DubbingTab {
   Workflow = 'dubbing-workflow',
   Models = 'dubbing-models',

@@ -505,6 +505,8 @@ import {
   videoContentTypeOptions,
 } from '../settingsModel'
 
+defineOptions({ name: 'Translate' })
+
 enum TranslateTab {
   Transcription = 'transcription',
   TranslationOptimization = 'translation-optimization',

@@ -8,8 +8,8 @@ export default createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: '/', component: Home },
-    { path: '/translate', component: Translate, meta: { keepAlive: true } },
-    { path: '/dubbing', component: Dubbing, meta: { keepAlive: true } },
+    { path: '/translate', name: 'Translate', component: Translate, meta: { keepAlive: true } },
+    { path: '/dubbing', name: 'Dubbing', component: Dubbing, meta: { keepAlive: true } },
     { path: '/settings', component: Settings },
   ],
 })
