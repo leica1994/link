@@ -1261,6 +1261,10 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
   opacity: 0.68;
 }
 
+.dubbing-model-card.index-model .dubbing-model-actions {
+  margin-top: auto;
+}
+
 .dubbing-model-card-header {
   display: flex;
   align-items: center;
@@ -1431,6 +1435,16 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
 
 .dubbing-search-field {
   margin-top: 0;
+}
+
+.dubbing-endpoint-field {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dubbing-endpoint-input {
+  width: 100%;
 }
 
 .dubbing-voice-options {

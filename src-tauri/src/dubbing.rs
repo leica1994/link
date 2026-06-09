@@ -1,12 +1,16 @@
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{FixedOffset, Utc};
+use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
@@ -25,6 +29,11 @@ const NANO_AI_TTS_ENGINE: &str = "nano-ai-tts";
 const NANO_AI_TTS_ENGINE_LABEL: &str = "纳米AI TTS";
 const NANO_AI_TTS_BASE_URL: &str = "https://bot.n.cn";
 const NANO_AI_TTS_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36";
+const INDEX_TTS2_ENGINE: &str = "index-tts-2";
+const INDEX_TTS2_ENGINE_LABEL: &str = "Index-TTS 2.0";
+const INDEX_TTS2_ENDPOINT: &str = "http://127.0.0.1:7860";
+const INDEX_TTS2_API_NAME: &str = "gen_single";
+const INDEX_TTS2_SAMPLE_AUDIO: &[u8] = include_bytes!("../assets/audio_sample.mp3");
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +74,7 @@ pub struct ListDubbingVoicesRequest {
 pub struct AddDubbingModelRequest {
     pub engine: String,
     pub model_key: String,
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +96,7 @@ pub struct PreviewDubbingVoiceRequest {
     pub engine: String,
     pub model_key: String,
     pub locale: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,11 +107,24 @@ pub struct PreviewDubbingVoiceResult {
 
 trait DubbingEngine {
     fn list_voices(&self) -> Result<Vec<DubbingVoiceOption>, String>;
-    fn synthesize_preview(&self, model_key: &str, locale: Option<&str>) -> Result<Vec<u8>, String>;
+    fn synthesize_preview(
+        &self,
+        model_key: &str,
+        locale: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<Vec<u8>, String>;
 }
 
 struct EdgeTtsEngine;
 struct NanoAiTtsEngine;
+struct IndexTts2Engine;
+
+struct IndexTts2Template {
+    model_key: &'static str,
+    display_name: &'static str,
+    locale: &'static str,
+    emo_control_method: &'static str,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -134,6 +158,54 @@ struct NanoAiRobot {
     icon: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GradioConfig {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    api_prefix: String,
+    #[serde(default)]
+    components: Vec<GradioComponent>,
+    #[serde(default)]
+    dependencies: Vec<GradioDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GradioDependency {
+    #[serde(default)]
+    id: Option<usize>,
+    #[serde(default)]
+    api_name: Value,
+    #[serde(default)]
+    inputs: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GradioComponent {
+    id: usize,
+    #[serde(rename = "type")]
+    component_type: String,
+    #[serde(default)]
+    props: GradioComponentProps,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GradioComponentProps {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    key: Value,
+    #[serde(default)]
+    value: Value,
+    #[serde(default)]
+    choices: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct GradioQueueJoinResponse {
+    event_id: String,
+}
+
 #[tauri::command]
 pub fn list_dubbing_models(
     store: tauri::State<'_, SettingsStore>,
@@ -153,11 +225,12 @@ pub fn add_dubbing_model(
     store: tauri::State<'_, SettingsStore>,
     request: AddDubbingModelRequest,
 ) -> Result<DubbingModel, String> {
-    let voice = engine_for(&request.engine)?
+    let mut voice = engine_for(&request.engine)?
         .list_voices()?
         .into_iter()
         .find(|voice| voice.model_key == request.model_key)
         .ok_or_else(|| "未找到该语音".to_string())?;
+    apply_dubbing_model_options(&mut voice, request.endpoint.as_deref())?;
 
     insert_dubbing_model(&store, voice)
 }
@@ -214,10 +287,14 @@ pub fn delete_dubbing_model(
 pub fn preview_dubbing_voice(
     request: PreviewDubbingVoiceRequest,
 ) -> Result<PreviewDubbingVoiceResult, String> {
-    let audio = engine_for(&request.engine)?
-        .synthesize_preview(&request.model_key, request.locale.as_deref())?;
+    let audio = engine_for(&request.engine)?.synthesize_preview(
+        &request.model_key,
+        request.locale.as_deref(),
+        request.endpoint.as_deref(),
+    )?;
+    let mime_type = audio_mime_type(&audio);
     let audio_data_url = format!(
-        "data:audio/mpeg;base64,{}",
+        "data:{mime_type};base64,{}",
         general_purpose::STANDARD.encode(audio)
     );
 
@@ -228,6 +305,7 @@ fn engine_for(engine: &str) -> Result<Box<dyn DubbingEngine>, String> {
     match engine {
         EDGE_TTS_ENGINE => Ok(Box::new(EdgeTtsEngine)),
         NANO_AI_TTS_ENGINE => Ok(Box::new(NanoAiTtsEngine)),
+        INDEX_TTS2_ENGINE => Ok(Box::new(IndexTts2Engine)),
         _ => Err("不支持的配音引擎".to_string()),
     }
 }
@@ -255,6 +333,43 @@ fn read_dubbing_models(store: &SettingsStore) -> Result<Vec<DubbingModel>, Strin
 
         Ok(models)
     })
+}
+
+fn audio_mime_type(audio: &[u8]) -> &'static str {
+    if audio.starts_with(b"RIFF") && audio.get(8..12) == Some(b"WAVE") {
+        return "audio/wav";
+    }
+
+    if audio.starts_with(b"ID3")
+        || audio
+            .first()
+            .zip(audio.get(1))
+            .is_some_and(|(first, second)| *first == 0xFF && (*second & 0xE0) == 0xE0)
+    {
+        return "audio/mpeg";
+    }
+
+    if audio.starts_with(b"OggS") {
+        return "audio/ogg";
+    }
+
+    if audio.starts_with(b"fLaC") {
+        return "audio/flac";
+    }
+
+    "application/octet-stream"
+}
+
+fn apply_dubbing_model_options(
+    voice: &mut DubbingVoiceOption,
+    endpoint: Option<&str>,
+) -> Result<(), String> {
+    if voice.engine == INDEX_TTS2_ENGINE {
+        let endpoint = normalize_index_tts2_endpoint(endpoint)?;
+        voice.metadata = index_tts2_metadata(&endpoint);
+    }
+
+    Ok(())
 }
 
 fn read_dubbing_model_by_id(
@@ -351,6 +466,7 @@ fn engine_label(engine: &str) -> &'static str {
     match engine {
         EDGE_TTS_ENGINE => EDGE_TTS_ENGINE_LABEL,
         NANO_AI_TTS_ENGINE => NANO_AI_TTS_ENGINE_LABEL,
+        INDEX_TTS2_ENGINE => INDEX_TTS2_ENGINE_LABEL,
         _ => "未知引擎",
     }
 }
@@ -390,7 +506,12 @@ impl DubbingEngine for EdgeTtsEngine {
             .collect())
     }
 
-    fn synthesize_preview(&self, model_key: &str, locale: Option<&str>) -> Result<Vec<u8>, String> {
+    fn synthesize_preview(
+        &self,
+        model_key: &str,
+        locale: Option<&str>,
+        _endpoint: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         synthesize_edge_tts_audio(model_key, preview_text_for_voice(model_key, locale))
     }
 }
@@ -444,11 +565,755 @@ impl DubbingEngine for NanoAiTtsEngine {
         Ok(voices)
     }
 
-    fn synthesize_preview(&self, model_key: &str, locale: Option<&str>) -> Result<Vec<u8>, String> {
+    fn synthesize_preview(
+        &self,
+        model_key: &str,
+        locale: Option<&str>,
+        _endpoint: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         let preview_locale = locale
             .filter(|value| !value.trim().is_empty())
             .or(Some("zh-CN"));
         synthesize_nano_ai_tts_audio(model_key, preview_text_for_voice(model_key, preview_locale))
+    }
+}
+
+impl DubbingEngine for IndexTts2Engine {
+    fn list_voices(&self) -> Result<Vec<DubbingVoiceOption>, String> {
+        Ok(index_tts2_templates()
+            .iter()
+            .map(|template| DubbingVoiceOption {
+                engine: INDEX_TTS2_ENGINE.to_string(),
+                engine_label: INDEX_TTS2_ENGINE_LABEL.to_string(),
+                model_key: template.model_key.to_string(),
+                display_name: template.display_name.to_string(),
+                locale: template.locale.to_string(),
+                gender: String::new(),
+                metadata: index_tts2_metadata(INDEX_TTS2_ENDPOINT),
+            })
+            .collect())
+    }
+
+    fn synthesize_preview(
+        &self,
+        model_key: &str,
+        locale: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let template = index_tts2_template(model_key)?;
+        let endpoint = normalize_index_tts2_endpoint(endpoint)?;
+        synthesize_index_tts2_audio(
+            template,
+            preview_text_for_voice(model_key, locale.or(Some(template.locale))),
+            &endpoint,
+        )
+    }
+}
+
+fn index_tts2_templates() -> &'static [IndexTts2Template] {
+    &[
+        IndexTts2Template {
+            model_key: "index-tts-2.0-zh",
+            display_name: "Index-TTS 2.0 中文版",
+            locale: "zh-CN",
+            emo_control_method: "与音色参考音频相同",
+        },
+        IndexTts2Template {
+            model_key: "index-tts-2.0-en",
+            display_name: "Index-TTS 2.0 英文版",
+            locale: "en-US",
+            emo_control_method: "Same as the voice reference",
+        },
+    ]
+}
+
+fn index_tts2_template(model_key: &str) -> Result<&'static IndexTts2Template, String> {
+    index_tts2_templates()
+        .iter()
+        .find(|template| template.model_key == model_key)
+        .ok_or_else(|| "未找到该 Index-TTS 2.0 模型".to_string())
+}
+
+fn index_tts2_metadata(endpoint: &str) -> Value {
+    json!({
+        "endpoint": endpoint,
+        "apiName": format!("/{INDEX_TTS2_API_NAME}"),
+    })
+}
+
+fn normalize_index_tts2_endpoint(endpoint: Option<&str>) -> Result<String, String> {
+    let value = endpoint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(INDEX_TTS2_ENDPOINT);
+    let value = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let mut url = reqwest::Url::parse(&value)
+        .map_err(|error| format!("Index-TTS 2.0 服务地址无效: {error}"))?;
+
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Index-TTS 2.0 服务地址必须是 HTTP/HTTPS 地址".to_string());
+    }
+
+    url.set_query(None);
+    url.set_fragment(None);
+
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn synthesize_index_tts2_audio(
+    template: &IndexTts2Template,
+    text: &str,
+    endpoint: &str,
+) -> Result<Vec<u8>, String> {
+    let client = index_tts2_client()?;
+    let gradio = load_gradio_config(&client, endpoint)?;
+    let uploaded_audio = upload_index_tts2_reference_audio(&client, &gradio.upload_url)?;
+    let session_hash = connect_id();
+    let output = submit_index_tts2_job(
+        &client,
+        &gradio,
+        &session_hash,
+        index_tts2_payload(template, text, uploaded_audio, &gradio.inputs),
+    )?;
+    let audio = download_gradio_audio(&client, &gradio, &output)?;
+
+    if audio.is_empty() {
+        return Err("Index-TTS 2.0 未返回试听音频".to_string());
+    }
+
+    Ok(audio.to_vec())
+}
+
+struct GradioRuntimeConfig {
+    fn_index: usize,
+    base_url: String,
+    src_prefixed: String,
+    sse_url: String,
+    sse_data_url: String,
+    upload_url: String,
+    inputs: Vec<GradioInputComponent>,
+}
+
+struct GradioInputComponent {
+    component_type: String,
+    label: String,
+    key: String,
+    default_value: Value,
+    choices: Value,
+}
+
+fn index_tts2_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("无法创建 Index-TTS 2.0 客户端: {error}"))
+}
+
+fn load_gradio_config(client: &Client, endpoint: &str) -> Result<GradioRuntimeConfig, String> {
+    let base_url = trailing_slash(endpoint);
+    let config = client
+        .get(format!("{base_url}config"))
+        .send()
+        .map_err(|error| format!("无法连接 Index-TTS 2.0 Gradio 服务: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Index-TTS 2.0 Gradio 配置请求失败: {error}"))?
+        .json::<GradioConfig>()
+        .map_err(|error| format!("无法解析 Index-TTS 2.0 Gradio 配置: {error}"))?;
+
+    let protocol = if config.protocol.trim().is_empty() {
+        "sse_v1"
+    } else {
+        config.protocol.trim()
+    };
+    if !protocol.starts_with("sse") {
+        return Err(format!(
+            "暂不支持该 Gradio 协议: {protocol}，请使用支持 SSE 的 Index-TTS 2.0 服务"
+        ));
+    }
+
+    let (dependency_index, dependency) = config
+        .dependencies
+        .iter()
+        .enumerate()
+        .find(|(_, dependency)| gradio_api_name_matches(&dependency.api_name, INDEX_TTS2_API_NAME))
+        .ok_or_else(|| "Index-TTS 2.0 Gradio 服务未暴露 /gen_single 接口".to_string())?;
+    let fn_index = dependency.id.unwrap_or(dependency_index);
+    let dependency_inputs = dependency.inputs.clone();
+    let api_prefix = config.api_prefix.trim().trim_matches('/');
+    let src_prefixed = if api_prefix.is_empty() {
+        base_url.clone()
+    } else {
+        format!("{base_url}{api_prefix}/")
+    };
+    let components = config
+        .components
+        .into_iter()
+        .map(|component| (component.id, component))
+        .collect::<HashMap<_, _>>();
+    let inputs = dependency_inputs
+        .iter()
+        .filter_map(|input_id| components.get(input_id))
+        .map(|component| GradioInputComponent {
+            component_type: component.component_type.clone(),
+            label: component.props.label.clone().unwrap_or_default(),
+            key: component_key_text(&component.props.key),
+            default_value: component.props.value.clone(),
+            choices: component.props.choices.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(GradioRuntimeConfig {
+        fn_index,
+        base_url,
+        sse_url: format!("{src_prefixed}queue/data"),
+        sse_data_url: format!("{src_prefixed}queue/join"),
+        upload_url: format!("{src_prefixed}upload"),
+        src_prefixed,
+        inputs,
+    })
+}
+
+fn upload_index_tts2_reference_audio(client: &Client, upload_url: &str) -> Result<Value, String> {
+    let audio_part = Part::bytes(INDEX_TTS2_SAMPLE_AUDIO.to_vec())
+        .file_name("audio_sample.mp3")
+        .mime_str("audio/mpeg")
+        .map_err(|error| format!("无法准备 Index-TTS 2.0 参考音频: {error}"))?;
+    let uploaded_paths = client
+        .post(upload_url)
+        .multipart(Form::new().part("files", audio_part))
+        .send()
+        .map_err(|error| format!("无法上传 Index-TTS 2.0 参考音频: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Index-TTS 2.0 参考音频上传失败: {error}"))?
+        .json::<Vec<String>>()
+        .map_err(|error| format!("无法解析 Index-TTS 2.0 参考音频上传结果: {error}"))?;
+    let uploaded_path = uploaded_paths
+        .first()
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "Index-TTS 2.0 未返回参考音频上传路径".to_string())?;
+
+    Ok(json!({
+        "path": uploaded_path,
+        "orig_name": "audio_sample.mp3",
+        "meta": { "_type": "gradio.FileData" },
+    }))
+}
+
+fn index_tts2_payload(
+    template: &IndexTts2Template,
+    text: &str,
+    reference_audio: Value,
+    inputs: &[GradioInputComponent],
+) -> Vec<Value> {
+    if inputs.is_empty() {
+        return vec![
+            json!(template.emo_control_method),
+            reference_audio.clone(),
+            json!(text),
+            reference_audio,
+            json!(0.8),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(""),
+            json!(false),
+            json!(120),
+            json!(true),
+            json!(0.8),
+            json!(30),
+            json!(0.8),
+            json!(0),
+            json!(3),
+            json!(10),
+            json!(1500),
+        ];
+    }
+
+    inputs
+        .iter()
+        .map(|input| index_tts2_input_value(template, text, &reference_audio, input))
+        .collect()
+}
+
+fn index_tts2_input_value(
+    template: &IndexTts2Template,
+    text: &str,
+    reference_audio: &Value,
+    input: &GradioInputComponent,
+) -> Value {
+    let identity = format!(
+        "{} {} {}",
+        input.key.to_lowercase(),
+        input.label.to_lowercase(),
+        input.component_type.to_lowercase()
+    );
+    let component_type = input.component_type.to_lowercase();
+
+    if component_type == "audio"
+        || identity_contains_any(
+            &identity,
+            &["prompt_audio", "reference_audio", "emo_ref_path"],
+        )
+    {
+        return reference_audio.clone();
+    }
+
+    if identity_contains_any(
+        &identity,
+        &[
+            "max_text_tokens_per_segment",
+            "max_text_tokens",
+            "分句最大token",
+        ],
+    ) {
+        return json!(120);
+    }
+
+    if identity_contains_any(
+        &identity,
+        &[
+            "input_text_single",
+            "target_text",
+            "input text",
+            "目标文本",
+            "文本",
+        ],
+    ) && !identity_contains_any(&identity, &["情感描述", "emotion text", "emo_text"])
+    {
+        return json!(text);
+    }
+
+    if component_type == "radio"
+        && identity_contains_any(&identity, &["情感控制", "emotion control", "emo_control"])
+    {
+        return json!(index_tts2_emo_control_value(template, input));
+    }
+
+    if identity_contains_any(&identity, &["emo_weight", "情感权重", "emotion weight"]) {
+        return json!(0.8);
+    }
+
+    if identity_contains_any(
+        &identity,
+        &[
+            "vec1", "vec2", "vec3", "vec4", "vec5", "vec6", "vec7", "vec8", "喜", "怒", "哀", "惧",
+            "厌恶", "低落", "惊喜", "平静",
+        ],
+    ) {
+        return json!(0);
+    }
+
+    if identity_contains_any(&identity, &["emo_text", "情感描述", "emotion text"]) {
+        return json!("");
+    }
+
+    if identity_contains_any(&identity, &["emo_random", "情感随机", "emotion random"]) {
+        return json!(false);
+    }
+
+    if identity_contains_any(&identity, &["do_sample"]) {
+        return json!(true);
+    }
+
+    if identity_contains_any(&identity, &["top_p"]) {
+        return json!(0.8);
+    }
+
+    if identity_contains_any(&identity, &["top_k"]) {
+        return json!(30);
+    }
+
+    if identity_contains_any(&identity, &["temperature"]) {
+        return json!(0.8);
+    }
+
+    if identity_contains_any(&identity, &["length_penalty"]) {
+        return json!(0);
+    }
+
+    if identity_contains_any(&identity, &["num_beams"]) {
+        return json!(3);
+    }
+
+    if identity_contains_any(&identity, &["repetition_penalty"]) {
+        return json!(10);
+    }
+
+    if identity_contains_any(&identity, &["max_mel_tokens"]) {
+        return json!(1500);
+    }
+
+    if !input.default_value.is_null() {
+        return input.default_value.clone();
+    }
+
+    match component_type.as_str() {
+        "checkbox" => json!(false),
+        "number" | "slider" => json!(0),
+        "textbox" => json!(""),
+        "radio" | "dropdown" => first_gradio_choice_value(&input.choices)
+            .map(Value::String)
+            .unwrap_or_else(|| json!("")),
+        "audio" | "file" => reference_audio.clone(),
+        _ => Value::Null,
+    }
+}
+
+fn gradio_api_name_matches(value: &Value, expected: &str) -> bool {
+    let expected_without_slash = expected.trim_start_matches('/');
+    let expected_with_slash = format!("/{expected_without_slash}");
+
+    match value {
+        Value::String(value) => value == expected_without_slash || value == &expected_with_slash,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| gradio_api_name_matches(value, expected)),
+        _ => false,
+    }
+}
+
+fn index_tts2_emo_control_value(
+    template: &IndexTts2Template,
+    input: &GradioInputComponent,
+) -> String {
+    let preferred = template.emo_control_method;
+    let alternatives = if preferred == "Same as the voice reference" {
+        ["Same as the voice reference", "与音色参考音频相同"]
+    } else {
+        ["与音色参考音频相同", "Same as the voice reference"]
+    };
+    let choices = gradio_choice_values(&input.choices);
+
+    for candidate in alternatives {
+        if choices.iter().any(|choice| choice == candidate) {
+            return candidate.to_string();
+        }
+    }
+
+    if choices.iter().any(|choice| choice == preferred) {
+        return preferred.to_string();
+    }
+
+    choices
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| preferred.to_string())
+}
+
+fn identity_contains_any(identity: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| identity.contains(needle))
+}
+
+fn component_key_text(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        Value::Array(values) => values
+            .iter()
+            .map(component_key_text)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => String::new(),
+    }
+}
+
+fn first_gradio_choice_value(value: &Value) -> Option<String> {
+    gradio_choice_values(value).into_iter().next()
+}
+
+fn gradio_choice_values(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Array(pair) => pair
+                    .get(1)
+                    .or_else(|| pair.first())
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn submit_index_tts2_job(
+    client: &Client,
+    gradio: &GradioRuntimeConfig,
+    session_hash: &str,
+    data: Vec<Value>,
+) -> Result<Value, String> {
+    let join_response = client
+        .post(&gradio.sse_data_url)
+        .json(&json!({
+            "data": data,
+            "fn_index": gradio.fn_index,
+            "session_hash": session_hash,
+        }))
+        .send()
+        .map_err(|error| format!("无法提交 Index-TTS 2.0 试听任务: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Index-TTS 2.0 试听任务提交失败: {error}"))?
+        .json::<GradioQueueJoinResponse>()
+        .map_err(|error| format!("无法解析 Index-TTS 2.0 任务提交结果: {error}"))?;
+
+    read_gradio_sse_result(client, gradio, session_hash, &join_response.event_id)
+}
+
+fn read_gradio_sse_result(
+    client: &Client,
+    gradio: &GradioRuntimeConfig,
+    session_hash: &str,
+    event_id: &str,
+) -> Result<Value, String> {
+    let response = client
+        .get(&gradio.sse_url)
+        .query(&[("session_hash", session_hash)])
+        .send()
+        .map_err(|error| format!("无法读取 Index-TTS 2.0 试听任务状态: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Index-TTS 2.0 试听任务状态请求失败: {error}"))?;
+    let reader = BufReader::new(response);
+
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("读取 Index-TTS 2.0 SSE 失败: {error}"))?;
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let message = serde_json::from_str::<Value>(payload.trim())
+            .map_err(|error| format!("无法解析 Index-TTS 2.0 SSE 消息: {error}"))?;
+        let message_type = message.get("msg").and_then(Value::as_str).unwrap_or("");
+
+        if matches!(message_type, "heartbeat" | "estimation" | "process_starts") {
+            continue;
+        }
+
+        if message
+            .get("event_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != event_id)
+        {
+            continue;
+        }
+
+        if message_type == "process_completed" {
+            if !message
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                let error_text = message
+                    .get("output")
+                    .and_then(|output| output.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Index-TTS 2.0 试听任务失败");
+                return Err(error_text.to_string());
+            }
+
+            return Ok(message
+                .get("output")
+                .cloned()
+                .ok_or_else(|| "Index-TTS 2.0 试听任务未返回输出".to_string())?);
+        }
+    }
+
+    Err("Index-TTS 2.0 试听任务连接已结束，但未收到完成结果".to_string())
+}
+
+fn download_gradio_audio(
+    client: &Client,
+    gradio: &GradioRuntimeConfig,
+    output: &Value,
+) -> Result<Vec<u8>, String> {
+    if let Some(path) = find_gradio_file_path(output) {
+        if let Some(audio) = read_local_gradio_file(&path)? {
+            return Ok(audio);
+        }
+    }
+
+    let candidates = gradio_audio_url_candidates(gradio, output)?;
+    let mut last_error = String::new();
+
+    for url in candidates {
+        match client.get(&url).send() {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    last_error = format!("HTTP {status} ({url})");
+                    continue;
+                }
+
+                let audio = response
+                    .bytes()
+                    .map_err(|error| format!("无法读取 Index-TTS 2.0 试听音频: {error}"))?;
+                if !audio.is_empty() {
+                    return Ok(audio.to_vec());
+                }
+
+                last_error = format!("空音频 ({url})");
+            }
+            Err(error) => {
+                last_error = format!("{error} ({url})");
+            }
+        }
+    }
+
+    if last_error.is_empty() {
+        Err("未能解析 Index-TTS 2.0 返回的音频文件".to_string())
+    } else {
+        Err(format!("Index-TTS 2.0 音频下载失败: {last_error}"))
+    }
+}
+
+fn find_gradio_file_url(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .map(ToString::to_string)
+            .or_else(|| object.values().find_map(find_gradio_file_url)),
+        Value::Array(values) => values.iter().find_map(find_gradio_file_url),
+        _ => None,
+    }
+}
+
+fn find_gradio_file_path(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .map(ToString::to_string)
+            .or_else(|| object.values().find_map(find_gradio_file_path)),
+        Value::Array(values) => values.iter().find_map(find_gradio_file_path),
+        Value::String(value) if !value.trim().is_empty() => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn read_local_gradio_file(path: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = Path::new(path);
+    if !path.exists() || !path.is_file() {
+        return Ok(None);
+    }
+
+    let audio = fs::read(path).map_err(|error| {
+        format!(
+            "无法读取 Index-TTS 2.0 本地试听音频 {}: {error}",
+            path.display()
+        )
+    })?;
+
+    if audio.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(audio))
+    }
+}
+
+fn gradio_audio_url_candidates(
+    gradio: &GradioRuntimeConfig,
+    output: &Value,
+) -> Result<Vec<String>, String> {
+    let mut candidates = Vec::new();
+
+    if let Some(url) = find_gradio_file_url(output) {
+        push_gradio_url_candidate(&mut candidates, &gradio.base_url, &url)?;
+        if let Some(relative_url) = absolute_gradio_file_relative_url(&url) {
+            push_gradio_url_candidate(&mut candidates, &gradio.base_url, &relative_url)?;
+        }
+    }
+
+    if let Some(path) = find_gradio_file_path(output) {
+        push_gradio_url_candidate(
+            &mut candidates,
+            &gradio.src_prefixed,
+            &format!("file={path}"),
+        )?;
+        push_gradio_url_candidate(
+            &mut candidates,
+            &gradio.src_prefixed,
+            &format!("file={}", percent_encode_path_value(&path)),
+        )?;
+        push_gradio_url_candidate(&mut candidates, &gradio.base_url, &format!("file={path}"))?;
+        push_gradio_url_candidate(
+            &mut candidates,
+            &gradio.base_url,
+            &format!("file={}", percent_encode_path_value(&path)),
+        )?;
+    }
+
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn push_gradio_url_candidate(
+    candidates: &mut Vec<String>,
+    base_url: &str,
+    file_url: &str,
+) -> Result<(), String> {
+    let url = normalize_gradio_file_url(base_url, file_url)?;
+    if !candidates.iter().any(|candidate| candidate == &url) {
+        candidates.push(url);
+    }
+
+    Ok(())
+}
+
+fn normalize_gradio_file_url(base_url: &str, file_url: &str) -> Result<String, String> {
+    let base = reqwest::Url::parse(base_url)
+        .map_err(|error| format!("Index-TTS 2.0 服务地址无效: {error}"))?;
+
+    if file_url.starts_with("http://") || file_url.starts_with("https://") {
+        return Ok(file_url.to_string());
+    }
+
+    base.join(file_url)
+        .map(|url| url.to_string())
+        .map_err(|error| format!("Index-TTS 2.0 音频地址无效: {error}"))
+}
+
+fn absolute_gradio_file_relative_url(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    let mut relative_url = url.path().to_string();
+    if let Some(query) = url.query() {
+        relative_url.push('?');
+        relative_url.push_str(query);
+    }
+
+    Some(relative_url)
+}
+
+fn percent_encode_path_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn trailing_slash(value: &str) -> String {
+    if value.ends_with('/') {
+        value.to_string()
+    } else {
+        format!("{value}/")
     }
 }
 

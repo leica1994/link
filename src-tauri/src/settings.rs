@@ -311,12 +311,13 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(engine, model_key)
+                updated_at TEXT NOT NULL
             );
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;
+
+    migrate_dubbing_models_table(connection)?;
 
     for service in LLM_SERVICES {
         connection
@@ -336,6 +337,87 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             )
             .map_err(|error| format!("无法初始化 LLM 配置: {error}"))?;
     }
+
+    Ok(())
+}
+
+fn migrate_dubbing_models_table(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA index_list(dubbing_models)")
+        .map_err(|error| format!("无法检查配音模型表结构: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(3).unwrap_or_default(),
+            ))
+        })
+        .map_err(|error| format!("无法检查配音模型表结构: {error}"))?;
+
+    let mut has_model_unique_index = false;
+    for row in rows {
+        let (is_unique, origin) =
+            row.map_err(|error| format!("无法解析配音模型表结构: {error}"))?;
+        if is_unique && origin == "u" {
+            has_model_unique_index = true;
+            break;
+        }
+    }
+
+    if !has_model_unique_index {
+        return Ok(());
+    }
+
+    drop(statement);
+
+    connection
+        .execute_batch(
+            "
+            DROP TABLE IF EXISTS dubbing_models_migration;
+
+            CREATE TABLE dubbing_models_migration (
+                id TEXT PRIMARY KEY NOT NULL,
+                engine TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                locale TEXT NOT NULL DEFAULT '',
+                gender TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            INSERT INTO dubbing_models_migration (
+                id,
+                engine,
+                model_key,
+                display_name,
+                locale,
+                gender,
+                enabled,
+                metadata,
+                created_at,
+                updated_at
+            )
+            SELECT
+                id,
+                engine,
+                model_key,
+                display_name,
+                locale,
+                gender,
+                enabled,
+                metadata,
+                created_at,
+                updated_at
+            FROM dubbing_models;
+
+            DROP TABLE dubbing_models;
+            ALTER TABLE dubbing_models_migration RENAME TO dubbing_models;
+            ",
+        )
+        .map_err(|error| format!("无法迁移配音模型表结构: {error}"))?;
 
     Ok(())
 }

@@ -63,14 +63,14 @@
               v-for="model in dubbingModels"
               :key="model.id"
               class="dubbing-model-card"
-              :class="{ disabled: !model.enabled }"
+              :class="{ disabled: !model.enabled, 'index-model': isIndexTts2Model(model) }"
             >
               <header class="dubbing-model-card-header">
                 <span class="dubbing-engine-pill">{{ model.engineLabel }}</span>
                 <button
                   class="dubbing-icon-button"
                   type="button"
-                  :aria-label="`删除${model.displayName}`"
+                  :aria-label="`删除${modelTitle(model)}`"
                   @click="openDeleteConfirmDialog(model)"
                 >
                   <Trash2 :stroke-width="2.1" aria-hidden="true" />
@@ -78,11 +78,11 @@
               </header>
 
               <div class="dubbing-model-copy">
-                <h2>{{ model.displayName }}</h2>
-                <p>{{ model.modelKey }}</p>
+                <h2 :title="modelTitle(model)">{{ modelTitle(model) }}</h2>
+                <p>{{ modelSubtitle(model) }}</p>
               </div>
 
-              <dl class="dubbing-model-meta">
+              <dl v-if="!isIndexTts2Model(model)" class="dubbing-model-meta">
                 <div>
                   <dt>语言</dt>
                   <dd>{{ model.locale || '未知' }}</dd>
@@ -111,11 +111,11 @@
                 <button
                   class="settings-action dubbing-preview-button"
                   type="button"
-                  :disabled="isPreviewing(model.engine, model.modelKey)"
-                  @click="previewVoice(model.engine, model.modelKey, model.locale)"
+                  :disabled="isPreviewing(model.engine, model.modelKey, modelEndpoint(model))"
+                  @click="previewVoice(model.engine, model.modelKey, model.locale, modelEndpoint(model))"
                 >
                   <Volume2 :stroke-width="2.1" aria-hidden="true" />
-                  <span>{{ isPreviewing(model.engine, model.modelKey) ? '试听中' : '试听' }}</span>
+                  <span>{{ isPreviewing(model.engine, model.modelKey, modelEndpoint(model)) ? '试听中' : '试听' }}</span>
                 </button>
               </footer>
             </article>
@@ -205,13 +205,25 @@
                 <span class="dialog-radio" aria-hidden="true" />
                 <span class="dubbing-voice-copy">
                   <span class="dubbing-voice-name">{{ voice.displayName }}</span>
-                  <span class="dubbing-voice-meta">{{ voice.modelKey }} · {{ voice.locale }} · {{ genderLabel(voice.gender) }}</span>
+                  <span class="dubbing-voice-meta">{{ voiceMeta(voice) }}</span>
                 </span>
                 <span v-if="isVoiceAdded(voice)" class="dubbing-added-label">已添加</span>
               </button>
 
               <span v-if="isVoicesLoading" class="language-empty">正在加载语音列表</span>
               <span v-else-if="filteredVoices.length === 0" class="language-empty">未找到语音</span>
+            </div>
+
+            <div v-if="isIndexTts2Selected" class="dubbing-endpoint-field">
+              <label class="dubbing-dialog-label" for="index-tts-endpoint">服务地址</label>
+              <input
+                id="index-tts-endpoint"
+                v-model="indexTts2Endpoint"
+                class="settings-input dubbing-endpoint-input"
+                type="url"
+                placeholder="http://127.0.0.1:7860"
+                autocomplete="off"
+              />
             </div>
           </div>
 
@@ -220,16 +232,16 @@
             <button
               class="settings-action dubbing-preview-button"
               type="button"
-              :disabled="!selectedVoice || isPreviewing(selectedVoice.engine, selectedVoice.modelKey)"
+              :disabled="!canSubmitSelectedVoice || !selectedVoice || isPreviewing(selectedVoice.engine, selectedVoice.modelKey, endpointForVoice(selectedVoice))"
               @click="previewSelectedVoice"
             >
               <Volume2 :stroke-width="2.1" aria-hidden="true" />
-              <span>{{ selectedVoice && isPreviewing(selectedVoice.engine, selectedVoice.modelKey) ? '试听中' : '试听' }}</span>
+              <span>{{ selectedVoice && isPreviewing(selectedVoice.engine, selectedVoice.modelKey, endpointForVoice(selectedVoice)) ? '试听中' : '试听' }}</span>
             </button>
             <button
               class="settings-action"
               type="button"
-              :disabled="!selectedVoice || isAddingModel"
+              :disabled="!canSubmitSelectedVoice || isAddingModel"
               @click="addSelectedVoice"
             >
               {{ isAddingModel ? '添加中' : '添加' }}
@@ -259,7 +271,7 @@
 
           <p class="dubbing-confirm-copy">
             <CircleAlert :stroke-width="2.1" aria-hidden="true" />
-            <span>确认删除“{{ modelPendingDelete.displayName }}”吗？删除后需要重新添加该语音模型。</span>
+            <span>确认删除“{{ modelTitle(modelPendingDelete) }}”吗？删除后需要重新添加该语音模型。</span>
           </p>
 
           <footer class="dubbing-dialog-actions">
@@ -294,6 +306,7 @@ enum DubbingTab {
 enum DubbingEngineKind {
   EdgeTts = 'edge-tts',
   NanoAiTts = 'nano-ai-tts',
+  IndexTts2 = 'index-tts-2',
 }
 
 type DubbingVoiceOption = {
@@ -317,6 +330,8 @@ type PreviewDubbingVoiceResult = {
   audioDataUrl: string
 }
 
+const INDEX_TTS2_DEFAULT_ENDPOINT = 'http://127.0.0.1:7860'
+
 const dubbingTabs = [
   { value: DubbingTab.Workflow, label: '配音流程', icon: MicVocal },
   { value: DubbingTab.Models, label: '模型合集', icon: Boxes },
@@ -325,6 +340,7 @@ const dubbingTabs = [
 const dubbingEngineOptions = [
   { value: DubbingEngineKind.EdgeTts, label: 'EDGE-TTS' },
   { value: DubbingEngineKind.NanoAiTts, label: '纳米AI TTS' },
+  { value: DubbingEngineKind.IndexTts2, label: 'Index-TTS 2.0' },
 ] as const
 
 const activeTab = ref<DubbingTab>(DubbingTab.Workflow)
@@ -333,6 +349,7 @@ const voices = ref<DubbingVoiceOption[]>([])
 const selectedEngine = ref<DubbingEngineKind>(DubbingEngineKind.EdgeTts)
 const selectedVoiceKey = ref('')
 const voiceSearch = ref('')
+const indexTts2Endpoint = ref(INDEX_TTS2_DEFAULT_ENDPOINT)
 const isAddModelDialogOpen = ref(false)
 const isModelsLoading = ref(false)
 const isVoicesLoading = ref(false)
@@ -349,7 +366,11 @@ let previewAudioUrl = ''
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 
 const addedVoiceKeys = computed(() => {
-  return new Set(dubbingModels.value.map((model) => `${model.engine}:${model.modelKey}`))
+  return new Set(
+    dubbingModels.value
+      .filter((model) => model.engine !== DubbingEngineKind.IndexTts2)
+      .map((model) => voiceKey(model.engine, model.modelKey)),
+  )
 })
 
 const filteredVoices = computed(() => {
@@ -368,6 +389,12 @@ const filteredVoices = computed(() => {
 
 const selectedVoice = computed(() => {
   return voices.value.find((voice) => voiceOptionKey(voice) === selectedVoiceKey.value)
+})
+
+const isIndexTts2Selected = computed(() => selectedEngine.value === DubbingEngineKind.IndexTts2)
+
+const canSubmitSelectedVoice = computed(() => {
+  return Boolean(selectedVoice.value) && (!isIndexTts2Selected.value || indexTts2Endpoint.value.trim())
 })
 
 const selectTab = (tab: DubbingTab) => {
@@ -393,6 +420,7 @@ const openAddModelDialog = () => {
   dialogError.value = ''
   selectedVoiceKey.value = ''
   voiceSearch.value = ''
+  indexTts2Endpoint.value = INDEX_TTS2_DEFAULT_ENDPOINT
   isAddModelDialogOpen.value = true
   void loadVoices()
 }
@@ -453,7 +481,7 @@ const loadVoices = async () => {
 }
 
 const addSelectedVoice = async () => {
-  if (!selectedVoice.value || isAddingModel.value) {
+  if (!selectedVoice.value || !canSubmitSelectedVoice.value || isAddingModel.value) {
     return
   }
 
@@ -465,6 +493,7 @@ const addSelectedVoice = async () => {
       request: {
         engine: selectedVoice.value.engine,
         modelKey: selectedVoice.value.modelKey,
+        endpoint: endpointForVoice(selectedVoice.value),
       },
     })
     dubbingModels.value = [model, ...dubbingModels.value]
@@ -526,11 +555,16 @@ const previewSelectedVoice = async () => {
     return
   }
 
-  await previewVoice(selectedVoice.value.engine, selectedVoice.value.modelKey, selectedVoice.value.locale)
+  await previewVoice(
+    selectedVoice.value.engine,
+    selectedVoice.value.modelKey,
+    selectedVoice.value.locale,
+    endpointForVoice(selectedVoice.value),
+  )
 }
 
-const previewVoice = async (engine: DubbingEngineKind, modelKey: string, locale = '') => {
-  if (!modelKey || isPreviewing(engine, modelKey)) {
+const previewVoice = async (engine: DubbingEngineKind, modelKey: string, locale = '', endpoint = '') => {
+  if (!modelKey || isPreviewing(engine, modelKey, endpoint)) {
     return
   }
 
@@ -539,13 +573,16 @@ const previewVoice = async (engine: DubbingEngineKind, modelKey: string, locale 
     return
   }
 
-  const key = voiceKey(engine, modelKey)
+  const key = voicePreviewKey(engine, modelKey, endpoint)
   previewingKey.value = key
   clearErrors()
 
   try {
+    const request = endpoint.trim()
+      ? { engine, modelKey, locale, endpoint: endpoint.trim() }
+      : { engine, modelKey, locale }
     const result = await invoke<PreviewDubbingVoiceResult>('preview_dubbing_voice', {
-      request: { engine, modelKey, locale },
+      request,
     })
     await playPreview(result.audioDataUrl)
   } catch (error) {
@@ -578,21 +615,73 @@ const stopPreviewAudio = () => {
 }
 
 const isVoiceAdded = (voice: DubbingVoiceOption) => {
+  if (voice.engine === DubbingEngineKind.IndexTts2) {
+    return false
+  }
+
   return addedVoiceKeys.value.has(voiceKey(voice.engine, voice.modelKey))
 }
 
-const isPreviewing = (engine: DubbingEngineKind, modelKey: string) => {
-  return previewingKey.value === voiceKey(engine, modelKey)
+const isPreviewing = (engine: DubbingEngineKind, modelKey: string, endpoint = '') => {
+  return previewingKey.value === voicePreviewKey(engine, modelKey, endpoint)
 }
 
 const isModelUpdating = (id: string) => {
   return updatingModelIds.value.includes(id)
 }
 
+const isIndexTts2Model = (model: Pick<DubbingModel, 'engine'>) => {
+  return model.engine === DubbingEngineKind.IndexTts2
+}
+
+const modelTitle = (model: DubbingModel) => {
+  if (isIndexTts2Model(model)) {
+    return modelEndpoint(model) || model.modelKey
+  }
+
+  return model.displayName
+}
+
+const modelSubtitle = (model: DubbingModel) => {
+  if (isIndexTts2Model(model)) {
+    return model.modelKey
+  }
+
+  return model.modelKey
+}
+
 const voiceKey = (engine: DubbingEngineKind, modelKey: string) => `${engine}:${modelKey}`
+
+const voicePreviewKey = (engine: DubbingEngineKind, modelKey: string, endpoint = '') => {
+  return `${voiceKey(engine, modelKey)}:${endpoint.trim()}`
+}
 
 const voiceOptionKey = (voice: DubbingVoiceOption) => {
   return `${voiceKey(voice.engine, voice.modelKey)}:${voice.displayName}`
+}
+
+const endpointForVoice = (voice: DubbingVoiceOption) => {
+  if (voice.engine !== DubbingEngineKind.IndexTts2) {
+    return ''
+  }
+
+  return indexTts2Endpoint.value.trim()
+}
+
+const modelEndpoint = (model: DubbingModel) => {
+  if (model.engine !== DubbingEngineKind.IndexTts2) {
+    return ''
+  }
+
+  return typeof model.metadata.endpoint === 'string' ? model.metadata.endpoint : ''
+}
+
+const voiceMeta = (voice: DubbingVoiceOption) => {
+  if (voice.engine === DubbingEngineKind.EdgeTts) {
+    return [voice.modelKey, voice.locale, genderLabel(voice.gender)].filter(Boolean).join(' · ')
+  }
+
+  return voice.modelKey
 }
 
 const genderLabel = (gender: string) => {
