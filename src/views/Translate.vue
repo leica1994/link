@@ -470,6 +470,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { DragDropEvent } from '@tauri-apps/api/webview'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import {
   Bot,
   Captions,
@@ -1738,6 +1739,10 @@ onMounted(() => {
   void registerProgressListener()
   void registerSubtitleTranslationProgressListener()
   void registerDragDropListener()
+})
+
+onBeforeRouteLeave(async () => {
+  await flushPendingSave()
 })
 
 onBeforeUnmount(() => {

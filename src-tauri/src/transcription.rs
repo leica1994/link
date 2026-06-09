@@ -1,6 +1,6 @@
 use crate::ai::AiService;
-use crate::app_paths;
 use crate::app_log::{AppLogger, LogSession};
+use crate::app_paths;
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::{correct_subtitles, smart_segment_subtitles};
 use reqwest::blocking::Client;
