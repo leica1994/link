@@ -70,6 +70,15 @@ const DUBBING_SUBTITLE_EXTENSIONS: &[&str] = &[
 ];
 const DUBBING_AUDIO_EXTENSIONS: &[&str] =
     &["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma"];
+const REFERENCE_AUDIO_POST_PROCESSING_VERSION: u32 = 1;
+const REFERENCE_AUDIO_TRIM_THRESHOLD_DB: f64 = -45.0;
+const REFERENCE_AUDIO_SILENCE_MEAN_DB: f64 = -45.0;
+const REFERENCE_AUDIO_SILENCE_MAX_DB: f64 = -35.0;
+const REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS: u64 = 200;
+const REFERENCE_AUDIO_MIN_DURATION_MS: u64 = 1_000;
+const REFERENCE_AUDIO_TARGET_LUFS: f64 = -16.0;
+const REFERENCE_AUDIO_TRUE_PEAK: f64 = -1.5;
+const REFERENCE_AUDIO_LRA: f64 = 11.0;
 const MIN_DUBBING_SUBTITLE_DURATION_MS: u64 = 100;
 const DEFAULT_DUBBING_TEXT_DURATION_MS: u64 = 3_000;
 const BACKGROUND_MUSIC_METHOD: &str = "libtorch-htdemucs";
@@ -274,6 +283,31 @@ struct DubbingMediaSeparationResult {
 struct DubbingReferenceAudioResult {
     manifest_path: PathBuf,
     metadata: Value,
+}
+
+#[derive(Clone)]
+struct ReferenceAudioClip {
+    index: usize,
+    uid: String,
+    text: String,
+    start_time: u64,
+    end_time: u64,
+    path: PathBuf,
+    raw_duration_ms: u64,
+    audio_duration_ms: u64,
+    file_size: u64,
+    mean_volume_db: Option<f64>,
+    max_volume_db: Option<f64>,
+    detected_silence: bool,
+    detected_short: bool,
+    is_silence: bool,
+    trim_fallback: bool,
+    silence_replaced: bool,
+    short_replaced: bool,
+    replaced_with: Option<usize>,
+    replacement_reason: Option<String>,
+    loudnorm_applied: bool,
+    quality: String,
 }
 
 struct BackgroundMusicSeparationResult {
@@ -1853,6 +1887,15 @@ fn reference_audio_metadata_matches(
 
     match options.reference_audio_source.as_str() {
         DUBBING_REFERENCE_AUDIO_EXISTING => {
+            if artifact
+                .metadata
+                .get("postProcessingVersion")
+                .and_then(Value::as_u64)
+                != Some(REFERENCE_AUDIO_POST_PROCESSING_VERSION as u64)
+            {
+                return false;
+            }
+
             let Some(source_audio_path) = source_audio_path(snapshot).ok() else {
                 return false;
             };
@@ -2161,7 +2204,10 @@ fn generate_existing_reference_audio(
     output_dir: &Path,
 ) -> Result<DubbingReferenceAudioResult, String> {
     let source_audio = source_audio_path(snapshot)?;
+    let raw_dir = output_dir.join("raw");
     let clips_dir = output_dir.join("clips");
+    fs::create_dir_all(&raw_dir)
+        .map_err(|error| format!("无法创建参考音频原始切片目录: {error}"))?;
     fs::create_dir_all(&clips_dir).map_err(|error| format!("无法创建参考音频切片目录: {error}"))?;
 
     let segment_count = snapshot.segments.len();
@@ -2171,33 +2217,52 @@ fn generate_existing_reference_audio(
             return Err(format!("第 {} 条字幕时间轴无效", index + 1));
         }
 
+        let raw_path = raw_dir.join(format!("reference_{:04}.wav", index + 1));
         let output_path = clips_dir.join(format!("reference_{:04}.wav", index + 1));
         export_reference_audio_clip(
             &source_audio,
             segment.start_time,
             segment.end_time,
-            &output_path,
+            &raw_path,
         )?;
-        ensure_non_empty_file(&output_path, "参考音频切片为空")?;
+        ensure_non_empty_file(&raw_path, "参考音频原始切片为空")?;
 
-        clips.push(json!({
-            "index": index,
-            "uid": segment.uid,
-            "startTime": segment.start_time,
-            "endTime": segment.end_time,
-            "text": segment.text,
-            "path": path_to_string(&output_path),
-        }));
+        clips.push(post_process_reference_audio_clip(
+            index,
+            segment,
+            &raw_path,
+            &output_path,
+        )?);
 
-        let progress = 8 + ((((index + 1) as f64 / segment_count as f64) * 84.0).round() as u8);
+        let progress = 8 + ((((index + 1) as f64 / segment_count as f64) * 62.0).round() as u8);
         emit_reference_audio_progress(
             app,
             task_id,
-            progress.min(92),
-            &format!("生成参考音频 {}/{}", index + 1, segment_count),
+            progress.min(70),
+            &format!("切割并处理参考音频 {}/{}", index + 1, segment_count),
             &options.reference_audio_source,
         )?;
     }
+
+    emit_reference_audio_progress(
+        app,
+        task_id,
+        74,
+        "替换静音参考音频",
+        &options.reference_audio_source,
+    )?;
+    replace_silence_reference_clips(&mut clips)?;
+
+    emit_reference_audio_progress(
+        app,
+        task_id,
+        82,
+        "替换过短参考音频",
+        &options.reference_audio_source,
+    )?;
+    replace_short_reference_clips(&mut clips)?;
+
+    apply_loudnorm_to_reference_clips(app, task_id, options, &mut clips)?;
 
     emit_reference_audio_progress(
         app,
@@ -2209,14 +2274,40 @@ fn generate_existing_reference_audio(
     let manifest_path = output_dir.join("manifest.json");
     let manifest = json!({
         "source": DUBBING_REFERENCE_AUDIO_EXISTING,
+        "postProcessingVersion": REFERENCE_AUDIO_POST_PROCESSING_VERSION,
         "segmentCount": segment_count,
         "sourceAudioPath": path_to_string(&source_audio),
         "manifestPath": path_to_string(&manifest_path),
-        "items": clips,
+        "trimSilence": {
+            "enabled": true,
+            "thresholdDb": REFERENCE_AUDIO_TRIM_THRESHOLD_DB,
+            "minTrimmedDurationMs": REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS,
+        },
+        "silenceDetection": {
+            "meanVolumeThresholdDb": REFERENCE_AUDIO_SILENCE_MEAN_DB,
+            "maxVolumeThresholdDb": REFERENCE_AUDIO_SILENCE_MAX_DB,
+            "detectedCount": clips.iter().filter(|clip| clip.detected_silence).count(),
+            "replacedCount": clips.iter().filter(|clip| clip.silence_replaced).count(),
+            "remainingCount": clips.iter().filter(|clip| clip.is_silence).count(),
+        },
+        "shortSegmentReplacement": {
+            "minDurationMs": REFERENCE_AUDIO_MIN_DURATION_MS,
+            "detectedCount": clips.iter().filter(|clip| clip.detected_short).count(),
+            "replacedCount": clips.iter().filter(|clip| clip.short_replaced).count(),
+        },
+        "loudnorm": {
+            "enabled": true,
+            "targetLufs": REFERENCE_AUDIO_TARGET_LUFS,
+            "truePeak": REFERENCE_AUDIO_TRUE_PEAK,
+            "lra": REFERENCE_AUDIO_LRA,
+            "appliedCount": clips.iter().filter(|clip| clip.loudnorm_applied).count(),
+        },
+        "items": clips.iter().map(reference_audio_clip_metadata).collect::<Vec<_>>(),
     });
     write_reference_audio_manifest(&manifest_path, &manifest)?;
     let metadata = json!({
         "source": DUBBING_REFERENCE_AUDIO_EXISTING,
+        "postProcessingVersion": REFERENCE_AUDIO_POST_PROCESSING_VERSION,
         "segmentCount": segment_count,
         "sourceAudioPath": path_to_string(&source_audio),
         "manifestPath": path_to_string(&manifest_path),
@@ -2360,6 +2451,366 @@ fn canonical_reference_audio_path(options: &DubbingTaskOptions) -> Result<PathBu
     let path = canonical_material_path(path, "参考音频文件不存在")?;
     ensure_supported_extension(&path, DUBBING_AUDIO_EXTENSIONS, "不支持的参考音频格式")?;
     Ok(path)
+}
+
+fn post_process_reference_audio_clip(
+    index: usize,
+    segment: &TranscriptionSegment,
+    raw_path: &Path,
+    output_path: &Path,
+) -> Result<ReferenceAudioClip, String> {
+    let raw_duration_ms = probe_audio_duration_ms(raw_path)
+        .unwrap_or_else(|_| segment.end_time.saturating_sub(segment.start_time));
+    let trimmed_path = reference_audio_temp_path(output_path, "trimmed");
+    let mut trim_fallback = false;
+
+    let should_use_raw = match trim_reference_audio_silence(raw_path, &trimmed_path) {
+        Ok(()) => {
+            let trimmed_duration_ms = probe_audio_duration_ms(&trimmed_path).unwrap_or_default();
+            trimmed_duration_ms < REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS
+        }
+        Err(_) => true,
+    };
+
+    if should_use_raw {
+        trim_fallback = true;
+        fs::copy(raw_path, output_path)
+            .map_err(|error| format!("无法写入参考音频切片: {error}"))?;
+        let _ = fs::remove_file(&trimmed_path);
+    } else {
+        fs::copy(&trimmed_path, output_path)
+            .map_err(|error| format!("无法写入裁静音参考音频: {error}"))?;
+        let _ = fs::remove_file(&trimmed_path);
+    }
+    ensure_non_empty_file(output_path, "参考音频切片为空")?;
+
+    let audio_duration_ms = probe_audio_duration_ms(output_path).unwrap_or(raw_duration_ms);
+    let file_size = file_size(output_path).unwrap_or_default();
+    let (mean_volume_db, max_volume_db) =
+        probe_audio_volume_db(output_path).unwrap_or((None, None));
+    let is_silence = is_reference_audio_silence(mean_volume_db, max_volume_db);
+    let detected_short = audio_duration_ms < REFERENCE_AUDIO_MIN_DURATION_MS;
+    let quality = reference_audio_quality(is_silence, audio_duration_ms, trim_fallback);
+
+    Ok(ReferenceAudioClip {
+        index,
+        uid: segment.uid.clone(),
+        text: segment.text.clone(),
+        start_time: segment.start_time,
+        end_time: segment.end_time,
+        path: output_path.to_path_buf(),
+        raw_duration_ms,
+        audio_duration_ms,
+        file_size,
+        mean_volume_db,
+        max_volume_db,
+        detected_silence: is_silence,
+        detected_short,
+        is_silence,
+        trim_fallback,
+        silence_replaced: false,
+        short_replaced: false,
+        replaced_with: None,
+        replacement_reason: None,
+        loudnorm_applied: false,
+        quality,
+    })
+}
+
+fn replace_silence_reference_clips(clips: &mut [ReferenceAudioClip]) -> Result<(), String> {
+    for index in 0..clips.len() {
+        if !clips[index].is_silence {
+            continue;
+        }
+
+        let Some(replacement_index) = nearest_reference_clip_index(clips, index, |clip| {
+            !clip.is_silence && clip.path.is_file()
+        }) else {
+            continue;
+        };
+        let replacement = clips[replacement_index].clone();
+        copy_reference_clip_from_replacement(&mut clips[index], &replacement, "silence")?;
+        clips[index].silence_replaced = true;
+    }
+
+    Ok(())
+}
+
+fn replace_short_reference_clips(clips: &mut [ReferenceAudioClip]) -> Result<(), String> {
+    for index in 0..clips.len() {
+        if clips[index].audio_duration_ms >= REFERENCE_AUDIO_MIN_DURATION_MS {
+            continue;
+        }
+
+        let Some(replacement_index) = nearest_reference_clip_index(clips, index, |clip| {
+            !clip.is_silence
+                && clip.path.is_file()
+                && clip.audio_duration_ms >= REFERENCE_AUDIO_MIN_DURATION_MS
+        }) else {
+            continue;
+        };
+        let replacement = clips[replacement_index].clone();
+        copy_reference_clip_from_replacement(&mut clips[index], &replacement, "too-short")?;
+        clips[index].detected_short = true;
+        clips[index].short_replaced = true;
+    }
+
+    Ok(())
+}
+
+fn nearest_reference_clip_index<F>(
+    clips: &[ReferenceAudioClip],
+    current_index: usize,
+    predicate: F,
+) -> Option<usize>
+where
+    F: Fn(&ReferenceAudioClip) -> bool,
+{
+    (0..current_index)
+        .rev()
+        .find(|index| predicate(&clips[*index]))
+        .or_else(|| ((current_index + 1)..clips.len()).find(|index| predicate(&clips[*index])))
+}
+
+fn copy_reference_clip_from_replacement(
+    target: &mut ReferenceAudioClip,
+    replacement: &ReferenceAudioClip,
+    reason: &str,
+) -> Result<(), String> {
+    fs::copy(&replacement.path, &target.path)
+        .map_err(|error| format!("无法替换参考音频切片: {error}"))?;
+    ensure_non_empty_file(&target.path, "替换后的参考音频切片为空")?;
+
+    target.audio_duration_ms = replacement.audio_duration_ms;
+    target.file_size = file_size(&target.path).unwrap_or(replacement.file_size);
+    target.mean_volume_db = replacement.mean_volume_db;
+    target.max_volume_db = replacement.max_volume_db;
+    target.is_silence = false;
+    target.replaced_with = Some(replacement.index);
+    target.replacement_reason = Some(reason.to_string());
+    target.loudnorm_applied = false;
+    target.quality = "replaced".to_string();
+
+    Ok(())
+}
+
+fn apply_loudnorm_to_reference_clips(
+    app: &AppHandle,
+    task_id: &str,
+    options: &DubbingTaskOptions,
+    clips: &mut [ReferenceAudioClip],
+) -> Result<(), String> {
+    let total = clips.len().max(1);
+    let clip_count = clips.len();
+    for (index, clip) in clips.iter_mut().enumerate() {
+        if clip.is_silence {
+            continue;
+        }
+
+        apply_reference_audio_loudnorm(&clip.path)?;
+        ensure_non_empty_file(&clip.path, "LUFS 归一化后的参考音频为空")?;
+        clip.loudnorm_applied = true;
+        clip.audio_duration_ms =
+            probe_audio_duration_ms(&clip.path).unwrap_or(clip.audio_duration_ms);
+        clip.file_size = file_size(&clip.path).unwrap_or(clip.file_size);
+        if let Ok((mean_volume_db, max_volume_db)) = probe_audio_volume_db(&clip.path) {
+            clip.mean_volume_db = mean_volume_db;
+            clip.max_volume_db = max_volume_db;
+        }
+        if clip.replacement_reason.is_none() {
+            clip.quality = reference_audio_quality(
+                clip.is_silence,
+                clip.audio_duration_ms,
+                clip.trim_fallback,
+            );
+        }
+
+        let progress = 84 + ((((index + 1) as f64 / total as f64) * 11.0).round() as u8);
+        emit_reference_audio_progress(
+            app,
+            task_id,
+            progress.min(95),
+            &format!("LUFS 归一化 {}/{}", index + 1, clip_count),
+            &options.reference_audio_source,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn reference_audio_clip_metadata(clip: &ReferenceAudioClip) -> Value {
+    json!({
+        "index": clip.index,
+        "uid": clip.uid,
+        "startTime": clip.start_time,
+        "endTime": clip.end_time,
+        "text": clip.text,
+        "path": path_to_string(&clip.path),
+        "rawDurationMs": clip.raw_duration_ms,
+        "audioDurationMs": clip.audio_duration_ms,
+        "fileSize": clip.file_size,
+        "meanVolumeDb": clip.mean_volume_db,
+        "maxVolumeDb": clip.max_volume_db,
+        "detectedSilence": clip.detected_silence,
+        "detectedShort": clip.detected_short,
+        "isSilence": clip.is_silence,
+        "trimFallback": clip.trim_fallback,
+        "silenceReplaced": clip.silence_replaced,
+        "shortReplaced": clip.short_replaced,
+        "replacedWith": clip.replaced_with,
+        "replacementReason": clip.replacement_reason,
+        "loudnormApplied": clip.loudnorm_applied,
+        "quality": clip.quality,
+    })
+}
+
+fn reference_audio_quality(
+    is_silence: bool,
+    audio_duration_ms: u64,
+    trim_fallback: bool,
+) -> String {
+    if is_silence {
+        "silent".to_string()
+    } else if audio_duration_ms < REFERENCE_AUDIO_MIN_DURATION_MS {
+        "too-short".to_string()
+    } else if trim_fallback {
+        "trim-fallback".to_string()
+    } else {
+        "ok".to_string()
+    }
+}
+
+fn is_reference_audio_silence(mean_volume_db: Option<f64>, max_volume_db: Option<f64>) -> bool {
+    mean_volume_db.is_some_and(|volume| volume <= REFERENCE_AUDIO_SILENCE_MEAN_DB)
+        || max_volume_db.is_some_and(|volume| volume <= REFERENCE_AUDIO_SILENCE_MAX_DB)
+}
+
+fn trim_reference_audio_silence(input_path: &Path, output_path: &Path) -> Result<(), String> {
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-af")
+            .arg(format!(
+                "silenceremove=start_periods=1:start_threshold={:.1}dB:stop_periods=1:stop_threshold={:.1}dB",
+                REFERENCE_AUDIO_TRIM_THRESHOLD_DB, REFERENCE_AUDIO_TRIM_THRESHOLD_DB
+            ))
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("1")
+            .arg("-y")
+            .arg(output_path),
+        "参考音频裁静音失败",
+    )
+}
+
+fn apply_reference_audio_loudnorm(path: &Path) -> Result<(), String> {
+    let output_path = reference_audio_temp_path(path, "loudnorm");
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(path)
+            .arg("-af")
+            .arg(format!(
+                "loudnorm=I={:.1}:TP={:.1}:LRA={:.1}:print_format=summary",
+                REFERENCE_AUDIO_TARGET_LUFS, REFERENCE_AUDIO_TRUE_PEAK, REFERENCE_AUDIO_LRA
+            ))
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("1")
+            .arg("-y")
+            .arg(&output_path),
+        "参考音频 LUFS 归一化失败",
+    )?;
+    ensure_non_empty_file(&output_path, "LUFS 归一化临时音频为空")?;
+    fs::copy(&output_path, path)
+        .map_err(|error| format!("无法写入 LUFS 归一化参考音频: {error}"))?;
+    let _ = fs::remove_file(output_path);
+
+    Ok(())
+}
+
+fn probe_audio_duration_ms(path: &Path) -> Result<u64, String> {
+    let mut command = Command::new("ffprobe");
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(path);
+
+    let (stdout, _) = run_command_with_output(&mut command, "无法获取音频时长")?;
+    let seconds = stdout
+        .trim()
+        .parse::<f64>()
+        .map_err(|error| format!("无法解析音频时长: {error}"))?;
+
+    Ok((seconds * 1000.0).round().max(0.0) as u64)
+}
+
+fn probe_audio_volume_db(path: &Path) -> Result<(Option<f64>, Option<f64>), String> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-nostats")
+        .arg("-i")
+        .arg(path)
+        .arg("-af")
+        .arg("volumedetect")
+        .arg("-f")
+        .arg("null")
+        .arg("-");
+
+    let (_, stderr) = run_command_with_output(&mut command, "无法检测参考音频音量")?;
+    Ok((
+        parse_ffmpeg_db_value(&stderr, "mean_volume:"),
+        parse_ffmpeg_db_value(&stderr, "max_volume:"),
+    ))
+}
+
+fn parse_ffmpeg_db_value(text: &str, key: &str) -> Option<f64> {
+    for line in text.lines() {
+        let Some(start_index) = line.find(key).map(|index| index + key.len()) else {
+            continue;
+        };
+        let value_text = line[start_index..]
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(',');
+        let value = match value_text {
+            "-inf" => -120.0,
+            "inf" | "+inf" => 120.0,
+            _ => value_text.parse::<f64>().ok()?,
+        };
+        return Some(value);
+    }
+
+    None
+}
+
+fn reference_audio_temp_path(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("reference");
+    path.with_file_name(format!("{stem}.{suffix}.wav"))
 }
 
 fn export_reference_audio_clip(
@@ -2576,6 +3027,12 @@ fn ensure_non_empty_file(path: &Path, message: &str) -> Result<(), String> {
     }
 }
 
+fn file_size(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("无法读取文件大小: {error}"))
+}
+
 fn run_ffmpeg_command(command: &mut Command, failure_message: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -2593,6 +3050,31 @@ fn run_ffmpeg_command(command: &mut Command, failure_message: &str) -> Result<()
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("{failure_message}: {}", stderr.trim()))
+    }
+}
+
+fn run_command_with_output(
+    command: &mut Command,
+    failure_message: &str,
+) -> Result<(String, String), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("{failure_message}: 无法启动进程: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok((stdout, stderr))
+    } else {
         Err(format!("{failure_message}: {}", stderr.trim()))
     }
 }
