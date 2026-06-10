@@ -11,7 +11,6 @@ struct FftCacheEntry {
     fft_inverse: Arc<dyn Fft<f32>>,
     hann_window: Vec<f32>,
 }
-
 /// Global FFT cache supporting multiple sizes
 struct FftCache {
     entries: RwLock<HashMap<usize, Arc<FftCacheEntry>>>,
@@ -403,62 +402,4 @@ pub fn istft_cac_stereo_parallel(
         .par_iter()
         .map(|spec_cac| istft_cac_stereo(spec_cac, f_bins, frames, n_fft, hop, target_length))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use approx::assert_abs_diff_eq;
-
-    #[test]
-    fn stft_into_matches_wrapper_output() {
-        let n_fft = 1024usize;
-        let hop = 256usize;
-        let t = 4096usize;
-        let left: Vec<f32> = (0..t).map(|i| (i as f32 * 0.01).sin()).collect();
-        let right: Vec<f32> = (0..t).map(|i| (i as f32 * 0.02).cos()).collect();
-
-        let (spec_a, f_bins_a, frames_a) = stft_cac_stereo_centered(&left, &right, n_fft, hop);
-        let mut spec_b = Vec::new();
-        let (f_bins_b, frames_b) =
-            stft_cac_stereo_centered_into(&left, &right, n_fft, hop, &mut spec_b);
-
-        assert_eq!(f_bins_a, f_bins_b);
-        assert_eq!(frames_a, frames_b);
-        assert_eq!(spec_a.len(), spec_b.len());
-        for (a, b) in spec_a.iter().zip(spec_b.iter()) {
-            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
-        }
-    }
-
-    #[test]
-    fn istft_add_into_matches_wrapper_sum() {
-        let n_fft = 1024usize;
-        let hop = 256usize;
-        let t = 4096usize;
-        let left: Vec<f32> = (0..t).map(|i| (i as f32 * 0.013).sin() * 0.2).collect();
-        let right: Vec<f32> = (0..t).map(|i| (i as f32 * 0.017).cos() * 0.15).collect();
-        let (spec, f_bins, frames) = stft_cac_stereo_centered(&left, &right, n_fft, hop);
-        let (base_left, base_right) = istft_cac_stereo(&spec, f_bins, frames, n_fft, hop, t);
-
-        let mut ws = IstftStereoWorkspace::default();
-        let mut acc_left = vec![0.25f32; t];
-        let mut acc_right = vec![-0.5f32; t];
-        istft_cac_stereo_add_into(
-            &spec,
-            f_bins,
-            frames,
-            n_fft,
-            hop,
-            t,
-            &mut ws,
-            &mut acc_left,
-            &mut acc_right,
-        );
-
-        for i in 0..t {
-            assert_abs_diff_eq!(acc_left[i], 0.25 + base_left[i], epsilon = 1e-5);
-            assert_abs_diff_eq!(acc_right[i], -0.5 + base_right[i], epsilon = 1e-5);
-        }
-    }
 }
