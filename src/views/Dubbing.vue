@@ -234,7 +234,10 @@
               </div>
             </div>
 
-            <div v-else-if="preprocessedSubtitleSegments.length > 0" class="translate-preview translate-subtitle-list">
+            <div
+              v-else-if="preprocessedSubtitleSegments.length > 0 && !shouldShowDubbingStagePreview"
+              class="translate-preview translate-subtitle-list"
+            >
               <div
                 v-for="(segment, index) in preprocessedSubtitleSegments"
                 :key="segment.uid || `dubbing-subtitle-${index}`"
@@ -257,7 +260,7 @@
               </div>
             </div>
 
-            <div v-else-if="visibleDubbingStages.length > 0" class="translate-preview dubbing-stage-preview">
+            <div v-else-if="shouldShowDubbingStagePreview" class="translate-preview dubbing-stage-preview">
               <div
                 v-for="stage in visibleDubbingStages"
                 :key="stage.key"
@@ -387,7 +390,7 @@
         @click.self="closeReferenceAudioDialog"
       >
         <section
-          class="settings-dialog"
+          class="settings-dialog reference-audio-dialog"
           role="dialog"
           aria-modal="true"
           aria-labelledby="reference-audio-dialog-title"
@@ -398,16 +401,40 @@
               v-for="option in referenceAudioSourceOptions"
               :key="option.value"
               class="dialog-option"
-              :class="{ active: selectedReferenceAudioSource === option.value }"
+              :class="{ active: draftReferenceAudioSource === option.value }"
               type="button"
               role="radio"
-              :aria-checked="selectedReferenceAudioSource === option.value"
+              :aria-checked="draftReferenceAudioSource === option.value"
               @click="selectReferenceAudioSource(option.value)"
             >
               <span class="dialog-radio" aria-hidden="true" />
               <span>{{ option.label }}</span>
             </button>
           </div>
+
+          <div v-if="draftReferenceAudioSource === ReferenceAudioSource.CustomAudioFile" class="reference-audio-picker">
+            <div class="reference-audio-file">
+              <FileMusic :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ draftCustomReferenceAudioFileName }}</span>
+              <button
+                v-if="draftCustomReferenceAudioPath"
+                class="reference-audio-clear-button"
+                type="button"
+                aria-label="取消选择参考音频"
+                @click="clearCustomReferenceAudioFile"
+              >
+                <X :stroke-width="2.4" aria-hidden="true" />
+              </button>
+            </div>
+            <button class="settings-action" type="button" @click="selectCustomReferenceAudioFile">
+              选择音频
+            </button>
+          </div>
+
+          <footer class="reference-audio-actions">
+            <button class="settings-action" type="button" @click="closeReferenceAudioDialog">取消</button>
+            <button class="settings-action" type="button" @click="confirmReferenceAudioDialog">确认</button>
+          </footer>
         </section>
       </div>
 
@@ -648,6 +675,7 @@ type DubbingStageProgress = {
   material?: DubbingProgressStage
   subtitlePreprocess?: DubbingProgressStage
   mediaSeparation?: DubbingProgressStage
+  referenceAudio?: DubbingProgressStage
   ttsSynthesis?: DubbingProgressStage
   audioMerge?: DubbingProgressStage
   videoCompose?: DubbingProgressStage
@@ -726,6 +754,9 @@ const dubbingModels = ref<DubbingModel[]>([])
 const voices = ref<DubbingVoiceOption[]>([])
 const selectedEngine = ref<DubbingEngineKind>(DubbingEngineKind.EdgeTts)
 const selectedReferenceAudioSource = ref<ReferenceAudioSource>(ReferenceAudioSource.ExistingDubbing)
+const customReferenceAudioPath = ref('')
+const draftReferenceAudioSource = ref<ReferenceAudioSource>(ReferenceAudioSource.ExistingDubbing)
+const draftCustomReferenceAudioPath = ref('')
 const isReferenceAudioDialogOpen = ref(false)
 const ttsIntervalMs = ref(150)
 const isBackgroundMusicEnabled = ref(true)
@@ -765,6 +796,7 @@ let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 const dubbingVideoExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v']
 const dubbingSubtitleExtensions = ['srt', 'vtt', 'ass', 'ssa', 'lrc', 'sbv', 'smi', 'sami', 'ttml', 'dfxp', 'txt']
+const referenceAudioExtensions = ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma']
 
 const addedVoiceKeys = computed(() => {
   return new Set(
@@ -799,7 +831,16 @@ const canSubmitSelectedVoice = computed(() => {
 })
 
 const referenceAudioSourceLabel = computed(() => {
-  return referenceAudioSourceOptions.find((option) => option.value === selectedReferenceAudioSource.value)?.label ?? ''
+  const optionLabel = referenceAudioSourceOptions.find((option) => option.value === selectedReferenceAudioSource.value)?.label ?? ''
+  if (selectedReferenceAudioSource.value === ReferenceAudioSource.CustomAudioFile && customReferenceAudioPath.value) {
+    return `自定义：${fileNameFromPath(customReferenceAudioPath.value)}`
+  }
+
+  return optionLabel
+})
+
+const draftCustomReferenceAudioFileName = computed(() => {
+  return draftCustomReferenceAudioPath.value ? fileNameFromPath(draftCustomReferenceAudioPath.value) : '未选择音频'
 })
 
 const selectedMaterialSummary = computed(() => {
@@ -833,11 +874,10 @@ const shouldShowMediaSeparationView = computed(() => {
   }
 
   if (task.currentStage === 'media-separation') {
-    return true
+    return stage.status !== 'done'
   }
 
-  return stage.status === 'active' || stage.status === 'failed' || stage.status === 'interrupted' ||
-    (stage.status === 'done' && task.status === 'preprocessed')
+  return stage.status === 'active' || stage.status === 'failed' || stage.status === 'interrupted'
 })
 
 const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
@@ -903,6 +943,30 @@ const isMediaSeparationDone = computed(() => {
   return hasCoreArtifacts && hasBackgroundMusic
 })
 
+const isReferenceAudioDone = computed(() => {
+  const task = activeDubbingTask.value
+  return Boolean(
+    task?.stages.referenceAudio?.status === 'done' &&
+    hasDubbingArtifact(task, 'reference-audio-manifest'),
+  )
+})
+
+const needsCustomReferenceAudioInput = computed(() => {
+  const task = activeDubbingTask.value
+  if (
+    !task ||
+    selectedReferenceAudioSource.value !== ReferenceAudioSource.CustomAudioFile ||
+    customReferenceAudioPath.value.trim()
+  ) {
+    return false
+  }
+
+  return (
+    ['ready', 'failed', 'interrupted'].includes(task.status) ||
+    (task.status === 'preprocessed' && !isReferenceAudioDone.value)
+  )
+})
+
 const visibleDubbingStages = computed<VisibleDubbingStage[]>(() => {
   const stages = activeDubbingTask.value?.stages
   if (!stages) {
@@ -913,6 +977,7 @@ const visibleDubbingStages = computed<VisibleDubbingStage[]>(() => {
     { key: 'material', label: '素材准备', stage: stages.material },
     { key: 'subtitle-preprocess', label: '字幕预处理', stage: stages.subtitlePreprocess },
     { key: 'media-separation', label: '音视频分离', stage: stages.mediaSeparation },
+    { key: 'reference-audio', label: '参考音频生成', stage: stages.referenceAudio },
     { key: 'tts-synthesis', label: 'TTS 配音', stage: stages.ttsSynthesis },
     { key: 'audio-merge', label: '音频合成', stage: stages.audioMerge },
     { key: 'video-compose', label: '视频合成', stage: stages.videoCompose },
@@ -941,6 +1006,14 @@ const currentDubbingStage = computed(() => {
 
 const shouldShowDubbingProgress = computed(() => {
   return shouldShowMediaSeparationView.value || Boolean(currentDubbingStage.value)
+})
+
+const shouldShowDubbingStagePreview = computed(() => {
+  const stage = currentDubbingStage.value
+  return Boolean(
+    stage &&
+    (preprocessedSubtitleSegments.value.length === 0 || ['active', 'failed', 'interrupted'].includes(stage.status)),
+  )
 })
 
 const displayedDubbingProgress = computed(() => {
@@ -986,7 +1059,15 @@ const dubbingStatusText = computed(() => {
     return '等待素材'
   }
 
+  if (needsCustomReferenceAudioInput.value) {
+    return '请选择参考音频'
+  }
+
   if (activeDubbingTask.value.status === 'preprocessed') {
+    if (isReferenceAudioDone.value) {
+      return '参考音频生成完成'
+    }
+
     if (isMediaSeparationDone.value) {
       return '音视频分离完成'
     }
@@ -1022,36 +1103,23 @@ const canStartDubbing = computed(() => {
     return false
   }
 
+  if (needsCustomReferenceAudioInput.value) {
+    return true
+  }
+
   return (
     ['ready', 'failed', 'interrupted'].includes(activeDubbingTask.value.status) ||
-    (activeDubbingTask.value.status === 'preprocessed' && !isMediaSeparationDone.value)
+    (activeDubbingTask.value.status === 'preprocessed' && !isReferenceAudioDone.value)
   )
 })
 
-const startDubbingButtonText = computed(() => {
-  if (isPreparingMaterial.value) {
-    return '准备素材'
-  }
-
-  if (isDubbingRunning.value) {
-    return '处理中'
-  }
-
-  if (activeDubbingTask.value && ['failed', 'interrupted'].includes(activeDubbingTask.value.status)) {
-    return '继续配音'
-  }
-
-  if (activeDubbingTask.value?.status === 'preprocessed' && !isMediaSeparationDone.value) {
-    return '继续分离'
-  }
-
-  return '开始配音'
-})
+const startDubbingButtonText = computed(() => '开始配音')
 
 const createSettingsSnapshot = (): AppSettings => ({
   ...currentSettings.value,
   dubbingTtsIntervalMs: ttsIntervalMs.value,
   dubbingReferenceAudioSource: selectedReferenceAudioSource.value,
+  dubbingCustomReferenceAudioPath: customReferenceAudioPath.value,
   dubbingIsBackgroundMusicEnabled: isBackgroundMusicEnabled.value,
   dubbingBackgroundMusicVolume: backgroundMusicVolume.value,
 })
@@ -1062,6 +1130,7 @@ const applySettings = (settings: AppSettings) => {
   currentSettings.value = settings
   ttsIntervalMs.value = settings.dubbingTtsIntervalMs
   selectedReferenceAudioSource.value = settings.dubbingReferenceAudioSource
+  customReferenceAudioPath.value = settings.dubbingCustomReferenceAudioPath
   isBackgroundMusicEnabled.value = settings.dubbingIsBackgroundMusicEnabled
   backgroundMusicVolume.value = settings.dubbingBackgroundMusicVolume
 
@@ -1266,7 +1335,17 @@ const prepareDubbingMaterial = async () => {
 
 const startDubbing = async () => {
   const task = activeDubbingTask.value
-  if (!task || !canStartDubbing.value) {
+  if (!task) {
+    return
+  }
+
+  if (needsCustomReferenceAudioInput.value) {
+    dubbingError.value = ''
+    openReferenceAudioDialog()
+    return
+  }
+
+  if (!canStartDubbing.value) {
     return
   }
 
@@ -1296,6 +1375,7 @@ const startDubbing = async () => {
 const currentDubbingTaskOptions = () => ({
   ttsIntervalMs: ttsIntervalMs.value,
   referenceAudioSource: selectedReferenceAudioSource.value,
+  customReferenceAudioPath: customReferenceAudioPath.value,
   isBackgroundMusicEnabled: isBackgroundMusicEnabled.value,
   backgroundMusicVolume: backgroundMusicVolume.value,
 })
@@ -1330,6 +1410,8 @@ const clearSourceDragTarget = () => {
 }
 
 const openReferenceAudioDialog = () => {
+  draftReferenceAudioSource.value = selectedReferenceAudioSource.value
+  draftCustomReferenceAudioPath.value = customReferenceAudioPath.value
   isReferenceAudioDialogOpen.value = true
 }
 
@@ -1337,9 +1419,45 @@ const closeReferenceAudioDialog = () => {
   isReferenceAudioDialogOpen.value = false
 }
 
-const selectReferenceAudioSource = (source: ReferenceAudioSource) => {
-  selectedReferenceAudioSource.value = source
+const confirmReferenceAudioDialog = () => {
+  selectedReferenceAudioSource.value = draftReferenceAudioSource.value
+  customReferenceAudioPath.value = draftCustomReferenceAudioPath.value
   closeReferenceAudioDialog()
+}
+
+const selectReferenceAudioSource = (source: ReferenceAudioSource) => {
+  draftReferenceAudioSource.value = source
+}
+
+const selectCustomReferenceAudioFile = async () => {
+  if (!isTauriRuntime()) {
+    dubbingError.value = '请在桌面应用中选择参考音频'
+    return
+  }
+
+  try {
+    const selected = await open({
+      title: '选择参考音频',
+      multiple: false,
+      filters: [
+        {
+          name: '音频文件',
+          extensions: referenceAudioExtensions,
+        },
+      ],
+    })
+
+    if (typeof selected === 'string') {
+      draftCustomReferenceAudioPath.value = selected
+      draftReferenceAudioSource.value = ReferenceAudioSource.CustomAudioFile
+    }
+  } catch (error) {
+    dubbingError.value = stringifyError(error, '选择参考音频失败')
+  }
+}
+
+const clearCustomReferenceAudioFile = () => {
+  draftCustomReferenceAudioPath.value = ''
 }
 
 const selectEngine = (engine: DubbingEngineKind) => {

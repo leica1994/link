@@ -634,7 +634,7 @@
         @click.self="closeReferenceAudioDialog"
       >
         <section
-          class="settings-dialog"
+          class="settings-dialog reference-audio-dialog"
           role="dialog"
           aria-modal="true"
           aria-labelledby="reference-audio-dialog-title"
@@ -645,16 +645,40 @@
               v-for="option in referenceAudioSourceOptions"
               :key="option.value"
               class="dialog-option"
-              :class="{ active: selectedReferenceAudioSource === option.value }"
+              :class="{ active: draftReferenceAudioSource === option.value }"
               type="button"
               role="radio"
-              :aria-checked="selectedReferenceAudioSource === option.value"
+              :aria-checked="draftReferenceAudioSource === option.value"
               @click="selectReferenceAudioSource(option.value)"
             >
               <span class="dialog-radio" aria-hidden="true" />
               <span>{{ option.label }}</span>
             </button>
           </div>
+
+          <div v-if="draftReferenceAudioSource === ReferenceAudioSource.CustomAudioFile" class="reference-audio-picker">
+            <div class="reference-audio-file">
+              <FileMusic :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ draftCustomReferenceAudioFileName }}</span>
+              <button
+                v-if="draftCustomReferenceAudioPath"
+                class="reference-audio-clear-button"
+                type="button"
+                aria-label="取消选择参考音频"
+                @click="clearCustomReferenceAudioFile"
+              >
+                <X :stroke-width="2.4" aria-hidden="true" />
+              </button>
+            </div>
+            <button class="settings-action" type="button" @click="selectCustomReferenceAudioFile">
+              选择音频
+            </button>
+          </div>
+
+          <footer class="reference-audio-actions">
+            <button class="settings-action" type="button" @click="closeReferenceAudioDialog">取消</button>
+            <button class="settings-action" type="button" @click="confirmReferenceAudioDialog">确认</button>
+          </footer>
         </section>
       </div>
 
@@ -705,6 +729,7 @@
 
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import {
@@ -737,6 +762,7 @@ import {
   Timer,
   Volume2,
   WandSparkles,
+  X,
 } from 'lucide-vue-next'
 import { useTheme } from '../composables/useTheme'
 
@@ -831,6 +857,7 @@ type AppSettings = {
   targetLanguage: string
   dubbingTtsIntervalMs: number
   dubbingReferenceAudioSource: ReferenceAudioSource
+  dubbingCustomReferenceAudioPath: string
   dubbingIsBackgroundMusicEnabled: boolean
   dubbingBackgroundMusicVolume: number
 }
@@ -1242,6 +1269,8 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
     referenceAudioSourceOptions,
     ReferenceAudioSource.ExistingDubbing,
   ),
+  dubbingCustomReferenceAudioPath:
+    typeof settings.dubbingCustomReferenceAudioPath === 'string' ? settings.dubbingCustomReferenceAudioPath : '',
   dubbingIsBackgroundMusicEnabled:
     typeof settings.dubbingIsBackgroundMusicEnabled === 'boolean'
       ? settings.dubbingIsBackgroundMusicEnabled
@@ -1279,6 +1308,9 @@ const isTargetLanguageDialogOpen = ref(false)
 const targetLanguageSearch = ref('')
 const dubbingTtsIntervalMs = ref(150)
 const selectedReferenceAudioSource = ref<ReferenceAudioSource>(ReferenceAudioSource.ExistingDubbing)
+const dubbingCustomReferenceAudioPath = ref('')
+const draftReferenceAudioSource = ref<ReferenceAudioSource>(ReferenceAudioSource.ExistingDubbing)
+const draftCustomReferenceAudioPath = ref('')
 const isReferenceAudioDialogOpen = ref(false)
 const dubbingIsBackgroundMusicEnabled = ref(true)
 const dubbingBackgroundMusicVolume = ref(0.5)
@@ -1288,6 +1320,7 @@ let isApplyingStoredSettings = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
+const referenceAudioExtensions = ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma']
 
 const getCurrentLlmConfig = () => {
   return llmConfigs.value[selectedLlmService.value]
@@ -1376,6 +1409,10 @@ const referenceAudioSourceLabel = computed(() => {
   return referenceAudioSourceOptions.find((option) => option.value === selectedReferenceAudioSource.value)?.label ?? ''
 })
 
+const draftCustomReferenceAudioFileName = computed(() => {
+  return draftCustomReferenceAudioPath.value ? fileNameFromPath(draftCustomReferenceAudioPath.value) : '未选择音频'
+})
+
 const filteredTargetLanguageOptions = computed(() => {
   const query = targetLanguageSearch.value.trim().toLowerCase()
 
@@ -1409,6 +1446,7 @@ const createSettingsSnapshot = (): AppSettings => ({
   targetLanguage: selectedTargetLanguage.value,
   dubbingTtsIntervalMs: dubbingTtsIntervalMs.value,
   dubbingReferenceAudioSource: selectedReferenceAudioSource.value,
+  dubbingCustomReferenceAudioPath: dubbingCustomReferenceAudioPath.value,
   dubbingIsBackgroundMusicEnabled: dubbingIsBackgroundMusicEnabled.value,
   dubbingBackgroundMusicVolume: dubbingBackgroundMusicVolume.value,
 })
@@ -1436,6 +1474,7 @@ const applySettings = (settings: AppSettings) => {
   selectedTargetLanguage.value = settings.targetLanguage
   dubbingTtsIntervalMs.value = settings.dubbingTtsIntervalMs
   selectedReferenceAudioSource.value = settings.dubbingReferenceAudioSource
+  dubbingCustomReferenceAudioPath.value = settings.dubbingCustomReferenceAudioPath
   dubbingIsBackgroundMusicEnabled.value = settings.dubbingIsBackgroundMusicEnabled
   dubbingBackgroundMusicVolume.value = settings.dubbingBackgroundMusicVolume
   resetLlmConnectionStatus()
@@ -1616,6 +1655,8 @@ const selectVideoContentType = (type: VideoContentType) => {
 }
 
 const openReferenceAudioDialog = () => {
+  draftReferenceAudioSource.value = selectedReferenceAudioSource.value
+  draftCustomReferenceAudioPath.value = dubbingCustomReferenceAudioPath.value
   isReferenceAudioDialogOpen.value = true
 }
 
@@ -1623,9 +1664,40 @@ const closeReferenceAudioDialog = () => {
   isReferenceAudioDialogOpen.value = false
 }
 
-const selectReferenceAudioSource = (source: ReferenceAudioSource) => {
-  selectedReferenceAudioSource.value = source
+const confirmReferenceAudioDialog = () => {
+  selectedReferenceAudioSource.value = draftReferenceAudioSource.value
+  dubbingCustomReferenceAudioPath.value = draftCustomReferenceAudioPath.value
   closeReferenceAudioDialog()
+}
+
+const selectReferenceAudioSource = (source: ReferenceAudioSource) => {
+  draftReferenceAudioSource.value = source
+}
+
+const selectCustomReferenceAudioFile = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  const selected = await open({
+    title: '选择参考音频',
+    multiple: false,
+    filters: [
+      {
+        name: '音频文件',
+        extensions: referenceAudioExtensions,
+      },
+    ],
+  })
+
+  if (typeof selected === 'string') {
+    draftCustomReferenceAudioPath.value = selected
+    draftReferenceAudioSource.value = ReferenceAudioSource.CustomAudioFile
+  }
+}
+
+const clearCustomReferenceAudioFile = () => {
+  draftCustomReferenceAudioPath.value = ''
 }
 
 const openTargetLanguageDialog = () => {
@@ -1640,6 +1712,11 @@ const closeTargetLanguageDialog = () => {
 const selectTargetLanguage = (language: string) => {
   selectedTargetLanguage.value = language
   closeTargetLanguageDialog()
+}
+
+const fileNameFromPath = (path: string) => {
+  const normalizedPath = path.replace(/\\/g, '/')
+  return normalizedPath.split('/').filter(Boolean).pop() ?? path
 }
 
 const handleKeydown = (event: KeyboardEvent) => {

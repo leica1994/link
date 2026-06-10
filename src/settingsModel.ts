@@ -83,6 +83,7 @@ export type AppSettings = {
   targetLanguage: string
   dubbingTtsIntervalMs: number
   dubbingReferenceAudioSource: ReferenceAudioSource
+  dubbingCustomReferenceAudioPath: string
   dubbingIsBackgroundMusicEnabled: boolean
   dubbingBackgroundMusicVolume: number
 }
@@ -502,6 +503,8 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
     referenceAudioSourceOptions,
     ReferenceAudioSource.ExistingDubbing,
   ),
+  dubbingCustomReferenceAudioPath:
+    typeof settings.dubbingCustomReferenceAudioPath === 'string' ? settings.dubbingCustomReferenceAudioPath : '',
   dubbingIsBackgroundMusicEnabled:
     typeof settings.dubbingIsBackgroundMusicEnabled === 'boolean'
       ? settings.dubbingIsBackgroundMusicEnabled

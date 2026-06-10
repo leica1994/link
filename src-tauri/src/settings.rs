@@ -43,6 +43,7 @@ pub struct AppSettings {
     pub target_language: String,
     pub dubbing_tts_interval_ms: u32,
     pub dubbing_reference_audio_source: String,
+    pub dubbing_custom_reference_audio_path: String,
     pub dubbing_is_background_music_enabled: bool,
     pub dubbing_background_music_volume: f64,
 }
@@ -140,6 +141,11 @@ impl SettingsStore {
                 &setting_values,
                 "dubbing_reference_audio_source",
                 "existing-dubbing",
+            ),
+            dubbing_custom_reference_audio_path: read_string_setting(
+                &setting_values,
+                "dubbing_custom_reference_audio_path",
+                "",
             ),
             dubbing_is_background_music_enabled: read_bool_setting(
                 &setting_values,
@@ -253,6 +259,11 @@ impl SettingsStore {
             &transaction,
             "dubbing_reference_audio_source",
             &settings.dubbing_reference_audio_source,
+        )?;
+        upsert_setting(
+            &transaction,
+            "dubbing_custom_reference_audio_path",
+            &settings.dubbing_custom_reference_audio_path,
         )?;
         upsert_setting(
             &transaction,
