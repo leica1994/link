@@ -1,0 +1,4 @@
+[env]
+# Keep LibTorch inference on CUDA without requiring a Python/PyTorch environment.
+# torch-sys uses this only when LIBTORCH is not already set.
+TORCH_CUDA_VERSION = { value = "cu128", force = false }

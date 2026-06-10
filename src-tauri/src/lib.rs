@@ -2,6 +2,7 @@ mod ai;
 mod app_log;
 mod app_paths;
 mod dubbing;
+mod htdemucs;
 mod settings;
 mod subtitle_ai;
 mod subtitle_translation;
@@ -14,12 +15,9 @@ use dubbing::{
     prepare_dubbing_material, preview_dubbing_voice, set_dubbing_model_enabled, start_dubbing_task,
 };
 use settings::{load_settings, save_settings, SettingsStore};
-use std::env;
 use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
 use tauri::{Manager, WebviewWindowBuilder};
 use transcription::{save_transcription_file, start_transcription};
-
-const STEM_SPLITTER_CACHE_DIR_ENV: &str = "STEM_SPLITTER_CORE_CACHE_DIR";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,10 +25,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let stem_splitter_cache_dir =
-                app_paths::stem_splitter_cache_dir().map_err(setup_error)?;
-            env::set_var(STEM_SPLITTER_CACHE_DIR_ENV, &stem_splitter_cache_dir);
-
             let store = SettingsStore::new(app.handle()).map_err(|error| {
                 Box::<dyn std::error::Error>::from(std::io::Error::new(
                     std::io::ErrorKind::Other,

@@ -8,17 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use stem_splitter_core::{
-    set_download_progress_callback, set_split_progress_callback, split_file, SplitOptions,
-    SplitProgress,
-};
 use tauri::{AppHandle, Emitter, Manager};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
@@ -26,6 +21,7 @@ use uuid::Uuid;
 
 use crate::app_log::AppLogger;
 use crate::app_paths;
+use crate::htdemucs::{self, HtDemucsProgress};
 use crate::settings::SettingsStore;
 use crate::transcription::{serialize_subtitle, SubtitleFormat, TranscriptionSegment};
 
@@ -70,16 +66,7 @@ const DUBBING_SUBTITLE_EXTENSIONS: &[&str] = &[
 ];
 const MIN_DUBBING_SUBTITLE_DURATION_MS: u64 = 100;
 const DEFAULT_DUBBING_TEXT_DURATION_MS: u64 = 3_000;
-const BACKGROUND_MUSIC_MODEL: &str = "htdemucs_ort_v1";
-const BACKGROUND_MUSIC_MODEL_MANIFEST_URL: &str =
-    "https://hf-mirror.com/gentij/htdemucs-ort/resolve/main/manifest.json";
-const BACKGROUND_MUSIC_MODEL_ARTIFACT_URL: &str =
-    "https://hf-mirror.com/gentij/htdemucs-ort/resolve/main/htdemucs.ort";
-const BACKGROUND_MUSIC_MODEL_CACHE_FILE: &str = "HTDemucs-ORT-09dc1655.ort";
-const STEM_SPLITTER_CACHE_DIR_ENV: &str = "STEM_SPLITTER_CORE_CACHE_DIR";
-const BACKGROUND_MUSIC_MODEL_SHA256: &str =
-    "09dc165512d8ef7480bcb2cacea9dda82d571f8dbf421d8c44a2ca5568bec729";
-const BACKGROUND_MUSIC_MODEL_SIZE_BYTES: u64 = 209_884_896;
+const BACKGROUND_MUSIC_METHOD: &str = "libtorch-htdemucs";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -271,12 +258,6 @@ struct DubbingMediaSeparationResult {
     source_audio_path: PathBuf,
     background_music_path: Option<PathBuf>,
     warnings: Vec<String>,
-}
-
-struct StemSplitPaths {
-    drums_path: PathBuf,
-    bass_path: PathBuf,
-    other_path: PathBuf,
 }
 
 struct DubbingSubtitleInput {
@@ -872,8 +853,8 @@ fn start_dubbing_task_blocking(
                         background_music_path,
                         json!({
                             "format": "wav",
-                            "method": "stem-splitter-core",
-                            "model": BACKGROUND_MUSIC_MODEL,
+                            "method": BACKGROUND_MUSIC_METHOD,
+                            "model": htdemucs::MODEL_ID,
                             "stems": ["drums", "bass", "other"],
                             "volume": options.background_music_volume,
                         }),
@@ -1653,9 +1634,9 @@ fn background_music_artifact_file_exists(snapshot: &DubbingTaskSnapshot) -> bool
     snapshot.artifacts.iter().any(|artifact| {
         artifact.kind == DUBBING_ARTIFACT_BACKGROUND_MUSIC
             && Path::new(&artifact.path).is_file()
-            && artifact.metadata.get("method").and_then(Value::as_str) == Some("stem-splitter-core")
-            && artifact.metadata.get("model").and_then(Value::as_str)
-                == Some(BACKGROUND_MUSIC_MODEL)
+            && artifact.metadata.get("method").and_then(Value::as_str)
+                == Some(BACKGROUND_MUSIC_METHOD)
+            && artifact.metadata.get("model").and_then(Value::as_str) == Some(htdemucs::MODEL_ID)
     })
 }
 
@@ -1965,210 +1946,20 @@ fn split_background_music_stems(
     source_audio_path: &Path,
     output_dir: &Path,
     progress: &MediaSeparationProgress,
-) -> Result<StemSplitPaths, String> {
-    ensure_background_music_model_cached_from_mirror(progress)?;
-    progress.set(78, "启动背景音乐分离模型")?;
-    install_background_music_progress_callbacks(progress);
-
-    let result = split_file(
-        &path_to_string(source_audio_path),
-        SplitOptions {
-            output_dir: path_to_string(output_dir),
-            model_name: BACKGROUND_MUSIC_MODEL.to_string(),
-            manifest_url_override: Some(BACKGROUND_MUSIC_MODEL_MANIFEST_URL.to_string()),
-        },
-    )
+) -> Result<htdemucs::StemPaths, String> {
+    let stem_paths = htdemucs::split_file(source_audio_path, output_dir, |event| {
+        if let Some((progress_value, message)) = background_music_split_progress_message(event) {
+            progress.set(progress_value, &message)?;
+        }
+        Ok(())
+    })
     .map_err(|error| format!("背景音乐分离失败: {error}"))?;
-
-    let stem_paths = StemSplitPaths {
-        drums_path: PathBuf::from(result.drums_path),
-        bass_path: PathBuf::from(result.bass_path),
-        other_path: PathBuf::from(result.other_path),
-    };
 
     ensure_non_empty_file(&stem_paths.drums_path, "鼓组分离结果为空")?;
     ensure_non_empty_file(&stem_paths.bass_path, "贝斯分离结果为空")?;
     ensure_non_empty_file(&stem_paths.other_path, "其他伴奏分离结果为空")?;
 
     Ok(stem_paths)
-}
-
-fn ensure_background_music_model_cached_from_mirror(
-    progress: &MediaSeparationProgress,
-) -> Result<(), String> {
-    let cache_root = background_music_model_cache_root()?;
-    set_stem_splitter_cache_dir(&cache_root);
-    let model_path = background_music_model_cache_path(&cache_root)?;
-
-    progress.set(69, "检查背景音乐分离模型")?;
-    if background_music_model_cache_is_valid(&model_path)? {
-        progress.set(77, "背景音乐分离模型已就绪")?;
-        return Ok(());
-    }
-
-    if model_path.exists() {
-        progress.set(69, "更新背景音乐分离模型缓存")?;
-        fs::remove_file(&model_path)
-            .map_err(|error| format!("无法更新背景音乐分离模型缓存: {error}"))?;
-    }
-
-    download_background_music_model_from_mirror(&model_path, progress)?;
-    progress.set(76, "校验背景音乐分离模型")?;
-    if background_music_model_cache_is_valid(&model_path)? {
-        progress.set(77, "背景音乐分离模型已就绪")?;
-        Ok(())
-    } else {
-        Err("背景音乐分离模型校验失败，请重试下载".to_string())
-    }
-}
-
-fn background_music_model_cache_root() -> Result<PathBuf, String> {
-    app_paths::stem_splitter_cache_dir()
-}
-
-fn set_stem_splitter_cache_dir(cache_root: &Path) {
-    env::set_var(STEM_SPLITTER_CACHE_DIR_ENV, cache_root);
-}
-
-fn background_music_model_cache_path(cache_root: &Path) -> Result<PathBuf, String> {
-    let cache_dir = cache_root.join("models");
-    fs::create_dir_all(&cache_dir)
-        .map_err(|error| format!("无法创建背景音乐分离模型缓存目录: {error}"))?;
-
-    Ok(cache_dir.join(BACKGROUND_MUSIC_MODEL_CACHE_FILE))
-}
-
-fn background_music_model_cache_is_valid(path: &Path) -> Result<bool, String> {
-    if !path.is_file() {
-        return Ok(false);
-    }
-
-    let metadata =
-        fs::metadata(path).map_err(|error| format!("无法读取背景音乐分离模型缓存: {error}"))?;
-    if metadata.len() != BACKGROUND_MUSIC_MODEL_SIZE_BYTES {
-        return Ok(false);
-    }
-
-    Ok(file_sha256_hex(path)? == BACKGROUND_MUSIC_MODEL_SHA256)
-}
-
-fn file_sha256_hex(path: &Path) -> Result<String, String> {
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("无法读取背景音乐分离模型缓存: {error}"))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-
-    loop {
-        let bytes_read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("无法校验背景音乐分离模型缓存: {error}"))?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn download_background_music_model_from_mirror(
-    output_path: &Path,
-    progress: &MediaSeparationProgress,
-) -> Result<(), String> {
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("无法创建背景音乐分离模型缓存目录: {error}"))?;
-    }
-
-    let temp_path = output_path.with_extension("part");
-    if temp_path.exists() {
-        fs::remove_file(&temp_path)
-            .map_err(|error| format!("无法清理背景音乐分离模型临时文件: {error}"))?;
-    }
-
-    let result = (|| {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(60 * 60))
-            .build()
-            .map_err(|error| format!("无法创建背景音乐分离模型下载客户端: {error}"))?;
-        let mut response = client
-            .get(BACKGROUND_MUSIC_MODEL_ARTIFACT_URL)
-            .send()
-            .map_err(|error| format!("无法下载背景音乐分离模型: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("背景音乐分离模型下载失败: {error}"))?;
-        let total = response
-            .content_length()
-            .unwrap_or(BACKGROUND_MUSIC_MODEL_SIZE_BYTES);
-        let mut file = fs::File::create(&temp_path)
-            .map_err(|error| format!("无法写入背景音乐分离模型缓存: {error}"))?;
-        let mut downloaded = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-
-        progress.set(70, "下载背景音乐分离模型 0%")?;
-        loop {
-            let bytes_read = response
-                .read(&mut buffer)
-                .map_err(|error| format!("无法读取背景音乐分离模型下载数据: {error}"))?;
-            if bytes_read == 0 {
-                break;
-            }
-            file.write_all(&buffer[..bytes_read])
-                .map_err(|error| format!("无法保存背景音乐分离模型缓存: {error}"))?;
-            downloaded += bytes_read as u64;
-            progress.set(
-                background_music_model_download_progress(downloaded, total),
-                &format!(
-                    "下载背景音乐分离模型 {}%",
-                    transfer_percent(downloaded, total)
-                ),
-            )?;
-        }
-        file.flush()
-            .map_err(|error| format!("无法保存背景音乐分离模型缓存: {error}"))?;
-
-        if downloaded != BACKGROUND_MUSIC_MODEL_SIZE_BYTES {
-            return Err(format!(
-                "背景音乐分离模型下载不完整，期望 {} 字节，实际 {} 字节",
-                BACKGROUND_MUSIC_MODEL_SIZE_BYTES, downloaded
-            ));
-        }
-
-        fs::rename(&temp_path, output_path)
-            .map_err(|error| format!("无法更新背景音乐分离模型缓存: {error}"))
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-
-    result
-}
-
-fn install_background_music_progress_callbacks(progress: &MediaSeparationProgress) {
-    let download_progress = progress.clone();
-    set_download_progress_callback(move |downloaded, total| {
-        let total = if total == 0 {
-            BACKGROUND_MUSIC_MODEL_SIZE_BYTES
-        } else {
-            total
-        };
-        let _ = download_progress.set(
-            background_music_model_download_progress(downloaded, total),
-            &format!(
-                "下载背景音乐分离模型 {}%",
-                transfer_percent(downloaded, total)
-            ),
-        );
-    });
-
-    let split_progress = progress.clone();
-    set_split_progress_callback(move |event| {
-        if let Some((progress, message)) = background_music_split_progress_message(event) {
-            let _ = split_progress.set(progress, &message);
-        }
-    });
 }
 
 fn background_music_model_download_progress(downloaded: u64, total: u64) -> u8 {
@@ -2184,37 +1975,35 @@ fn transfer_percent(done: u64, total: u64) -> u64 {
     ((done.min(total) as f64 / total as f64) * 100.0).round() as u64
 }
 
-fn background_music_split_progress_message(event: SplitProgress) -> Option<(u8, String)> {
+fn background_music_split_progress_message(event: HtDemucsProgress) -> Option<(u8, String)> {
     match event {
-        SplitProgress::Stage(stage) => match stage {
-            "resolve_model" => Some((78, "解析背景音乐分离模型".to_string())),
-            "engine_preload" => Some((80, "加载背景音乐分离模型".to_string())),
-            "read_audio" => Some((82, "读取源音频".to_string())),
-            "infer" => Some((84, "分离背景音乐音轨".to_string())),
-            "write_stems" => Some((94, "写入分离音轨".to_string())),
-            "finalize" => Some((96, "整理分离结果".to_string())),
-            _ => None,
-        },
-        SplitProgress::Chunks { percent, .. } => {
+        HtDemucsProgress::CheckingModel => Some((69, "检查背景音乐分离模型".to_string())),
+        HtDemucsProgress::DownloadingModel { downloaded, total } => Some((
+            background_music_model_download_progress(downloaded, total),
+            format!(
+                "下载背景音乐分离模型 {}%",
+                transfer_percent(downloaded, total)
+            ),
+        )),
+        HtDemucsProgress::VerifyingModel => Some((76, "校验背景音乐分离模型".to_string())),
+        HtDemucsProgress::ModelReady => Some((77, "背景音乐分离模型已就绪".to_string())),
+        HtDemucsProgress::LoadingModel { device } => {
+            Some((80, format!("加载背景音乐分离模型 ({device})")))
+        }
+        HtDemucsProgress::ReadingAudio => Some((82, "读取源音频".to_string())),
+        HtDemucsProgress::Inferencing { percent } => {
             let progress = (84.0 + (percent.clamp(0.0, 100.0) * 0.10)).round() as u8;
             Some((
                 progress.min(94),
                 format!("分离背景音乐音轨 {:.0}%", percent),
             ))
         }
-        SplitProgress::Writing { stem, percent, .. } => {
-            let progress = (94.0 + (percent.clamp(0.0, 100.0) * 0.02)).round() as u8;
-            Some((
-                progress.min(96),
-                format!("写入{}音轨 {:.0}%", stem, percent),
-            ))
-        }
-        SplitProgress::Finished => Some((96, "背景音乐音轨分离完成".to_string())),
+        HtDemucsProgress::Finished => Some((96, "背景音乐音轨分离完成".to_string())),
     }
 }
 
 fn mix_background_music_stems(
-    stem_paths: &StemSplitPaths,
+    stem_paths: &htdemucs::StemPaths,
     output_path: &Path,
 ) -> Result<(), String> {
     run_ffmpeg_command(

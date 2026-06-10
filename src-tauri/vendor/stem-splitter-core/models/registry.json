@@ -1,9 +1,0 @@
-{
-  "default": "htdemucs_ort_v1",
-  "models": [
-    {
-      "name": "htdemucs_ort_v1",
-      "manifest": "https://huggingface.co/gentij/htdemucs-ort/resolve/main/manifest.json"
-    }
-  ]
-}
