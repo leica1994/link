@@ -730,8 +730,11 @@ type DubbingReferenceAudioItem = {
   index: number
   uid?: string
   path: string
+  rawDurationMs?: number
   audioDurationMs?: number
   fileSize?: number
+  rmsAmplitude?: number
+  silenceRatio?: number
   detectedSilence?: boolean
   detectedShort?: boolean
   isSilence?: boolean
@@ -1893,7 +1896,20 @@ const referenceAudioDetailLabel = (item?: DubbingReferenceAudioItem) => {
     return ''
   }
 
-  const details = [formatDurationLabel(item.audioDurationMs)]
+  const details: string[] = []
+  const audioDurationLabel = formatDurationLabel(item.audioDurationMs)
+  const rawDurationLabel = formatDurationLabel(item.rawDurationMs)
+  if (audioDurationLabel) {
+    details.push(`参考 ${audioDurationLabel}`)
+  }
+  if (
+    rawDurationLabel &&
+    item.rawDurationMs !== undefined &&
+    item.audioDurationMs !== undefined &&
+    Math.abs(item.rawDurationMs - item.audioDurationMs) >= 50
+  ) {
+    details.push(`原始 ${rawDurationLabel}`)
+  }
   if (typeof item.replacedWith === 'number') {
     details.push(`源 ${item.replacedWith + 1}`)
   } else if (item.trimFallback) {
@@ -1927,8 +1943,11 @@ const readReferenceAudioItem = (value: unknown): DubbingReferenceAudioItem | nul
     index,
     uid: readStringValue(value.uid),
     path: readStringValue(value.path) ?? '',
+    rawDurationMs: readNumberValue(value.rawDurationMs),
     audioDurationMs: readNumberValue(value.audioDurationMs),
     fileSize: readNumberValue(value.fileSize),
+    rmsAmplitude: readNumberValue(value.rmsAmplitude),
+    silenceRatio: readNumberValue(value.silenceRatio),
     detectedSilence: readBooleanValue(value.detectedSilence),
     detectedShort: readBooleanValue(value.detectedShort),
     isSilence: readBooleanValue(value.isSilence),

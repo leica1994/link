@@ -70,10 +70,11 @@ const DUBBING_SUBTITLE_EXTENSIONS: &[&str] = &[
 ];
 const DUBBING_AUDIO_EXTENSIONS: &[&str] =
     &["wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma"];
-const REFERENCE_AUDIO_POST_PROCESSING_VERSION: u32 = 1;
-const REFERENCE_AUDIO_TRIM_THRESHOLD_DB: f64 = -45.0;
-const REFERENCE_AUDIO_SILENCE_MEAN_DB: f64 = -45.0;
-const REFERENCE_AUDIO_SILENCE_MAX_DB: f64 = -35.0;
+const REFERENCE_AUDIO_POST_PROCESSING_VERSION: u32 = 2;
+const REFERENCE_AUDIO_TRIM_AMPLITUDE_THRESHOLD: f32 = 0.01;
+const REFERENCE_AUDIO_SILENCE_AMPLITUDE_THRESHOLD: f32 = 0.01;
+const REFERENCE_AUDIO_SILENCE_RMS_THRESHOLD: f64 = 0.005;
+const REFERENCE_AUDIO_SILENCE_RATIO_THRESHOLD: f64 = 0.8;
 const REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS: u64 = 200;
 const REFERENCE_AUDIO_MIN_DURATION_MS: u64 = 1_000;
 const REFERENCE_AUDIO_TARGET_LUFS: f64 = -16.0;
@@ -312,6 +313,8 @@ struct ReferenceAudioClip {
     file_size: u64,
     mean_volume_db: Option<f64>,
     max_volume_db: Option<f64>,
+    rms_amplitude: Option<f64>,
+    silence_ratio: Option<f64>,
     detected_silence: bool,
     detected_short: bool,
     is_silence: bool,
@@ -332,6 +335,15 @@ struct BackgroundMusicSeparationResult {
 struct DubbingSubtitleInput {
     segments: Vec<TranscriptionSegment>,
     warnings: Vec<String>,
+}
+
+struct ReferenceAudioTrimResult {
+    trim_fallback: bool,
+}
+
+struct ReferenceAudioStats {
+    rms_amplitude: f64,
+    silence_ratio: f64,
 }
 
 struct AssMergedCue {
@@ -2385,12 +2397,13 @@ fn generate_existing_reference_audio(
         "manifestPath": path_to_string(&manifest_path),
         "trimSilence": {
             "enabled": true,
-            "thresholdDb": REFERENCE_AUDIO_TRIM_THRESHOLD_DB,
+            "amplitudeThreshold": REFERENCE_AUDIO_TRIM_AMPLITUDE_THRESHOLD,
             "minTrimmedDurationMs": REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS,
         },
         "silenceDetection": {
-            "meanVolumeThresholdDb": REFERENCE_AUDIO_SILENCE_MEAN_DB,
-            "maxVolumeThresholdDb": REFERENCE_AUDIO_SILENCE_MAX_DB,
+            "amplitudeThreshold": REFERENCE_AUDIO_SILENCE_AMPLITUDE_THRESHOLD,
+            "rmsThreshold": REFERENCE_AUDIO_SILENCE_RMS_THRESHOLD,
+            "silenceRatioThreshold": REFERENCE_AUDIO_SILENCE_RATIO_THRESHOLD,
             "detectedCount": clips.iter().filter(|clip| clip.detected_silence).count(),
             "replacedCount": clips.iter().filter(|clip| clip.silence_replaced).count(),
             "remainingCount": clips.iter().filter(|clip| clip.is_silence).count(),
@@ -2648,11 +2661,22 @@ fn post_process_reference_audio_clip(
         .unwrap_or_else(|_| segment.end_time.saturating_sub(segment.start_time));
     let trimmed_path = reference_audio_temp_path(output_path, "trimmed");
     let mut trim_fallback = false;
+    let raw_stats = reference_audio_stats(raw_path).ok();
+    let raw_is_silence = raw_stats
+        .as_ref()
+        .is_some_and(|stats| is_reference_audio_silence(stats.rms_amplitude, stats.silence_ratio));
 
-    let should_use_raw = match trim_reference_audio_silence(raw_path, &trimmed_path) {
-        Ok(()) => {
+    let trim_result = trim_reference_audio_silence(raw_path, &trimmed_path);
+    let should_use_raw = match &trim_result {
+        Ok(_) => {
             let trimmed_duration_ms = probe_audio_duration_ms(&trimmed_path).unwrap_or_default();
-            trimmed_duration_ms < REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS
+            let raw_can_drive_tts =
+                raw_duration_ms >= REFERENCE_AUDIO_MIN_DURATION_MS && !raw_is_silence;
+            let trimmed_too_short_for_tts = trimmed_duration_ms < REFERENCE_AUDIO_MIN_DURATION_MS;
+            let over_trimmed = trimmed_duration_ms < REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS
+                && raw_duration_ms > trimmed_duration_ms;
+
+            (trimmed_too_short_for_tts && raw_can_drive_tts) || over_trimmed
         }
         Err(_) => true,
     };
@@ -2666,6 +2690,9 @@ fn post_process_reference_audio_clip(
         fs::copy(&trimmed_path, output_path)
             .map_err(|error| format!("无法写入裁静音参考音频: {error}"))?;
         let _ = fs::remove_file(&trimmed_path);
+        if let Ok(result) = trim_result {
+            trim_fallback = result.trim_fallback;
+        }
     }
     ensure_non_empty_file(output_path, "参考音频切片为空")?;
 
@@ -2673,7 +2700,12 @@ fn post_process_reference_audio_clip(
     let file_size = file_size(output_path).unwrap_or_default();
     let (mean_volume_db, max_volume_db) =
         probe_audio_volume_db(output_path).unwrap_or((None, None));
-    let is_silence = is_reference_audio_silence(mean_volume_db, max_volume_db);
+    let audio_stats = reference_audio_stats(output_path).ok();
+    let rms_amplitude = audio_stats.as_ref().map(|stats| stats.rms_amplitude);
+    let silence_ratio = audio_stats.as_ref().map(|stats| stats.silence_ratio);
+    let is_silence = audio_stats
+        .as_ref()
+        .is_some_and(|stats| is_reference_audio_silence(stats.rms_amplitude, stats.silence_ratio));
     let detected_short = audio_duration_ms < REFERENCE_AUDIO_MIN_DURATION_MS;
     let quality = reference_audio_quality(is_silence, audio_duration_ms, trim_fallback);
 
@@ -2689,6 +2721,8 @@ fn post_process_reference_audio_clip(
         file_size,
         mean_volume_db,
         max_volume_db,
+        rms_amplitude,
+        silence_ratio,
         detected_silence: is_silence,
         detected_short,
         is_silence,
@@ -2770,6 +2804,8 @@ fn copy_reference_clip_from_replacement(
     target.file_size = file_size(&target.path).unwrap_or(replacement.file_size);
     target.mean_volume_db = replacement.mean_volume_db;
     target.max_volume_db = replacement.max_volume_db;
+    target.rms_amplitude = replacement.rms_amplitude;
+    target.silence_ratio = replacement.silence_ratio;
     target.is_silence = false;
     target.replaced_with = Some(replacement.index);
     target.replacement_reason = Some(reason.to_string());
@@ -2804,6 +2840,13 @@ fn apply_loudnorm_to_reference_clips(
                 clip.mean_volume_db = mean_volume_db;
                 clip.max_volume_db = max_volume_db;
             }
+            if let Ok(stats) = reference_audio_stats(&clip.path) {
+                clip.rms_amplitude = Some(stats.rms_amplitude);
+                clip.silence_ratio = Some(stats.silence_ratio);
+                clip.is_silence =
+                    is_reference_audio_silence(stats.rms_amplitude, stats.silence_ratio);
+            }
+            clip.detected_short = clip.audio_duration_ms < REFERENCE_AUDIO_MIN_DURATION_MS;
             if clip.replacement_reason.is_none() {
                 clip.quality = reference_audio_quality(
                     clip.is_silence,
@@ -2851,6 +2894,8 @@ fn reference_audio_clip_metadata(clip: &ReferenceAudioClip) -> Value {
         "fileSize": clip.file_size,
         "meanVolumeDb": clip.mean_volume_db,
         "maxVolumeDb": clip.max_volume_db,
+        "rmsAmplitude": clip.rms_amplitude,
+        "silenceRatio": clip.silence_ratio,
         "detectedSilence": clip.detected_silence,
         "detectedShort": clip.detected_short,
         "isSilence": clip.is_silence,
@@ -2880,34 +2925,142 @@ fn reference_audio_quality(
     }
 }
 
-fn is_reference_audio_silence(mean_volume_db: Option<f64>, max_volume_db: Option<f64>) -> bool {
-    mean_volume_db.is_some_and(|volume| volume <= REFERENCE_AUDIO_SILENCE_MEAN_DB)
-        || max_volume_db.is_some_and(|volume| volume <= REFERENCE_AUDIO_SILENCE_MAX_DB)
+fn is_reference_audio_silence(rms_amplitude: f64, silence_ratio: f64) -> bool {
+    rms_amplitude < REFERENCE_AUDIO_SILENCE_RMS_THRESHOLD
+        || silence_ratio > REFERENCE_AUDIO_SILENCE_RATIO_THRESHOLD
 }
 
-fn trim_reference_audio_silence(input_path: &Path, output_path: &Path) -> Result<(), String> {
-    run_ffmpeg_command(
-        Command::new("ffmpeg")
-            .arg("-hide_banner")
-            .arg("-nostdin")
-            .arg("-nostats")
-            .arg("-i")
-            .arg(input_path)
-            .arg("-af")
-            .arg(format!(
-                "silenceremove=start_periods=1:start_threshold={:.1}dB:stop_periods=1:stop_threshold={:.1}dB",
-                REFERENCE_AUDIO_TRIM_THRESHOLD_DB, REFERENCE_AUDIO_TRIM_THRESHOLD_DB
-            ))
-            .arg("-acodec")
-            .arg("pcm_s16le")
-            .arg("-ar")
-            .arg("44100")
-            .arg("-ac")
-            .arg("1")
-            .arg("-y")
-            .arg(output_path),
-        "参考音频裁静音失败",
-    )
+fn trim_reference_audio_silence(
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<ReferenceAudioTrimResult, String> {
+    let mut reader =
+        hound::WavReader::open(input_path).map_err(|error| format!("无法读取参考音频: {error}"))?;
+    let spec = reader.spec();
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        fs::copy(input_path, output_path)
+            .map_err(|error| format!("无法写入参考音频切片: {error}"))?;
+        return Ok(ReferenceAudioTrimResult {
+            trim_fallback: true,
+        });
+    }
+
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法解析参考音频采样: {error}"))?;
+    if samples.is_empty() {
+        fs::copy(input_path, output_path)
+            .map_err(|error| format!("无法写入参考音频切片: {error}"))?;
+        return Ok(ReferenceAudioTrimResult {
+            trim_fallback: true,
+        });
+    }
+
+    let threshold = REFERENCE_AUDIO_TRIM_AMPLITUDE_THRESHOLD as f64;
+    let Some(first_non_silent) = samples
+        .iter()
+        .position(|sample| normalized_sample_amplitude(*sample) > threshold)
+    else {
+        write_reference_audio_samples(output_path, spec, &samples)?;
+        return Ok(ReferenceAudioTrimResult {
+            trim_fallback: true,
+        });
+    };
+    let last_non_silent = samples
+        .iter()
+        .rposition(|sample| normalized_sample_amplitude(*sample) > threshold)
+        .unwrap_or(first_non_silent);
+    let channels = usize::from(spec.channels.max(1));
+    let start_index = (first_non_silent / channels) * channels;
+    let end_index = (((last_non_silent / channels) + 1) * channels).min(samples.len());
+    let trimmed_samples = if start_index < end_index {
+        &samples[start_index..end_index]
+    } else {
+        samples.as_slice()
+    };
+    let trimmed_duration_ms = reference_audio_duration_ms(trimmed_samples.len(), spec);
+
+    if trimmed_duration_ms < REFERENCE_AUDIO_MIN_TRIMMED_DURATION_MS {
+        write_reference_audio_samples(output_path, spec, &samples)?;
+        return Ok(ReferenceAudioTrimResult {
+            trim_fallback: true,
+        });
+    }
+
+    write_reference_audio_samples(output_path, spec, trimmed_samples)?;
+    Ok(ReferenceAudioTrimResult {
+        trim_fallback: false,
+    })
+}
+
+fn write_reference_audio_samples(
+    path: &Path,
+    spec: hound::WavSpec,
+    samples: &[i16],
+) -> Result<(), String> {
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|error| format!("无法写入参考音频切片: {error}"))?;
+    for sample in samples {
+        writer
+            .write_sample(*sample)
+            .map_err(|error| format!("无法写入参考音频采样: {error}"))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| format!("无法保存参考音频切片: {error}"))
+}
+
+fn reference_audio_stats(path: &Path) -> Result<ReferenceAudioStats, String> {
+    let mut reader =
+        hound::WavReader::open(path).map_err(|error| format!("无法读取参考音频: {error}"))?;
+    let spec = reader.spec();
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err("参考音频采样格式不支持".to_string());
+    }
+
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法解析参考音频采样: {error}"))?;
+    if samples.is_empty() {
+        return Err("参考音频采样为空".to_string());
+    }
+
+    Ok(reference_audio_stats_from_samples(&samples))
+}
+
+fn reference_audio_stats_from_samples(samples: &[i16]) -> ReferenceAudioStats {
+    let mut square_sum = 0.0;
+    let mut silence_count = 0usize;
+    let silence_threshold = REFERENCE_AUDIO_SILENCE_AMPLITUDE_THRESHOLD as f64;
+
+    for sample in samples {
+        let amplitude = normalized_sample_amplitude(*sample);
+        square_sum += amplitude * amplitude;
+        if amplitude < silence_threshold {
+            silence_count += 1;
+        }
+    }
+
+    let sample_count = samples.len().max(1);
+    ReferenceAudioStats {
+        rms_amplitude: (square_sum / sample_count as f64).sqrt(),
+        silence_ratio: silence_count as f64 / sample_count as f64,
+    }
+}
+
+fn normalized_sample_amplitude(sample: i16) -> f64 {
+    (f64::from(sample) / f64::from(i16::MAX)).abs().min(1.0)
+}
+
+fn reference_audio_duration_ms(sample_count: usize, spec: hound::WavSpec) -> u64 {
+    let channels = u64::from(spec.channels.max(1));
+    let sample_rate = u64::from(spec.sample_rate.max(1));
+    let frames = sample_count as u64 / channels;
+    ((frames as f64 / sample_rate as f64) * 1000.0)
+        .round()
+        .max(0.0) as u64
 }
 
 fn apply_reference_audio_loudnorm(path: &Path) -> Result<(), String> {
