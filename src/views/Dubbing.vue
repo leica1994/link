@@ -176,15 +176,15 @@
               </div>
             </div>
 
-            <div v-if="currentDubbingStage" class="translate-progress" aria-label="配音处理进度">
+            <div v-if="shouldShowDubbingProgress" class="translate-progress" aria-label="配音处理进度">
               <div class="translate-progress-track">
                 <span
                   class="translate-progress-bar"
-                  :style="{ width: `${currentDubbingStage.progress}%` }"
+                  :style="{ width: `${displayedDubbingProgress}%` }"
                   aria-hidden="true"
                 />
               </div>
-              <span class="translate-progress-value">{{ currentDubbingStage.progress }}%</span>
+              <span class="translate-progress-value">{{ displayedDubbingProgress }}%</span>
             </div>
 
             <div v-if="dubbingErrorMessage" class="translate-alert" role="alert">
@@ -198,31 +198,38 @@
             </div>
 
             <div v-if="shouldShowMediaSeparationView" class="translate-preview dubbing-stage-page">
-              <div class="dubbing-stage-page-header">
-                <div class="dubbing-stage-page-copy">
-                  <span class="dubbing-stage-eyebrow">当前阶段</span>
-                  <strong>音视频分离</strong>
-                  <span>{{ mediaSeparationMessage }}</span>
-                </div>
-                <span class="dubbing-stage-percent">{{ mediaSeparationProgress }}%</span>
-              </div>
-
-              <div class="dubbing-stage-page-progress" aria-label="音视频分离进度">
-                <span
-                  class="dubbing-stage-page-bar"
-                  :style="{ width: `${mediaSeparationProgress}%` }"
-                  aria-hidden="true"
-                />
-              </div>
-
-              <div class="dubbing-media-steps" aria-label="音视频分离子步骤">
-                <div v-for="step in mediaSeparationSteps" :key="step.key" class="dubbing-media-step">
-                  <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
-                  <span class="dubbing-media-step-copy">
+              <div class="dubbing-media-steps" aria-label="音视频分离子阶段进度">
+                <div
+                  v-for="step in mediaSeparationSteps"
+                  :key="step.key"
+                  class="dubbing-media-step"
+                  :class="step.status"
+                >
+                  <div class="dubbing-media-step-top">
+                    <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
                     <span class="dubbing-media-step-title">{{ step.label }}</span>
-                    <span class="dubbing-media-step-subtitle">{{ step.description }}</span>
-                  </span>
-                  <span class="dubbing-media-step-status">{{ dubbingStageStatusLabel(step.status) }}</span>
+                    <span class="dubbing-media-step-status">{{ dubbingStageStatusLabel(step.status) }}</span>
+                  </div>
+
+                  <span class="dubbing-media-step-subtitle">{{ step.description }}</span>
+
+                  <div class="dubbing-media-step-progress">
+                    <span
+                      class="dubbing-media-step-track"
+                      role="progressbar"
+                      :aria-valuenow="step.progress"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      :aria-label="`${step.label}进度`"
+                    >
+                      <span
+                        class="dubbing-media-step-bar"
+                        :style="{ width: `${step.progress}%` }"
+                        aria-hidden="true"
+                      />
+                    </span>
+                    <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -696,6 +703,7 @@ type DubbingMediaStep = {
   key: string
   label: string
   description: string
+  progress: number
   status: DubbingStageStatus
 }
 
@@ -817,10 +825,6 @@ const mediaSeparationProgress = computed(() => {
   return clampProgress(mediaSeparationStage.value?.progress ?? 0)
 })
 
-const mediaSeparationMessage = computed(() => {
-  return mediaSeparationStage.value?.message || '等待音视频分离'
-})
-
 const shouldShowMediaSeparationView = computed(() => {
   const task = activeDubbingTask.value
   const stage = mediaSeparationStage.value
@@ -847,24 +851,32 @@ const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
       key: 'muted-video',
       label: '无声视频',
       description: '从源视频保留画面轨道',
+      progress: mediaStepProgress(progress, 20, 40, stageStatus),
       status: mediaStepStatus(progress, 40, 20, stageStatus),
     },
     {
       key: 'source-audio',
       label: backgroundEnabled ? '人声音频' : '源音频',
       description: backgroundEnabled ? '提取源音频并分离人声轨道' : '提取并转为后续处理音频',
+      progress: mediaStepProgress(progress, 55, 65, stageStatus),
       status: mediaStepStatus(progress, 65, 55, stageStatus),
     },
     {
       key: 'background-model',
       label: '分离模型',
       description: backgroundEnabled ? '检查、下载或加载人声/背景音乐分离模型' : '背景音乐已关闭',
+      progress: backgroundEnabled ? mediaStepProgress(progress, 69, 78, stageStatus) : 100,
       status: backgroundEnabled ? mediaStepStatus(progress, 78, 69, stageStatus) : 'done',
     },
     {
       key: 'background-music',
       label: '背景音乐',
       description: backgroundEnabled ? '分离并混合鼓组、贝斯和其他伴奏音轨' : '跳过背景音乐分离',
+      progress: backgroundEnabled
+        ? mediaStepProgress(progress, 80, 99, stageStatus)
+        : progress >= 90 || stageStatus === 'done'
+          ? 100
+          : 0,
       status: backgroundEnabled
         ? mediaStepStatus(progress, 99, 80, stageStatus)
         : progress >= 90 || stageStatus === 'done'
@@ -927,6 +939,18 @@ const currentDubbingStage = computed(() => {
   )
 })
 
+const shouldShowDubbingProgress = computed(() => {
+  return shouldShowMediaSeparationView.value || Boolean(currentDubbingStage.value)
+})
+
+const displayedDubbingProgress = computed(() => {
+  if (shouldShowMediaSeparationView.value) {
+    return mediaSeparationProgress.value
+  }
+
+  return currentDubbingStage.value?.progress ?? 0
+})
+
 const dubbingErrorMessage = computed(() => {
   return dubbingError.value || activeDubbingTask.value?.errorMessage || ''
 })
@@ -944,6 +968,10 @@ const dubbingWarningMessage = computed(() => {
 const dubbingStatusText = computed(() => {
   if (isPreparingMaterial.value) {
     return '素材准备中'
+  }
+
+  if (shouldShowMediaSeparationView.value) {
+    return '音视频分离'
   }
 
   if (dubbingErrorMessage.value) {
@@ -1710,6 +1738,23 @@ const isPointInsideElement = (point: { x: number; y: number }, element: HTMLElem
 }
 
 const clampProgress = (value: number) => Math.min(Math.max(Math.round(value), 0), 100)
+
+const mediaStepProgress = (
+  progress: number,
+  activeAt: number,
+  doneAt: number,
+  stageStatus: DubbingStageStatus,
+) => {
+  if (stageStatus === 'done' || progress >= doneAt) {
+    return 100
+  }
+
+  if (progress <= activeAt) {
+    return 0
+  }
+
+  return clampProgress(((progress - activeAt) / (doneAt - activeAt)) * 100)
+}
 
 const mediaStepStatus = (
   progress: number,

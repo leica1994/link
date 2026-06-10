@@ -1290,110 +1290,48 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
 }
 
 .dubbing-stage-page {
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  padding: 22px 24px;
-}
-
-.dubbing-stage-page-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
-}
-
-.dubbing-stage-page-copy {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.dubbing-stage-eyebrow {
-  color: var(--accent);
-  font-size: 12px;
-  font-weight: 850;
-  line-height: 1.2;
-}
-
-.dubbing-stage-page-copy strong {
-  color: var(--text);
-  font-size: 20px;
-  font-weight: 850;
-  line-height: 1.2;
-}
-
-.dubbing-stage-page-copy span:last-child {
-  overflow: hidden;
-  color: var(--text-muted);
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dubbing-stage-percent {
-  flex: 0 0 auto;
-  color: var(--accent);
-  font-size: 22px;
-  font-weight: 850;
-  line-height: 1.2;
-}
-
-.dubbing-stage-page-progress {
-  position: relative;
-  height: 12px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--bg-muted) 72%, transparent);
-}
-
-.dubbing-stage-page-bar {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 0;
-  border-radius: inherit;
-  background: var(--accent);
-  transition: width 160ms ease;
+  padding: 24px 36px;
 }
 
 .dubbing-media-steps {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0;
-  border: 1px solid var(--hairline);
-  border-radius: 8px;
-  overflow: hidden;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .dubbing-media-step {
-  display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  min-height: 86px;
-  padding: 16px;
+  display: flex;
+  min-width: 0;
+  min-height: 112px;
+  flex-direction: column;
+  gap: 10px;
+  padding: 15px 16px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
   background: color-mix(in srgb, var(--bg-surface) 64%, transparent);
 }
 
-.dubbing-media-step + .dubbing-media-step {
-  border-left: 1px solid var(--hairline);
+html[data-theme='dark'] .dubbing-media-step {
+  background: rgba(0, 0, 0, 0.1);
 }
 
-.dubbing-media-step-copy {
-  display: flex;
+.dubbing-media-step-top {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
-  flex-direction: column;
-  gap: 5px;
 }
 
 .dubbing-media-step-title {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text);
   font-size: 14px;
   font-weight: 850;
   line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dubbing-media-step-subtitle {
@@ -1412,6 +1350,70 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
   font-weight: 850;
   line-height: 1.2;
   white-space: nowrap;
+}
+
+.dubbing-media-step.active .dubbing-media-step-status {
+  color: var(--accent);
+}
+
+.dubbing-media-step.done .dubbing-media-step-status {
+  color: #2f7c50;
+}
+
+.dubbing-media-step.failed .dubbing-media-step-status,
+.dubbing-media-step.interrupted .dubbing-media-step-status {
+  color: #a93535;
+}
+
+.dubbing-media-step-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+}
+
+.dubbing-media-step-track {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-muted) 70%, transparent);
+}
+
+html[data-theme='dark'] .dubbing-media-step-track {
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.dubbing-media-step-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+
+.dubbing-media-step.pending .dubbing-media-step-bar {
+  background: color-mix(in srgb, var(--text-subtle) 60%, transparent);
+}
+
+.dubbing-media-step.done .dubbing-media-step-bar {
+  background: #2f8a55;
+}
+
+.dubbing-media-step.failed .dubbing-media-step-bar,
+.dubbing-media-step.interrupted .dubbing-media-step-bar {
+  background: #b83b3b;
+}
+
+.dubbing-media-step-progress-value {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .dubbing-section-header {
@@ -1923,25 +1925,12 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
     padding: 18px;
   }
 
-  .dubbing-stage-page-header {
-    align-items: flex-start;
-  }
-
-  .dubbing-stage-page-copy span:last-child {
-    white-space: normal;
-  }
-
   .dubbing-media-steps {
     grid-template-columns: 1fr;
   }
 
   .dubbing-media-step {
-    min-height: 74px;
-  }
-
-  .dubbing-media-step + .dubbing-media-step {
-    border-top: 1px solid var(--hairline);
-    border-left: 0;
+    min-height: 98px;
   }
 
   .dubbing-media-step-subtitle {
