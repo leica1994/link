@@ -260,6 +260,11 @@ struct DubbingMediaSeparationResult {
     warnings: Vec<String>,
 }
 
+struct BackgroundMusicSeparationResult {
+    vocals_path: PathBuf,
+    background_music_path: PathBuf,
+}
+
 struct DubbingSubtitleInput {
     segments: Vec<TranscriptionSegment>,
     warnings: Vec<String>,
@@ -839,10 +844,7 @@ fn start_dubbing_task_blocking(
                     &request.task_id,
                     DUBBING_ARTIFACT_SOURCE_AUDIO,
                     &media_result.source_audio_path,
-                    json!({
-                        "format": "wav",
-                        "sampleRate": 44100,
-                    }),
+                    source_audio_metadata(&options),
                     &now,
                 )?;
                 if let Some(background_music_path) = &media_result.background_music_path {
@@ -888,6 +890,11 @@ fn start_dubbing_task_blocking(
                     json!({
                         "mutedVideoPath": path_to_string(&media_result.muted_video_path),
                         "sourceAudioPath": path_to_string(&media_result.source_audio_path),
+                        "sourceAudioKind": if options.is_background_music_enabled {
+                            "vocals"
+                        } else {
+                            "mix"
+                        },
                         "backgroundMusicPath": media_result.background_music_path.as_ref().map(|path| path_to_string(path)),
                         "backgroundMusic": options.is_background_music_enabled,
                         "warnings": &media_result.warnings,
@@ -1574,6 +1581,25 @@ fn delete_dubbing_artifact(
     Ok(())
 }
 
+fn source_audio_metadata(options: &DubbingTaskOptions) -> Value {
+    if options.is_background_music_enabled {
+        json!({
+            "format": "wav",
+            "sampleRate": 44100,
+            "source": "vocals",
+            "method": BACKGROUND_MUSIC_METHOD,
+            "model": htdemucs::MODEL_ID,
+            "stem": "vocals",
+        })
+    } else {
+        json!({
+            "format": "wav",
+            "sampleRate": 44100,
+            "source": "mix",
+        })
+    }
+}
+
 fn save_dubbing_task_options(
     store: &SettingsStore,
     task_id: &str,
@@ -1833,7 +1859,7 @@ fn run_media_separation(
 
     let video_extension = path_extension(&source_video).unwrap_or_else(|| "mp4".to_string());
     let muted_video_path = output_dir.join(format!("video_no_audio.{video_extension}"));
-    let source_audio_path = output_dir.join("source_audio.wav");
+    let extracted_audio_path = output_dir.join("source_audio.wav");
 
     progress.set(8, "准备音视频分离")?;
     progress.set(20, "分离无声视频")?;
@@ -1841,20 +1867,22 @@ fn run_media_separation(
     progress.set(40, "无声视频分离完成")?;
 
     progress.set(55, "提取源音频")?;
-    extract_source_audio(&source_video, &source_audio_path)?;
+    extract_source_audio(&source_video, &extracted_audio_path)?;
     progress.set(65, "源音频提取完成")?;
 
     let warnings = Vec::new();
+    let mut source_audio_path = extracted_audio_path.clone();
     let background_music_path = if options.is_background_music_enabled {
-        progress.set(68, "准备背景音乐分离")?;
+        progress.set(68, "准备人声/背景音乐分离")?;
         let background_music_path = output_dir.join("background_music.wav");
-        separate_background_music(
-            &source_audio_path,
+        let separation_result = separate_background_music(
+            &extracted_audio_path,
             &output_dir,
             &background_music_path,
             progress,
         )?;
-        Some(background_music_path)
+        source_audio_path = separation_result.vocals_path;
+        Some(separation_result.background_music_path)
     } else {
         progress.set(90, "跳过背景音乐分离")?;
         None
@@ -1931,15 +1959,21 @@ fn separate_background_music(
     output_dir: &Path,
     output_path: &Path,
     progress: &MediaSeparationProgress,
-) -> Result<(), String> {
+) -> Result<BackgroundMusicSeparationResult, String> {
     let stem_output_dir = output_dir.join("stems");
     fs::create_dir_all(&stem_output_dir)
         .map_err(|error| format!("无法创建背景音乐分离目录: {error}"))?;
 
     let stem_paths = split_background_music_stems(source_audio_path, &stem_output_dir, progress)?;
+    let vocals_path = stem_paths.vocals_path.clone();
     progress.set(97, "混合背景音乐音轨")?;
     mix_background_music_stems(&stem_paths, output_path)?;
-    ensure_non_empty_file(output_path, "背景音乐分离结果为空")
+    ensure_non_empty_file(output_path, "背景音乐分离结果为空")?;
+
+    Ok(BackgroundMusicSeparationResult {
+        vocals_path,
+        background_music_path: output_path.to_path_buf(),
+    })
 }
 
 fn split_background_music_stems(
@@ -1958,6 +1992,7 @@ fn split_background_music_stems(
     ensure_non_empty_file(&stem_paths.drums_path, "鼓组分离结果为空")?;
     ensure_non_empty_file(&stem_paths.bass_path, "贝斯分离结果为空")?;
     ensure_non_empty_file(&stem_paths.other_path, "其他伴奏分离结果为空")?;
+    ensure_non_empty_file(&stem_paths.vocals_path, "人声分离结果为空")?;
 
     Ok(stem_paths)
 }
@@ -1977,28 +2012,28 @@ fn transfer_percent(done: u64, total: u64) -> u64 {
 
 fn background_music_split_progress_message(event: HtDemucsProgress) -> Option<(u8, String)> {
     match event {
-        HtDemucsProgress::CheckingModel => Some((69, "检查背景音乐分离模型".to_string())),
+        HtDemucsProgress::CheckingModel => Some((69, "检查人声/背景音乐分离模型".to_string())),
         HtDemucsProgress::DownloadingModel { downloaded, total } => Some((
             background_music_model_download_progress(downloaded, total),
             format!(
-                "下载背景音乐分离模型 {}%",
+                "下载人声/背景音乐分离模型 {}%",
                 transfer_percent(downloaded, total)
             ),
         )),
-        HtDemucsProgress::VerifyingModel => Some((76, "校验背景音乐分离模型".to_string())),
-        HtDemucsProgress::ModelReady => Some((77, "背景音乐分离模型已就绪".to_string())),
+        HtDemucsProgress::VerifyingModel => Some((76, "校验人声/背景音乐分离模型".to_string())),
+        HtDemucsProgress::ModelReady => Some((77, "人声/背景音乐分离模型已就绪".to_string())),
         HtDemucsProgress::LoadingModel { device } => {
-            Some((80, format!("加载背景音乐分离模型 ({device})")))
+            Some((80, format!("加载人声/背景音乐分离模型 ({device})")))
         }
         HtDemucsProgress::ReadingAudio => Some((82, "读取源音频".to_string())),
         HtDemucsProgress::Inferencing { percent } => {
             let progress = (84.0 + (percent.clamp(0.0, 100.0) * 0.10)).round() as u8;
             Some((
                 progress.min(94),
-                format!("分离背景音乐音轨 {:.0}%", percent),
+                format!("分离人声/背景音乐音轨 {:.0}%", percent),
             ))
         }
-        HtDemucsProgress::Finished => Some((96, "背景音乐音轨分离完成".to_string())),
+        HtDemucsProgress::Finished => Some((96, "人声/背景音乐音轨分离完成".to_string())),
     }
 }
 

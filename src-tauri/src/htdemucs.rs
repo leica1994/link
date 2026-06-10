@@ -13,7 +13,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::app_paths;
 
-pub const MODEL_ID: &str = "htdemucs_libtorch_ft_cuda_v2";
+pub const MODEL_ID: &str = "htdemucs_libtorch_ft_cuda_v3_context_norm";
 
 const MODEL_FILE_NAME: &str = "htdemucs_ft_cuda.pt";
 const SOURCE_MODEL_FILE_NAME: &str = "htdemucs_ft.pt";
@@ -27,8 +27,11 @@ const MODEL_URLS: &[&str] = &[
 ];
 const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u16 = 2;
-const CHUNK_SECONDS: usize = 8;
-const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * CHUNK_SECONDS;
+const WINDOW_SECONDS: usize = 8;
+const CONTEXT_SECONDS: usize = 2;
+const WINDOW_SAMPLES: usize = SAMPLE_RATE as usize * WINDOW_SECONDS;
+const CONTEXT_SAMPLES: usize = SAMPLE_RATE as usize * CONTEXT_SECONDS;
+const HOP_SAMPLES: usize = WINDOW_SAMPLES - CONTEXT_SAMPLES * 2;
 const STEM_COUNT: usize = 4;
 const STEM_NAMES: [&str; STEM_COUNT] = ["drums", "bass", "other", "vocals"];
 
@@ -94,17 +97,21 @@ where
 
     let paths = stem_paths(output_dir);
     let mut writers = create_stem_writers(&paths)?;
-    let chunk_count = audio.left.len().div_ceil(CHUNK_SAMPLES);
+    let chunk_count = audio.left.len().div_ceil(HOP_SAMPLES);
 
     progress(HtDemucsProgress::Inferencing { percent: 0.0 })?;
     for chunk_index in 0..chunk_count {
-        let start = chunk_index * CHUNK_SAMPLES;
-        let take = (audio.left.len() - start).min(CHUNK_SAMPLES);
-        let input = chunk_tensor(&audio, start, take, device);
+        let valid_start = chunk_index * HOP_SAMPLES;
+        let take = (audio.left.len() - valid_start).min(HOP_SAMPLES);
+        let input_start = valid_start.saturating_sub(CONTEXT_SAMPLES);
+        let output_start = valid_start - input_start;
+        let input = window_tensor(&audio, input_start, device);
+        let (input, input_mean, input_std) = normalize_input_tensor(input);
         let output = no_grad(|| model.forward_ts(&[input]))
             .map_err(|error| format!("HTDemucs CUDA 推理失败: {}", compact_torch_error(error)))?;
-        let output = normalize_output_tensor(output, take)?;
-        write_chunk(&mut writers, &output, take)?;
+        let output = denormalize_output_tensor(output, &input_mean, &input_std);
+        let output = normalize_output_tensor(output, output_start + take)?;
+        write_chunk(&mut writers, &output, output_start, take)?;
 
         let percent = ((chunk_index + 1) as f64 / chunk_count as f64) * 100.0;
         progress(HtDemucsProgress::Inferencing { percent })?;
@@ -597,29 +604,43 @@ fn create_stem_writers(paths: &StemPaths) -> Result<Vec<StemWriter>, String> {
     Ok(writers)
 }
 
-fn chunk_tensor(audio: &StereoAudio, start: usize, take: usize, device: Device) -> Tensor {
-    let mut samples = vec![0.0_f32; CHANNELS as usize * CHUNK_SAMPLES];
+fn window_tensor(audio: &StereoAudio, start: usize, device: Device) -> Tensor {
+    let mut samples = vec![0.0_f32; CHANNELS as usize * WINDOW_SAMPLES];
+    let take = audio.left.len().saturating_sub(start).min(WINDOW_SAMPLES);
 
     for index in 0..take {
         samples[index] = audio.left[start + index];
-        samples[CHUNK_SAMPLES + index] = audio.right[start + index];
+        samples[WINDOW_SAMPLES + index] = audio.right[start + index];
     }
 
     Tensor::from_slice(&samples)
-        .reshape([1, CHANNELS as i64, CHUNK_SAMPLES as i64])
+        .reshape([1, CHANNELS as i64, WINDOW_SAMPLES as i64])
         .to_device(device)
 }
 
-fn normalize_output_tensor(output: Tensor, take: usize) -> Result<Tensor, String> {
+fn normalize_input_tensor(input: Tensor) -> (Tensor, Tensor, Tensor) {
+    let mono = input.mean_dim(1i64, true, Kind::Float);
+    let mean = mono.mean_dim(2i64, true, Kind::Float);
+    let std = mono.std_dim(2i64, false, true);
+    let normalized = (&input - &mean) / (&std + 1e-5);
+
+    (normalized, mean, std)
+}
+
+fn denormalize_output_tensor(output: Tensor, mean: &Tensor, std: &Tensor) -> Tensor {
+    output * std + mean
+}
+
+fn normalize_output_tensor(output: Tensor, required_frames: usize) -> Result<Tensor, String> {
     let output = output.to_device(Device::Cpu).to_kind(Kind::Float);
     let shape = output.size();
     let output = match shape.as_slice() {
         [1, sources, channels, frames] => {
-            validate_output_shape(*sources, *channels, *frames, take)?;
+            validate_output_shape(*sources, *channels, *frames, required_frames)?;
             output.i(0)
         }
         [sources, channels, frames] => {
-            validate_output_shape(*sources, *channels, *frames, take)?;
+            validate_output_shape(*sources, *channels, *frames, required_frames)?;
             output
         }
         _ => {
@@ -637,7 +658,7 @@ fn validate_output_shape(
     sources: i64,
     channels: i64,
     frames: i64,
-    take: usize,
+    required_frames: usize,
 ) -> Result<(), String> {
     if sources < STEM_COUNT as i64 {
         return Err(format!("HTDemucs 输出音轨数量不足: {sources}"));
@@ -645,28 +666,33 @@ fn validate_output_shape(
     if channels != CHANNELS as i64 {
         return Err(format!("HTDemucs 输出声道数量异常: {channels}"));
     }
-    if frames < take as i64 {
+    if frames < required_frames as i64 {
         return Err(format!(
             "HTDemucs 输出长度不足，期望至少 {}，实际 {}",
-            take, frames
+            required_frames, frames
         ));
     }
 
     Ok(())
 }
 
-fn write_chunk(writers: &mut [StemWriter], output: &Tensor, take: usize) -> Result<(), String> {
+fn write_chunk(
+    writers: &mut [StemWriter],
+    output: &Tensor,
+    output_start: usize,
+    take: usize,
+) -> Result<(), String> {
     for source_index in 0..STEM_COUNT {
         let mut left = vec![0.0_f32; take];
         let mut right = vec![0.0_f32; take];
         output
             .i((source_index as i64, 0))
-            .narrow(0, 0, take as i64)
+            .narrow(0, output_start as i64, take as i64)
             .contiguous()
             .copy_data(&mut left, take);
         output
             .i((source_index as i64, 1))
-            .narrow(0, 0, take as i64)
+            .narrow(0, output_start as i64, take as i64)
             .contiguous()
             .copy_data(&mut right, take);
 

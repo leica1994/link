@@ -851,20 +851,20 @@ const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
     },
     {
       key: 'source-audio',
-      label: '源音频',
-      description: '提取并转为后续处理音频',
+      label: backgroundEnabled ? '人声音频' : '源音频',
+      description: backgroundEnabled ? '提取源音频并分离人声轨道' : '提取并转为后续处理音频',
       status: mediaStepStatus(progress, 65, 55, stageStatus),
     },
     {
       key: 'background-model',
       label: '分离模型',
-      description: backgroundEnabled ? '检查、下载或加载背景音乐分离模型' : '背景音乐已关闭',
+      description: backgroundEnabled ? '检查、下载或加载人声/背景音乐分离模型' : '背景音乐已关闭',
       status: backgroundEnabled ? mediaStepStatus(progress, 78, 69, stageStatus) : 'done',
     },
     {
       key: 'background-music',
       label: '背景音乐',
-      description: backgroundEnabled ? '分离伴奏音轨并混合输出' : '跳过背景音乐分离',
+      description: backgroundEnabled ? '分离并混合鼓组、贝斯和其他伴奏音轨' : '跳过背景音乐分离',
       status: backgroundEnabled
         ? mediaStepStatus(progress, 99, 80, stageStatus)
         : progress >= 90 || stageStatus === 'done'
