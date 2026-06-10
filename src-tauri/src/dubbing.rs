@@ -155,6 +155,18 @@ pub struct PreviewDubbingVoiceResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LoadDubbingReferenceAudioRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadDubbingReferenceAudioResult {
+    pub audio_data_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PrepareDubbingMaterialRequest {
     pub video_path: String,
     pub subtitle_path: String,
@@ -197,6 +209,7 @@ pub struct DubbingProgressStage {
     pub progress: u8,
     pub message: String,
     pub status: String,
+    pub snapshot: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -283,6 +296,7 @@ struct DubbingMediaSeparationResult {
 struct DubbingReferenceAudioResult {
     manifest_path: PathBuf,
     metadata: Value,
+    stage_snapshot: Value,
 }
 
 #[derive(Clone)]
@@ -1088,7 +1102,7 @@ fn start_dubbing_task_blocking(
                     100,
                     "参考音频生成完成",
                     "done",
-                    reference_result.metadata,
+                    reference_result.stage_snapshot,
                     &now,
                 )?;
                 read_dubbing_task_snapshot_by_id(connection, &request.task_id)
@@ -1225,6 +1239,27 @@ pub fn preview_dubbing_voice(
     Ok(PreviewDubbingVoiceResult { audio_data_url })
 }
 
+#[tauri::command]
+pub fn load_dubbing_reference_audio(
+    request: LoadDubbingReferenceAudioRequest,
+) -> Result<LoadDubbingReferenceAudioResult, String> {
+    let path = canonical_material_path(&request.path, "参考音频不存在")?;
+    ensure_supported_extension(&path, DUBBING_AUDIO_EXTENSIONS, "不支持的参考音频格式")?;
+
+    let audio = fs::read(&path).map_err(|error| format!("无法读取参考音频: {error}"))?;
+    if audio.is_empty() {
+        return Err("参考音频为空".to_string());
+    }
+
+    let mime_type = audio_mime_type_for_path(&path, &audio);
+    let audio_data_url = format!(
+        "data:{mime_type};base64,{}",
+        general_purpose::STANDARD.encode(audio)
+    );
+
+    Ok(LoadDubbingReferenceAudioResult { audio_data_url })
+}
+
 fn engine_for(engine: &str) -> Result<Box<dyn DubbingEngine>, String> {
     match engine {
         EDGE_TTS_ENGINE => Ok(Box::new(EdgeTtsEngine)),
@@ -1282,6 +1317,24 @@ fn audio_mime_type(audio: &[u8]) -> &'static str {
     }
 
     "application/octet-stream"
+}
+
+fn audio_mime_type_for_path(path: &Path, audio: &[u8]) -> &'static str {
+    let detected = audio_mime_type(audio);
+    if detected != "application/octet-stream" {
+        return detected;
+    }
+
+    match path_extension(path).as_deref() {
+        Some("m4a") | Some("mp4") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("wma") => "audio/x-ms-wma",
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") | Some("opus") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        _ => detected,
+    }
 }
 
 fn apply_dubbing_model_options(
@@ -1590,7 +1643,7 @@ fn read_dubbing_stages(
     let mut statement = connection
         .prepare(
             "
-            SELECT stage_key, progress, message, status
+            SELECT stage_key, progress, message, status, snapshot
             FROM dubbing_task_stages
             WHERE task_id = ?1
             ",
@@ -1598,12 +1651,17 @@ fn read_dubbing_stages(
         .map_err(|error| format!("无法读取配音阶段: {error}"))?;
     let rows = statement
         .query_map(params![task_id], |row| {
+            let stage_key = row.get::<_, String>(0)?;
+            let snapshot_text: String = row.get(4)?;
+            let snapshot = serde_json::from_str(&snapshot_text).unwrap_or_else(|_| json!({}));
+
             Ok((
-                row.get::<_, String>(0)?,
+                stage_key,
                 DubbingProgressStage {
                     progress: row.get::<_, i64>(1)?.clamp(0, 100) as u8,
                     message: row.get(2)?,
                     status: row.get(3)?,
+                    snapshot,
                 },
             ))
         })
@@ -2235,12 +2293,13 @@ fn generate_existing_reference_audio(
         )?);
 
         let progress = 8 + ((((index + 1) as f64 / segment_count as f64) * 62.0).round() as u8);
-        emit_reference_audio_progress(
+        emit_reference_audio_progress_for_clips(
             app,
             task_id,
             progress.min(70),
             &format!("切割并处理参考音频 {}/{}", index + 1, segment_count),
             &options.reference_audio_source,
+            &clips,
         )?;
     }
 
@@ -2252,6 +2311,14 @@ fn generate_existing_reference_audio(
         &options.reference_audio_source,
     )?;
     replace_silence_reference_clips(&mut clips)?;
+    emit_reference_audio_progress_for_clips(
+        app,
+        task_id,
+        78,
+        "静音参考音频替换完成",
+        &options.reference_audio_source,
+        &clips,
+    )?;
 
     emit_reference_audio_progress(
         app,
@@ -2261,17 +2328,27 @@ fn generate_existing_reference_audio(
         &options.reference_audio_source,
     )?;
     replace_short_reference_clips(&mut clips)?;
+    emit_reference_audio_progress_for_clips(
+        app,
+        task_id,
+        83,
+        "过短参考音频替换完成",
+        &options.reference_audio_source,
+        &clips,
+    )?;
 
     apply_loudnorm_to_reference_clips(app, task_id, options, &mut clips)?;
 
-    emit_reference_audio_progress(
+    emit_reference_audio_progress_for_clips(
         app,
         task_id,
         96,
         "写入参考音频清单",
         &options.reference_audio_source,
+        &clips,
     )?;
     let manifest_path = output_dir.join("manifest.json");
+    let items = reference_audio_clip_items(&clips);
     let manifest = json!({
         "source": DUBBING_REFERENCE_AUDIO_EXISTING,
         "postProcessingVersion": REFERENCE_AUDIO_POST_PROCESSING_VERSION,
@@ -2302,7 +2379,7 @@ fn generate_existing_reference_audio(
             "lra": REFERENCE_AUDIO_LRA,
             "appliedCount": clips.iter().filter(|clip| clip.loudnorm_applied).count(),
         },
-        "items": clips.iter().map(reference_audio_clip_metadata).collect::<Vec<_>>(),
+        "items": items.clone(),
     });
     write_reference_audio_manifest(&manifest_path, &manifest)?;
     let metadata = json!({
@@ -2316,6 +2393,7 @@ fn generate_existing_reference_audio(
     Ok(DubbingReferenceAudioResult {
         manifest_path,
         metadata,
+        stage_snapshot: reference_audio_stage_snapshot(DUBBING_REFERENCE_AUDIO_EXISTING, items),
     })
 }
 
@@ -2356,21 +2434,31 @@ fn generate_custom_reference_audio(
         })
         .collect::<Vec<_>>();
 
-    emit_reference_audio_progress(
+    emit_reference_audio_progress_with_items(
+        app,
+        task_id,
+        88,
+        "自定义参考音频已就绪",
+        &options.reference_audio_source,
+        &segments,
+    )?;
+    let manifest_path = output_dir.join("manifest.json");
+
+    emit_reference_audio_progress_with_items(
         app,
         task_id,
         96,
         "写入参考音频清单",
         &options.reference_audio_source,
+        &segments,
     )?;
-    let manifest_path = output_dir.join("manifest.json");
     let manifest = json!({
         "source": DUBBING_REFERENCE_AUDIO_CUSTOM,
         "segmentCount": snapshot.segments.len(),
         "customAudioPath": path_to_string(&custom_audio),
         "referenceAudioPath": path_to_string(&cached_audio_path),
         "manifestPath": path_to_string(&manifest_path),
-        "items": segments,
+        "items": segments.clone(),
     });
     write_reference_audio_manifest(&manifest_path, &manifest)?;
     let metadata = json!({
@@ -2384,6 +2472,7 @@ fn generate_custom_reference_audio(
     Ok(DubbingReferenceAudioResult {
         manifest_path,
         metadata,
+        stage_snapshot: reference_audio_stage_snapshot(DUBBING_REFERENCE_AUDIO_CUSTOM, segments),
     })
 }
 
@@ -2417,6 +2506,74 @@ fn emit_reference_audio_progress(
             message,
             "active",
             json!({ "source": source }),
+            &now,
+        )?;
+        read_dubbing_task_snapshot_by_id(connection, task_id)
+    })?;
+    emit_dubbing_progress(app, &snapshot);
+
+    Ok(snapshot)
+}
+
+fn emit_reference_audio_progress_with_items(
+    app: &AppHandle,
+    task_id: &str,
+    progress: u8,
+    message: &str,
+    source: &str,
+    items: &[Value],
+) -> Result<DubbingTaskSnapshot, String> {
+    emit_reference_audio_progress_with_snapshot(
+        app,
+        task_id,
+        progress,
+        message,
+        reference_audio_stage_snapshot(source, items.to_vec()),
+    )
+}
+
+fn emit_reference_audio_progress_for_clips(
+    app: &AppHandle,
+    task_id: &str,
+    progress: u8,
+    message: &str,
+    source: &str,
+    clips: &[ReferenceAudioClip],
+) -> Result<DubbingTaskSnapshot, String> {
+    let items = reference_audio_clip_items(clips);
+    emit_reference_audio_progress_with_items(app, task_id, progress, message, source, &items)
+}
+
+fn emit_reference_audio_progress_with_snapshot(
+    app: &AppHandle,
+    task_id: &str,
+    progress: u8,
+    message: &str,
+    stage_snapshot: Value,
+) -> Result<DubbingTaskSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let progress = progress.min(99);
+    let now = Utc::now().to_rfc3339();
+    let snapshot = store.with_connection(|connection| {
+        update_dubbing_task_state(
+            connection,
+            task_id,
+            DUBBING_STAGE_REFERENCE_AUDIO,
+            DUBBING_STATUS_RUNNING,
+            progress,
+            message,
+            "",
+            None,
+            &now,
+        )?;
+        upsert_dubbing_stage(
+            connection,
+            task_id,
+            DUBBING_STAGE_REFERENCE_AUDIO,
+            progress,
+            message,
+            "active",
+            stage_snapshot,
             &now,
         )?;
         read_dubbing_task_snapshot_by_id(connection, task_id)
@@ -2602,40 +2759,55 @@ fn apply_loudnorm_to_reference_clips(
 ) -> Result<(), String> {
     let total = clips.len().max(1);
     let clip_count = clips.len();
-    for (index, clip) in clips.iter_mut().enumerate() {
-        if clip.is_silence {
+    for index in 0..clips.len() {
+        if clips[index].is_silence {
             continue;
         }
 
-        apply_reference_audio_loudnorm(&clip.path)?;
-        ensure_non_empty_file(&clip.path, "LUFS 归一化后的参考音频为空")?;
-        clip.loudnorm_applied = true;
-        clip.audio_duration_ms =
-            probe_audio_duration_ms(&clip.path).unwrap_or(clip.audio_duration_ms);
-        clip.file_size = file_size(&clip.path).unwrap_or(clip.file_size);
-        if let Ok((mean_volume_db, max_volume_db)) = probe_audio_volume_db(&clip.path) {
-            clip.mean_volume_db = mean_volume_db;
-            clip.max_volume_db = max_volume_db;
-        }
-        if clip.replacement_reason.is_none() {
-            clip.quality = reference_audio_quality(
-                clip.is_silence,
-                clip.audio_duration_ms,
-                clip.trim_fallback,
-            );
+        {
+            let clip = &mut clips[index];
+            apply_reference_audio_loudnorm(&clip.path)?;
+            ensure_non_empty_file(&clip.path, "LUFS 归一化后的参考音频为空")?;
+            clip.loudnorm_applied = true;
+            clip.audio_duration_ms =
+                probe_audio_duration_ms(&clip.path).unwrap_or(clip.audio_duration_ms);
+            clip.file_size = file_size(&clip.path).unwrap_or(clip.file_size);
+            if let Ok((mean_volume_db, max_volume_db)) = probe_audio_volume_db(&clip.path) {
+                clip.mean_volume_db = mean_volume_db;
+                clip.max_volume_db = max_volume_db;
+            }
+            if clip.replacement_reason.is_none() {
+                clip.quality = reference_audio_quality(
+                    clip.is_silence,
+                    clip.audio_duration_ms,
+                    clip.trim_fallback,
+                );
+            }
         }
 
         let progress = 84 + ((((index + 1) as f64 / total as f64) * 11.0).round() as u8);
-        emit_reference_audio_progress(
+        emit_reference_audio_progress_for_clips(
             app,
             task_id,
             progress.min(95),
             &format!("LUFS 归一化 {}/{}", index + 1, clip_count),
             &options.reference_audio_source,
+            clips,
         )?;
     }
 
     Ok(())
+}
+
+fn reference_audio_stage_snapshot(source: &str, items: Vec<Value>) -> Value {
+    json!({
+        "source": source,
+        "items": items,
+    })
+}
+
+fn reference_audio_clip_items(clips: &[ReferenceAudioClip]) -> Vec<Value> {
+    clips.iter().map(reference_audio_clip_metadata).collect()
 }
 
 fn reference_audio_clip_metadata(clip: &ReferenceAudioClip) -> Value {

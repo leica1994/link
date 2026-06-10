@@ -1256,6 +1256,115 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
   overflow-wrap: anywhere;
 }
 
+.dubbing-subtitle-row {
+  grid-template-columns: 42px 76px minmax(96px, 0.46fr) minmax(96px, 0.46fr) minmax(240px, 2.1fr) minmax(180px, 0.9fr);
+}
+
+.dubbing-reference-audio {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(70px, auto);
+  align-items: center;
+  justify-content: start;
+  gap: 6px 8px;
+}
+
+.dubbing-reference-play {
+  height: 26px;
+  min-width: 72px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
+  color: var(--accent-strong);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.dubbing-reference-play svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.dubbing-reference-play:not(:disabled):hover,
+.dubbing-reference-play.active {
+  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+  background: var(--accent);
+  color: #fff;
+}
+
+html[data-theme='dark'] .dubbing-reference-play:not(:disabled):hover,
+html[data-theme='dark'] .dubbing-reference-play.active {
+  color: #18140f;
+}
+
+.dubbing-reference-play:disabled {
+  border-color: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--text-subtle);
+  cursor: not-allowed;
+}
+
+html[data-theme='dark'] .dubbing-reference-play:disabled {
+  background: rgba(0, 0, 0, 0.14);
+}
+
+.dubbing-reference-status {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.dubbing-reference-status.quality-ok,
+.dubbing-reference-status.quality-normalized {
+  color: #2f7c50;
+}
+
+.dubbing-reference-status.quality-replaced {
+  color: #246f91;
+}
+
+.dubbing-reference-status.quality-warning {
+  color: #815518;
+}
+
+html[data-theme='dark'] .dubbing-reference-status.quality-ok,
+html[data-theme='dark'] .dubbing-reference-status.quality-normalized {
+  color: #8dd0a8;
+}
+
+html[data-theme='dark'] .dubbing-reference-status.quality-replaced {
+  color: #86c9e5;
+}
+
+html[data-theme='dark'] .dubbing-reference-status.quality-warning {
+  color: #e5bc7a;
+}
+
+.dubbing-reference-detail {
+  grid-column: 1 / -1;
+  min-width: 0;
+  color: var(--text-subtle);
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .translate-translation-table {
   flex: 1;
   min-height: 0;
@@ -1866,6 +1975,10 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
     gap: 10px;
   }
 
+  .dubbing-subtitle-row {
+    grid-template-columns: 38px 72px 92px 92px minmax(220px, 1fr) minmax(168px, 0.72fr);
+  }
+
   .translate-translation-row {
     grid-template-columns: 38px 78px 92px 92px minmax(210px, 0.9fr) minmax(260px, 1.1fr);
     gap: 12px;
@@ -2044,8 +2157,12 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
     gap: 6px 10px;
   }
 
+  .dubbing-subtitle-row {
+    grid-template-columns: 32px minmax(76px, auto) minmax(0, 1fr);
+  }
+
   .translate-subtitle-index {
-    grid-row: 1 / span 3;
+    grid-row: 1 / span 4;
   }
 
   .translate-subtitle-status {
@@ -2056,6 +2173,16 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
   .translate-subtitle-row p {
     grid-column: 2 / -1;
     grid-row: 3;
+  }
+
+  .dubbing-reference-audio {
+    grid-column: 2 / -1;
+    grid-row: 4;
+    grid-template-columns: auto auto minmax(0, 1fr);
+  }
+
+  .dubbing-reference-detail {
+    grid-column: auto;
   }
 
   .translate-subtitle-start {

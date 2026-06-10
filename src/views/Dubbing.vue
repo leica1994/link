@@ -235,28 +235,50 @@
             </div>
 
             <div
-              v-else-if="preprocessedSubtitleSegments.length > 0 && !shouldShowDubbingStagePreview"
+              v-else-if="dubbingSubtitleRows.length > 0 && !shouldShowDubbingStagePreview"
               class="translate-preview translate-subtitle-list"
             >
               <div
-                v-for="(segment, index) in preprocessedSubtitleSegments"
-                :key="segment.uid || `dubbing-subtitle-${index}`"
-                class="translate-subtitle-row"
+                v-for="row in dubbingSubtitleRows"
+                :key="row.segment.uid || `dubbing-subtitle-${row.index}`"
+                class="translate-subtitle-row dubbing-subtitle-row"
               >
-                <span class="translate-subtitle-index">{{ index + 1 }}</span>
+                <span class="translate-subtitle-index">{{ row.index + 1 }}</span>
                 <span
                   class="translate-subtitle-status"
-                  :class="`status-${normalizeDubbingSegmentStatus(segment.status)}`"
+                  :class="`status-${normalizeDubbingSegmentStatus(row.segment.status)}`"
                 >
-                  {{ dubbingSegmentStatusLabel(segment.status) }}
+                  {{ dubbingSegmentStatusLabel(row.segment.status) }}
                 </span>
                 <span class="translate-subtitle-time translate-subtitle-start">
-                  {{ formatSegmentTime(segment.startTime) }}
+                  {{ formatSegmentTime(row.segment.startTime) }}
                 </span>
                 <span class="translate-subtitle-time translate-subtitle-end">
-                  {{ formatSegmentTime(segment.endTime) }}
+                  {{ formatSegmentTime(row.segment.endTime) }}
                 </span>
-                <p>{{ segment.text }}</p>
+                <p>{{ row.segment.text }}</p>
+                <div class="dubbing-reference-audio">
+                  <button
+                    class="dubbing-reference-play"
+                    :class="{ active: isReferenceAudioPlaying(row.referenceAudio) }"
+                    type="button"
+                    :disabled="!canPlayReferenceAudio(row.referenceAudio)"
+                    :aria-label="referenceAudioAriaLabel(row.referenceAudio, row.index)"
+                    @click="playReferenceAudio(row.referenceAudio)"
+                  >
+                    <Volume2 :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ referenceAudioButtonLabel(row.referenceAudio) }}</span>
+                  </button>
+                  <span
+                    class="dubbing-reference-status"
+                    :class="`quality-${referenceAudioQualityClass(row.referenceAudio)}`"
+                  >
+                    {{ referenceAudioStatusLabel(row.referenceAudio) }}
+                  </span>
+                  <span v-if="referenceAudioDetailLabel(row.referenceAudio)" class="dubbing-reference-detail">
+                    {{ referenceAudioDetailLabel(row.referenceAudio) }}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -663,12 +685,17 @@ type PreviewDubbingVoiceResult = {
   audioDataUrl: string
 }
 
+type LoadDubbingReferenceAudioResult = {
+  audioDataUrl: string
+}
+
 type DubbingStageStatus = 'pending' | 'active' | 'done' | 'failed' | 'interrupted'
 
 type DubbingProgressStage = {
   progress: number
   message: string
   status: DubbingStageStatus
+  snapshot?: Record<string, unknown>
 }
 
 type DubbingStageProgress = {
@@ -697,6 +724,30 @@ type DubbingSubtitleSegment = {
   startTime: number
   endTime: number
   status?: DubbingSubtitleSegmentStatus | string
+}
+
+type DubbingReferenceAudioItem = {
+  index: number
+  uid?: string
+  path: string
+  audioDurationMs?: number
+  fileSize?: number
+  detectedSilence?: boolean
+  detectedShort?: boolean
+  isSilence?: boolean
+  trimFallback?: boolean
+  silenceReplaced?: boolean
+  shortReplaced?: boolean
+  replacedWith?: number
+  replacementReason?: string
+  loudnormApplied?: boolean
+  quality?: string
+}
+
+type DubbingSubtitleRow = {
+  index: number
+  segment: DubbingSubtitleSegment
+  referenceAudio?: DubbingReferenceAudioItem
 }
 
 type DubbingTaskSnapshot = {
@@ -785,6 +836,8 @@ const updatingModelIds = ref<string[]>([])
 const previewingKey = ref('')
 const modelPendingDelete = ref<DubbingModel | null>(null)
 const isSettingsLoaded = ref(false)
+const loadingReferenceAudioPath = ref('')
+const playingReferenceAudioPath = ref('')
 let previewAudio: HTMLAudioElement | null = null
 let previewAudioUrl = ''
 let materialPrepareToken = 0
@@ -859,6 +912,32 @@ const selectedMaterialSummary = computed(() => {
 })
 
 const preprocessedSubtitleSegments = computed(() => activeDubbingTask.value?.segments ?? [])
+
+const referenceAudioItems = computed(() => {
+  return readReferenceAudioItems(activeDubbingTask.value?.stages.referenceAudio?.snapshot?.items)
+})
+
+const referenceAudioItemsByUid = computed(() => {
+  return new Map(
+    referenceAudioItems.value
+      .filter((item): item is DubbingReferenceAudioItem & { uid: string } => Boolean(item.uid))
+      .map((item) => [item.uid, item]),
+  )
+})
+
+const referenceAudioItemsByIndex = computed(() => {
+  return new Map(referenceAudioItems.value.map((item) => [item.index, item]))
+})
+
+const dubbingSubtitleRows = computed<DubbingSubtitleRow[]>(() => {
+  return preprocessedSubtitleSegments.value.map((segment, index) => ({
+    index,
+    segment,
+    referenceAudio:
+      (segment.uid ? referenceAudioItemsByUid.value.get(segment.uid) : undefined) ??
+      referenceAudioItemsByIndex.value.get(index),
+  }))
+})
 
 const mediaSeparationStage = computed(() => activeDubbingTask.value?.stages.mediaSeparation ?? null)
 
@@ -1010,6 +1089,10 @@ const shouldShowDubbingProgress = computed(() => {
 
 const shouldShowDubbingStagePreview = computed(() => {
   const stage = currentDubbingStage.value
+  if (stage?.key === 'reference-audio' && preprocessedSubtitleSegments.value.length > 0) {
+    return false
+  }
+
   return Boolean(
     stage &&
     (preprocessedSubtitleSegments.value.length === 0 || ['active', 'failed', 'interrupted'].includes(stage.status)),
@@ -1659,6 +1742,7 @@ const playPreview = async (audioDataUrl: string) => {
   previewAudioUrl = URL.createObjectURL(audioBlob)
   previewAudio = new Audio(previewAudioUrl)
   await previewAudio.play()
+  return previewAudio
 }
 
 const stopPreviewAudio = () => {
@@ -1671,6 +1755,205 @@ const stopPreviewAudio = () => {
     URL.revokeObjectURL(previewAudioUrl)
     previewAudioUrl = ''
   }
+
+  playingReferenceAudioPath.value = ''
+}
+
+const playReferenceAudio = async (item?: DubbingReferenceAudioItem) => {
+  if (!item?.path || loadingReferenceAudioPath.value) {
+    return
+  }
+
+  if (playingReferenceAudioPath.value === item.path) {
+    stopPreviewAudio()
+    return
+  }
+
+  if (!isTauriRuntime()) {
+    dubbingError.value = '请在桌面应用中播放参考音频'
+    return
+  }
+
+  loadingReferenceAudioPath.value = item.path
+  dubbingError.value = ''
+
+  try {
+    const result = await invoke<LoadDubbingReferenceAudioResult>('load_dubbing_reference_audio', {
+      request: { path: item.path },
+    })
+    const audio = await playPreview(result.audioDataUrl)
+    playingReferenceAudioPath.value = item.path
+    audio.addEventListener(
+      'ended',
+      () => {
+        if (playingReferenceAudioPath.value === item.path) {
+          playingReferenceAudioPath.value = ''
+        }
+      },
+      { once: true },
+    )
+  } catch (error) {
+    dubbingError.value = stringifyError(error, '播放参考音频失败')
+  } finally {
+    if (loadingReferenceAudioPath.value === item.path) {
+      loadingReferenceAudioPath.value = ''
+    }
+  }
+}
+
+const canPlayReferenceAudio = (item?: DubbingReferenceAudioItem) => {
+  return Boolean(item?.path) && !loadingReferenceAudioPath.value
+}
+
+const isReferenceAudioPlaying = (item?: DubbingReferenceAudioItem) => {
+  return Boolean(item?.path && playingReferenceAudioPath.value === item.path)
+}
+
+const referenceAudioButtonLabel = (item?: DubbingReferenceAudioItem) => {
+  if (item?.path && loadingReferenceAudioPath.value === item.path) {
+    return '载入中'
+  }
+
+  return isReferenceAudioPlaying(item) ? '播放中' : '播放'
+}
+
+const referenceAudioAriaLabel = (item: DubbingReferenceAudioItem | undefined, index: number) => {
+  if (!item?.path) {
+    return `第 ${index + 1} 条参考音频未生成`
+  }
+
+  return `${isReferenceAudioPlaying(item) ? '停止' : '播放'}第 ${index + 1} 条参考音频`
+}
+
+const referenceAudioStatusLabel = (item?: DubbingReferenceAudioItem) => {
+  if (!item) {
+    return '等待'
+  }
+
+  if (item.silenceReplaced) {
+    return '替换静音'
+  }
+
+  if (item.shortReplaced) {
+    return '替换过短'
+  }
+
+  if (item.loudnormApplied) {
+    return '已归一化'
+  }
+
+  switch (item.quality) {
+    case 'silent':
+      return '静音'
+    case 'too-short':
+      return '过短'
+    case 'trim-fallback':
+      return '保留原段'
+    case 'replaced':
+      return '已替换'
+    case 'ok':
+      return '可用'
+    default:
+      return item.path ? '可用' : '等待'
+  }
+}
+
+const referenceAudioQualityClass = (item?: DubbingReferenceAudioItem) => {
+  if (!item) {
+    return 'pending'
+  }
+
+  if (item.isSilence || (item.detectedShort && !item.shortReplaced)) {
+    return 'warning'
+  }
+
+  if (item.silenceReplaced || item.shortReplaced || item.quality === 'replaced') {
+    return 'replaced'
+  }
+
+  if (item.loudnormApplied) {
+    return 'normalized'
+  }
+
+  return item.path ? 'ok' : 'pending'
+}
+
+const referenceAudioDetailLabel = (item?: DubbingReferenceAudioItem) => {
+  if (!item) {
+    return ''
+  }
+
+  const details = [formatDurationLabel(item.audioDurationMs)]
+  if (typeof item.replacedWith === 'number') {
+    details.push(`源 ${item.replacedWith + 1}`)
+  } else if (item.trimFallback) {
+    details.push('未裁剪')
+  }
+
+  return details.filter(Boolean).join(' · ')
+}
+
+const readReferenceAudioItems = (value: unknown): DubbingReferenceAudioItem[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .map(readReferenceAudioItem)
+    .filter((item): item is DubbingReferenceAudioItem => Boolean(item))
+}
+
+const readReferenceAudioItem = (value: unknown): DubbingReferenceAudioItem | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const index = readNumberValue(value.index)
+  if (index === undefined) {
+    return null
+  }
+
+  return {
+    index,
+    uid: readStringValue(value.uid),
+    path: readStringValue(value.path) ?? '',
+    audioDurationMs: readNumberValue(value.audioDurationMs),
+    fileSize: readNumberValue(value.fileSize),
+    detectedSilence: readBooleanValue(value.detectedSilence),
+    detectedShort: readBooleanValue(value.detectedShort),
+    isSilence: readBooleanValue(value.isSilence),
+    trimFallback: readBooleanValue(value.trimFallback),
+    silenceReplaced: readBooleanValue(value.silenceReplaced),
+    shortReplaced: readBooleanValue(value.shortReplaced),
+    replacedWith: readNumberValue(value.replacedWith),
+    replacementReason: readStringValue(value.replacementReason),
+    loudnormApplied: readBooleanValue(value.loudnormApplied),
+    quality: readStringValue(value.quality),
+  }
+}
+
+const readStringValue = (value: unknown) => (typeof value === 'string' ? value : undefined)
+
+const readNumberValue = (value: unknown) => {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+const readBooleanValue = (value: unknown) => (typeof value === 'boolean' ? value : undefined)
+
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const formatDurationLabel = (durationMs?: number) => {
+  if (durationMs === undefined) {
+    return ''
+  }
+
+  if (durationMs < 1000) {
+    return `${Math.max(Math.round(durationMs), 0)} ms`
+  }
+
+  return `${(durationMs / 1000).toFixed(1)} s`
 }
 
 const isVoiceAdded = (voice: DubbingVoiceOption) => {
