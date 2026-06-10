@@ -786,6 +786,11 @@ type DubbingMediaStep = {
   status: DubbingStageStatus
 }
 
+type DubbingBackgroundModelSnapshot = {
+  state?: string
+  downloadProgress?: number
+}
+
 const INDEX_TTS2_DEFAULT_ENDPOINT = 'http://127.0.0.1:7860'
 
 const dubbingTabs = [
@@ -945,6 +950,10 @@ const mediaSeparationProgress = computed(() => {
   return clampProgress(mediaSeparationStage.value?.progress ?? 0)
 })
 
+const mediaSeparationBackgroundModel = computed(() => {
+  return readBackgroundModelSnapshot(mediaSeparationStage.value?.snapshot?.backgroundModel)
+})
+
 const shouldShowMediaSeparationView = computed(() => {
   const task = activeDubbingTask.value
   const stage = mediaSeparationStage.value
@@ -964,6 +973,7 @@ const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
   const stageStatus = mediaSeparationStage.value?.status ?? 'pending'
   const isTerminalProblem = stageStatus === 'failed' || stageStatus === 'interrupted'
   const backgroundEnabled = isBackgroundMusicEnabled.value
+  const backgroundModel = mediaSeparationBackgroundModel.value
 
   return [
     {
@@ -984,8 +994,8 @@ const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
       key: 'background-model',
       label: '分离模型',
       description: backgroundEnabled ? '检查、下载或加载人声/背景音乐分离模型' : '背景音乐已关闭',
-      progress: backgroundEnabled ? mediaStepProgress(progress, 69, 78, stageStatus) : 100,
-      status: backgroundEnabled ? mediaStepStatus(progress, 78, 69, stageStatus) : 'done',
+      progress: backgroundEnabled ? backgroundModelStepProgress(progress, stageStatus, backgroundModel) : 100,
+      status: backgroundEnabled ? backgroundModelStepStatus(progress, stageStatus, backgroundModel) : 'done',
     },
     {
       key: 'background-music',
@@ -2139,6 +2149,69 @@ const isPointInsideElement = (point: { x: number; y: number }, element: HTMLElem
 }
 
 const clampProgress = (value: number) => Math.min(Math.max(Math.round(value), 0), 100)
+
+const readBackgroundModelSnapshot = (value: unknown): DubbingBackgroundModelSnapshot | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  return {
+    state: readStringValue(value.state),
+    downloadProgress: readNumberValue(value.downloadProgress),
+  }
+}
+
+const isBackgroundModelReady = (
+  progress: number,
+  stageStatus: DubbingStageStatus,
+  model: DubbingBackgroundModelSnapshot | null,
+) => {
+  if (stageStatus === 'done' || progress >= 80) {
+    return true
+  }
+
+  if (model?.state === 'ready' || model?.state === 'loading') {
+    return true
+  }
+
+  return !model && progress >= 76
+}
+
+const backgroundModelStepProgress = (
+  progress: number,
+  stageStatus: DubbingStageStatus,
+  model: DubbingBackgroundModelSnapshot | null,
+) => {
+  if (isBackgroundModelReady(progress, stageStatus, model)) {
+    return 100
+  }
+
+  if (model?.state === 'downloading') {
+    return clampProgress(model.downloadProgress ?? 0)
+  }
+
+  if (progress <= 69) {
+    return 0
+  }
+
+  return mediaStepProgress(progress, 69, 76, stageStatus)
+}
+
+const backgroundModelStepStatus = (
+  progress: number,
+  stageStatus: DubbingStageStatus,
+  model: DubbingBackgroundModelSnapshot | null,
+): DubbingStageStatus => {
+  if (isBackgroundModelReady(progress, stageStatus, model)) {
+    return 'done'
+  }
+
+  if (stageStatus === 'failed' || stageStatus === 'interrupted') {
+    return progress >= 69 ? stageStatus : 'pending'
+  }
+
+  return progress >= 69 || Boolean(model) ? 'active' : 'pending'
+}
 
 const mediaStepProgress = (
   progress: number,

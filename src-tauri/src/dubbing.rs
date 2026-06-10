@@ -2066,6 +2066,15 @@ impl MediaSeparationProgress {
     }
 
     fn set(&self, progress: u8, message: &str) -> Result<(), String> {
+        self.set_with_snapshot(progress, message, json!({}))
+    }
+
+    fn set_with_snapshot(
+        &self,
+        progress: u8,
+        message: &str,
+        stage_snapshot: Value,
+    ) -> Result<(), String> {
         let progress = progress.min(99);
         {
             let mut last_update = self
@@ -2078,8 +2087,15 @@ impl MediaSeparationProgress {
             *last_update = (progress, message.to_string());
         }
 
-        emit_media_separation_progress(&self.app, &self.task_id, &self.options, progress, message)
-            .map(|_| ())
+        emit_media_separation_progress(
+            &self.app,
+            &self.task_id,
+            &self.options,
+            progress,
+            message,
+            stage_snapshot,
+        )
+        .map(|_| ())
     }
 
     fn snapshot(&self) -> Option<DubbingTaskSnapshot> {
@@ -2098,10 +2114,12 @@ fn emit_media_separation_progress(
     options: &DubbingTaskOptions,
     progress: u8,
     message: &str,
+    stage_snapshot: Value,
 ) -> Result<DubbingTaskSnapshot, String> {
     let store = app.state::<SettingsStore>();
     let progress = progress.min(99);
     let now = Utc::now().to_rfc3339();
+    let stage_snapshot = media_separation_stage_snapshot(options, stage_snapshot);
     let snapshot = store.with_connection(|connection| {
         update_dubbing_task_state(
             connection,
@@ -2121,7 +2139,7 @@ fn emit_media_separation_progress(
             progress,
             message,
             "active",
-            json!({ "backgroundMusic": options.is_background_music_enabled }),
+            stage_snapshot,
             &now,
         )?;
         read_dubbing_task_snapshot_by_id(connection, task_id)
@@ -2129,6 +2147,16 @@ fn emit_media_separation_progress(
     emit_dubbing_progress(app, &snapshot);
 
     Ok(snapshot)
+}
+
+fn media_separation_stage_snapshot(options: &DubbingTaskOptions, details: Value) -> Value {
+    let mut snapshot = json!({ "backgroundMusic": options.is_background_music_enabled });
+    if let (Some(snapshot), Value::Object(details)) = (snapshot.as_object_mut(), details) {
+        for (key, value) in details {
+            snapshot.insert(key, value);
+        }
+    }
+    snapshot
 }
 
 fn run_subtitle_preprocess(
@@ -3104,8 +3132,10 @@ fn split_background_music_stems(
     progress: &MediaSeparationProgress,
 ) -> Result<htdemucs::StemPaths, String> {
     let stem_paths = htdemucs::split_file(source_audio_path, output_dir, |event| {
-        if let Some((progress_value, message)) = background_music_split_progress_message(event) {
-            progress.set(progress_value, &message)?;
+        if let Some((progress_value, message, stage_snapshot)) =
+            background_music_split_progress_message(event)
+        {
+            progress.set_with_snapshot(progress_value, &message, stage_snapshot)?;
         }
         Ok(())
     })
@@ -3124,6 +3154,20 @@ fn background_music_model_download_progress(downloaded: u64, total: u64) -> u8 {
     (70 + ((percent as u16 * 6) / 100) as u8).min(76)
 }
 
+fn background_model_stage_snapshot(state: &str, download_progress: Option<u64>) -> Value {
+    let mut background_model = json!({ "state": state });
+    if let Some(download_progress) = download_progress {
+        if let Some(model) = background_model.as_object_mut() {
+            model.insert(
+                "downloadProgress".to_string(),
+                json!(download_progress.min(100)),
+            );
+        }
+    }
+
+    json!({ "backgroundModel": background_model })
+}
+
 fn transfer_percent(done: u64, total: u64) -> u64 {
     if total == 0 {
         return 0;
@@ -3132,30 +3176,54 @@ fn transfer_percent(done: u64, total: u64) -> u64 {
     ((done.min(total) as f64 / total as f64) * 100.0).round() as u64
 }
 
-fn background_music_split_progress_message(event: HtDemucsProgress) -> Option<(u8, String)> {
+fn background_music_split_progress_message(event: HtDemucsProgress) -> Option<(u8, String, Value)> {
     match event {
-        HtDemucsProgress::CheckingModel => Some((69, "检查人声/背景音乐分离模型".to_string())),
-        HtDemucsProgress::DownloadingModel { downloaded, total } => Some((
-            background_music_model_download_progress(downloaded, total),
-            format!(
-                "下载人声/背景音乐分离模型 {}%",
-                transfer_percent(downloaded, total)
-            ),
+        HtDemucsProgress::CheckingModel => Some((
+            69,
+            "检查人声/背景音乐分离模型".to_string(),
+            background_model_stage_snapshot("checking", None),
         )),
-        HtDemucsProgress::VerifyingModel => Some((76, "校验人声/背景音乐分离模型".to_string())),
-        HtDemucsProgress::ModelReady => Some((77, "人声/背景音乐分离模型已就绪".to_string())),
-        HtDemucsProgress::LoadingModel { device } => {
-            Some((80, format!("加载人声/背景音乐分离模型 ({device})")))
+        HtDemucsProgress::DownloadingModel { downloaded, total } => {
+            let percent = transfer_percent(downloaded, total);
+            Some((
+                background_music_model_download_progress(downloaded, total),
+                format!("下载人声/背景音乐分离模型 {percent}%"),
+                background_model_stage_snapshot("downloading", Some(percent)),
+            ))
         }
-        HtDemucsProgress::ReadingAudio => Some((82, "读取源音频".to_string())),
+        HtDemucsProgress::VerifyingModel => Some((
+            69,
+            "校验人声/背景音乐分离模型".to_string(),
+            background_model_stage_snapshot("verifying", None),
+        )),
+        HtDemucsProgress::ModelReady => Some((
+            77,
+            "人声/背景音乐分离模型已就绪".to_string(),
+            background_model_stage_snapshot("ready", Some(100)),
+        )),
+        HtDemucsProgress::LoadingModel { device } => Some((
+            80,
+            format!("加载人声/背景音乐分离模型 ({device})"),
+            background_model_stage_snapshot("loading", Some(100)),
+        )),
+        HtDemucsProgress::ReadingAudio => Some((
+            82,
+            "读取源音频".to_string(),
+            background_model_stage_snapshot("ready", Some(100)),
+        )),
         HtDemucsProgress::Inferencing { percent } => {
             let progress = (84.0 + (percent.clamp(0.0, 100.0) * 0.10)).round() as u8;
             Some((
                 progress.min(94),
                 format!("分离人声/背景音乐音轨 {:.0}%", percent),
+                background_model_stage_snapshot("ready", Some(100)),
             ))
         }
-        HtDemucsProgress::Finished => Some((96, "人声/背景音乐音轨分离完成".to_string())),
+        HtDemucsProgress::Finished => Some((
+            96,
+            "人声/背景音乐音轨分离完成".to_string(),
+            background_model_stage_snapshot("ready", Some(100)),
+        )),
     }
 }
 
