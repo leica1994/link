@@ -783,6 +783,8 @@ pub fn prepare_dubbing_material(
             &now,
         )?;
         if should_mark_interrupted && interrupted_stage != DUBBING_STAGE_MATERIAL {
+            let interrupted_stage_snapshot =
+                read_dubbing_stage_snapshot(connection, &task_id, &interrupted_stage);
             upsert_dubbing_stage(
                 connection,
                 &task_id,
@@ -790,7 +792,7 @@ pub fn prepare_dubbing_material(
                 progress,
                 "任务已中断，可继续配音",
                 "interrupted",
-                json!({}),
+                interrupted_stage_snapshot,
                 &now,
             )?;
         }
@@ -4215,23 +4217,18 @@ impl TtsSynthesisProgress {
     where
         F: FnOnce(&mut DubbingTtsItem),
     {
-        let (progress, failed_count, items) = {
-            let mut items = self
-                .items
-                .lock()
-                .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))?;
-            if let Some(item) = items.iter_mut().find(|item| item.index == index) {
-                update(item);
-            }
-            (
-                tts_stage_progress(&items),
-                items.iter().filter(|item| item.status == "failed").count(),
-                tts_item_values(&items),
-            )
-        };
+        let mut items = self
+            .items
+            .lock()
+            .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))?;
+        if let Some(item) = items.iter_mut().find(|item| item.index == index) {
+            update(item);
+        }
+        let progress = tts_stage_progress(&items);
+        let failed_count = items.iter().filter(|item| item.status == "failed").count();
+        let item_values = tts_item_values(&items);
         let _ = message;
-        let stage_snapshot =
-            self.stage_snapshot(failed_count, items);
+        let stage_snapshot = self.stage_snapshot(failed_count, item_values);
         emit_tts_synthesis_progress(
             &self.app,
             &self.task_id,
@@ -4243,17 +4240,13 @@ impl TtsSynthesisProgress {
     }
 
     fn emit(&self, progress: u8, message: &str) -> Result<(), String> {
-        let (failed_count, items) = {
-            let items = self
-                .items
-                .lock()
-                .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))?;
-            (
-                items.iter().filter(|item| item.status == "failed").count(),
-                tts_item_values(&items),
-            )
-        };
-        let stage_snapshot = self.stage_snapshot(failed_count, items);
+        let items = self
+            .items
+            .lock()
+            .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))?;
+        let failed_count = items.iter().filter(|item| item.status == "failed").count();
+        let item_values = tts_item_values(&items);
+        let stage_snapshot = self.stage_snapshot(failed_count, item_values);
         emit_tts_synthesis_progress(&self.app, &self.task_id, progress, message, stage_snapshot)
             .map(|_| ())
     }
@@ -4285,7 +4278,18 @@ fn emit_tts_synthesis_progress(
     let store = app.state::<SettingsStore>();
     let progress = progress.min(99);
     let now = Utc::now().to_rfc3339();
+    let manifest_path = persist_tts_synthesis_manifest(&stage_snapshot)?;
     let snapshot = store.with_connection(|connection| {
+        if let Some(manifest_path) = &manifest_path {
+            upsert_dubbing_artifact(
+                connection,
+                task_id,
+                DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST,
+                manifest_path,
+                stage_snapshot.clone(),
+                &now,
+            )?;
+        }
         update_dubbing_task_state(
             connection,
             task_id,
@@ -4312,6 +4316,24 @@ fn emit_tts_synthesis_progress(
     emit_dubbing_progress(app, &snapshot);
 
     Ok(snapshot)
+}
+
+fn persist_tts_synthesis_manifest(stage_snapshot: &Value) -> Result<Option<PathBuf>, String> {
+    let Some(manifest_path) = stage_snapshot
+        .get("manifestPath")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建 TTS 配音目录: {error}"))?;
+    }
+    write_tts_manifest(&manifest_path, stage_snapshot)?;
+
+    Ok(Some(manifest_path))
 }
 
 fn read_tts_resume_items(
