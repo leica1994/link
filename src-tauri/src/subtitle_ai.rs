@@ -968,7 +968,7 @@ fn build_word_units(segments: &[TranscriptionSegment]) -> Vec<WordUnit> {
             if segment.words.is_empty() {
                 estimate_word_units(segment)
             } else {
-                let words = segment
+                let mut words = segment
                     .words
                     .iter()
                     .filter_map(|word| {
@@ -988,11 +988,32 @@ fn build_word_units(segments: &[TranscriptionSegment]) -> Vec<WordUnit> {
                 if words.is_empty() {
                     estimate_word_units(segment)
                 } else {
+                    apply_segment_timing_bounds(&mut words, segment);
                     words
                 }
             }
         })
         .collect()
+}
+
+fn apply_segment_timing_bounds(words: &mut [WordUnit], segment: &TranscriptionSegment) {
+    if words.is_empty() {
+        return;
+    }
+
+    if let Some(first) = words.first_mut() {
+        first.start_time = first.start_time.max(segment.start_time);
+        if first.end_time < first.start_time {
+            first.end_time = first.start_time;
+        }
+    }
+
+    if let Some(last) = words.last_mut() {
+        last.end_time = last.end_time.max(segment.end_time);
+        if last.start_time > last.end_time {
+            last.start_time = last.end_time;
+        }
+    }
 }
 
 fn estimate_word_units(segment: &TranscriptionSegment) -> Vec<WordUnit> {
@@ -1665,4 +1686,79 @@ fn is_no_space_character(character: char) -> bool {
 
 fn estimate_max_output_tokens(text: &str) -> u32 {
     ((text.chars().count() as u32) * 6).clamp(1024, 12000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_segment(
+        text: &str,
+        start_time: u64,
+        end_time: u64,
+        words: Vec<TranscriptionWord>,
+    ) -> TranscriptionSegment {
+        TranscriptionSegment {
+            text: text.to_string(),
+            start_time,
+            end_time,
+            uid: String::new(),
+            status: String::new(),
+            words,
+        }
+    }
+
+    #[test]
+    fn build_word_units_keeps_parent_segment_timing_bounds() {
+        let segments = vec![test_segment(
+            "你好世界",
+            1000,
+            3000,
+            vec![
+                TranscriptionWord {
+                    text: "你好".to_string(),
+                    start_time: 900,
+                    end_time: 1200,
+                },
+                TranscriptionWord {
+                    text: "世界".to_string(),
+                    start_time: 1500,
+                    end_time: 1900,
+                },
+            ],
+        )];
+
+        let words = build_word_units(&segments);
+
+        assert_eq!(words.first().map(|word| word.start_time), Some(1000));
+        assert_eq!(words.last().map(|word| word.end_time), Some(3000));
+    }
+
+    #[test]
+    fn merge_word_units_uses_adjusted_parent_bounds() {
+        let segments = vec![test_segment(
+            "你好世界",
+            1000,
+            3000,
+            vec![
+                TranscriptionWord {
+                    text: "你好".to_string(),
+                    start_time: 900,
+                    end_time: 1200,
+                },
+                TranscriptionWord {
+                    text: "世界".to_string(),
+                    start_time: 1500,
+                    end_time: 1900,
+                },
+            ],
+        )];
+        let words = build_word_units(&segments);
+
+        let merged = merge_word_units_by_sentences(&words, &["你好世界".to_string()]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].start_time, 1000);
+        assert_eq!(merged[0].end_time, 3000);
+    }
 }
