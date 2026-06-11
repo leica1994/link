@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -106,6 +106,22 @@ const TTS_MAX_ATTEMPTS_PER_LINE: usize = 3;
 const TTS_RETRY_SLEEP_MS: u64 = 350;
 const TTS_MODEL_WAIT_SLEEP_MS: u64 = 500;
 const TTS_SYNTHESIS_ACTIVE_MESSAGE: &str = "TTS 配音生成中";
+const TTS_AUDIO_POST_PROCESSING_VERSION: u32 = 1;
+const TTS_RNNOISE_MODEL_FILE_NAME: &str = "std.rnnn";
+const TTS_RNNOISE_MODEL_URL: &str =
+    "https://raw.githubusercontent.com/richardpl/arnndn-models/master/std.rnnn";
+const TTS_RNNOISE_MODEL_SIZE_BYTES: u64 = 302_903;
+const TTS_RNNOISE_MODEL_SHA256: &str =
+    "6b8943dc4a9b6b24425873992a44f29c0577503276456af46a8854774faeb294";
+const TTS_RNNOISE_MIX: f64 = 0.7;
+const TTS_AUDIO_DECLICK_WINDOW: f64 = 10.0;
+const TTS_AUDIO_DECLICK_OVERLAP: f64 = 0.75;
+const TTS_AUDIO_LOWPASS_HZ: u32 = 6_500;
+const TTS_AUDIO_TAIL_RMS_WINDOW_MS: u64 = 30;
+const TTS_AUDIO_TAIL_RMS_THRESHOLD: f64 = 0.015;
+const TTS_AUDIO_FORCE_TAIL_FADE_MS: u64 = 150;
+
+static TTS_RNNOISE_MODEL_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -366,6 +382,7 @@ struct DubbingTtsItem {
     latency_ms: Option<u128>,
     file_size: Option<u64>,
     audio_duration_ms: Option<u64>,
+    post_processing: Option<Value>,
     error: Option<String>,
 }
 
@@ -4873,6 +4890,8 @@ fn run_tts_work_item(
                 ensure_non_empty_file(&raw_output_path, "TTS 原始音频为空")?;
                 convert_tts_audio_to_wav(&raw_output_path, &work_item.output_path)?;
                 ensure_non_empty_file(&work_item.output_path, "TTS 音频为空")?;
+                let post_processing = post_process_tts_audio(&work_item.output_path);
+                ensure_non_empty_file(&work_item.output_path, "TTS 音频为空")?;
                 let file_size = file_size(&work_item.output_path).ok();
                 let audio_duration_ms = probe_audio_duration_ms(&work_item.output_path).ok();
                 record_dubbing_model_success(&store, &selected.model.id, latency_ms)?;
@@ -4884,6 +4903,7 @@ fn run_tts_work_item(
                     item.latency_ms = Some(latency_ms);
                     item.file_size = file_size;
                     item.audio_duration_ms = audio_duration_ms;
+                    item.post_processing = Some(post_processing);
                     item.error = None;
                 })?;
                 return Ok(());
@@ -5172,6 +5192,7 @@ fn build_tts_work_items_from_resume(
                 latency_ms: None,
                 file_size: None,
                 audio_duration_ms: None,
+                post_processing: None,
                 error: None,
             });
         item.status = "queued".to_string();
@@ -5179,6 +5200,7 @@ fn build_tts_work_items_from_resume(
         item.raw_output_path = None;
         item.audio_duration_ms = None;
         item.file_size = None;
+        item.post_processing = None;
         items.push(item);
         work_items.push_back(DubbingTtsWorkItem {
             index,
@@ -5235,12 +5257,26 @@ fn is_reusable_tts_item(
     if !output_path.is_file() || file_size(&output_path).unwrap_or_default() == 0 {
         return false;
     }
+    if !tts_item_post_processing_matches(item) {
+        return false;
+    }
 
     item.get("audioDurationMs")
         .and_then(Value::as_u64)
         .filter(|duration| *duration > 0)
         .or_else(|| probe_audio_duration_ms(&output_path).ok())
         .is_some_and(|duration| duration > 0)
+}
+
+fn tts_item_post_processing_matches(item: &Value) -> bool {
+    item.get("postProcessing")
+        .filter(|value| {
+            value.get("status").and_then(Value::as_str) == Some("done")
+                && value.get("version").and_then(Value::as_u64)
+                    == Some(u64::from(TTS_AUDIO_POST_PROCESSING_VERSION))
+                && value.get("rnnoiseApplied").and_then(Value::as_bool) == Some(true)
+        })
+        .is_some()
 }
 
 fn tts_item_matches_segment(
@@ -5319,6 +5355,7 @@ fn tts_item_from_resume_value(
             .map(|value| value as u128),
         file_size: value.get("fileSize").and_then(Value::as_u64),
         audio_duration_ms: value.get("audioDurationMs").and_then(Value::as_u64),
+        post_processing: value.get("postProcessing").cloned(),
         error: value
             .get("error")
             .and_then(Value::as_str)
@@ -5339,6 +5376,7 @@ fn tts_synthesis_stage_snapshot(
         "referenceAudioManifestPath": input_metadata.get("referenceAudioManifestPath").cloned().unwrap_or_else(|| json!("")),
         "referenceAudioManifestHash": input_metadata.get("referenceAudioManifestHash").cloned().unwrap_or_else(|| json!("")),
         "enabledModelHash": input_metadata.get("enabledModelHash").cloned().unwrap_or_else(|| json!("")),
+        "postProcessing": input_metadata.get("postProcessing").cloned().unwrap_or_else(tts_audio_post_processing_metadata),
         "failedCount": failed_count,
         "manifestPath": path_to_string(manifest_path),
         "items": items,
@@ -5352,6 +5390,7 @@ fn tts_synthesis_metadata_value_matches(value: &Value, expected: &Value) -> bool
         "referenceAudioManifestPath",
         "referenceAudioManifestHash",
         "enabledModelHash",
+        "postProcessing",
     ]
     .into_iter()
     .all(|key| value.get(key) == expected.get(key))
@@ -5401,6 +5440,7 @@ fn tts_item_value(item: &DubbingTtsItem) -> Value {
         "latencyMs": item.latency_ms,
         "fileSize": item.file_size,
         "audioDurationMs": item.audio_duration_ms,
+        "postProcessing": item.post_processing,
         "error": item.error,
     })
 }
@@ -5512,7 +5552,30 @@ fn tts_synthesis_input_metadata(
         "referenceAudioManifestPath": reference_manifest_path,
         "referenceAudioManifestHash": reference_manifest_hash,
         "enabledModelHash": enabled_model_hash(store)?,
+        "postProcessing": tts_audio_post_processing_metadata(),
     }))
+}
+
+fn tts_audio_post_processing_metadata() -> Value {
+    json!({
+        "version": TTS_AUDIO_POST_PROCESSING_VERSION,
+        "mode": "rnnoise-edge",
+        "model": {
+            "fileName": TTS_RNNOISE_MODEL_FILE_NAME,
+            "url": TTS_RNNOISE_MODEL_URL,
+            "sizeBytes": TTS_RNNOISE_MODEL_SIZE_BYTES,
+            "sha256": TTS_RNNOISE_MODEL_SHA256,
+        },
+        "filters": {
+            "rnnoiseMix": TTS_RNNOISE_MIX,
+            "declickWindow": TTS_AUDIO_DECLICK_WINDOW,
+            "declickOverlap": TTS_AUDIO_DECLICK_OVERLAP,
+            "lowpassHz": TTS_AUDIO_LOWPASS_HZ,
+            "tailRmsWindowMs": TTS_AUDIO_TAIL_RMS_WINDOW_MS,
+            "tailRmsThreshold": TTS_AUDIO_TAIL_RMS_THRESHOLD,
+            "forceTailFadeMs": TTS_AUDIO_FORCE_TAIL_FADE_MS,
+        },
+    })
 }
 
 fn file_sha256(path: &Path) -> Result<String, String> {
@@ -5615,6 +5678,292 @@ fn convert_tts_audio_to_wav(input_path: &Path, output_path: &Path) -> Result<(),
             .arg(output_path),
         "TTS 音频转码失败",
     )
+}
+
+fn post_process_tts_audio(path: &Path) -> Value {
+    let tail_rms_before = measure_tts_tail_rms(path, TTS_AUDIO_TAIL_RMS_WINDOW_MS).ok();
+    let model_path = match ensure_tts_rnnoise_model() {
+        Ok(path) => path,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "version": TTS_AUDIO_POST_PROCESSING_VERSION,
+                "rnnoiseApplied": false,
+                "tailFadeApplied": false,
+                "tailRmsBefore": tail_rms_before,
+                "tailRmsAfter": tail_rms_before,
+                "error": error,
+            });
+        }
+    };
+
+    let denoised_path = tts_audio_temp_path(path, "rnnoise");
+    let filter_result = run_tts_denoise_filter(path, &denoised_path, &model_path)
+        .and_then(|_| ensure_non_empty_file(&denoised_path, "TTS 去噪临时音频为空"))
+        .and_then(|_| {
+            fs::copy(&denoised_path, path)
+                .map(|_| ())
+                .map_err(|error| format!("无法写入 TTS 去噪音频: {error}"))
+        });
+    let _ = fs::remove_file(&denoised_path);
+
+    if let Err(error) = filter_result {
+        return json!({
+            "status": "failed",
+            "version": TTS_AUDIO_POST_PROCESSING_VERSION,
+            "modelPath": path_to_string(&model_path),
+            "rnnoiseApplied": false,
+            "tailFadeApplied": false,
+            "tailRmsBefore": tail_rms_before,
+            "tailRmsAfter": tail_rms_before,
+            "error": error,
+        });
+    }
+
+    let mut tail_rms_after = measure_tts_tail_rms(path, TTS_AUDIO_TAIL_RMS_WINDOW_MS).ok();
+    let mut tail_fade_applied = false;
+    let mut tail_fade_error = None::<String>;
+    if tail_rms_after.is_some_and(|value| value > TTS_AUDIO_TAIL_RMS_THRESHOLD) {
+        match apply_tts_tail_fade(path) {
+            Ok(applied) => {
+                tail_fade_applied = applied;
+                if applied {
+                    tail_rms_after = measure_tts_tail_rms(path, TTS_AUDIO_TAIL_RMS_WINDOW_MS).ok();
+                }
+            }
+            Err(error) => {
+                tail_fade_error = Some(error);
+            }
+        }
+    }
+
+    json!({
+        "status": "done",
+        "version": TTS_AUDIO_POST_PROCESSING_VERSION,
+        "modelPath": path_to_string(&model_path),
+        "rnnoiseApplied": true,
+        "tailFadeApplied": tail_fade_applied,
+        "tailRmsBefore": tail_rms_before,
+        "tailRmsAfter": tail_rms_after,
+        "tailFadeError": tail_fade_error,
+    })
+}
+
+fn ensure_tts_rnnoise_model() -> Result<PathBuf, String> {
+    let _guard = TTS_RNNOISE_MODEL_LOCK
+        .lock()
+        .map_err(|error| format!("RNNoise 模型缓存锁定失败: {error}"))?;
+    let model_path = app_paths::rnnoise_model_dir()?.join(TTS_RNNOISE_MODEL_FILE_NAME);
+    if tts_rnnoise_model_matches(&model_path) {
+        return Ok(model_path);
+    }
+
+    if model_path.exists() {
+        fs::remove_file(&model_path)
+            .map_err(|error| format!("无法清理无效 RNNoise 模型缓存: {error}"))?;
+    }
+    download_tts_rnnoise_model(&model_path)?;
+    if tts_rnnoise_model_matches(&model_path) {
+        Ok(model_path)
+    } else {
+        Err("RNNoise 模型下载后校验失败".to_string())
+    }
+}
+
+fn tts_rnnoise_model_matches(path: &Path) -> bool {
+    path.is_file()
+        && file_size(path).ok() == Some(TTS_RNNOISE_MODEL_SIZE_BYTES)
+        && file_sha256(path)
+            .ok()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(TTS_RNNOISE_MODEL_SHA256))
+}
+
+fn download_tts_rnnoise_model(output_path: &Path) -> Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建 RNNoise 模型目录: {error}"))?;
+    }
+
+    let temp_path = output_path.with_extension("part");
+    if temp_path.exists() {
+        fs::remove_file(&temp_path)
+            .map_err(|error| format!("无法清理 RNNoise 模型临时文件: {error}"))?;
+    }
+
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| format!("无法创建 RNNoise 模型下载客户端: {error}"))?;
+    let mut response = client
+        .get(TTS_RNNOISE_MODEL_URL)
+        .send()
+        .map_err(|error| format!("RNNoise 模型下载失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("RNNoise 模型下载失败: {error}"))?;
+    let mut file =
+        File::create(&temp_path).map_err(|error| format!("无法写入 RNNoise 模型缓存: {error}"))?;
+    let mut downloaded = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let bytes_read = response
+            .read(&mut buffer)
+            .map_err(|error| format!("无法读取 RNNoise 模型下载数据: {error}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..bytes_read])
+            .map_err(|error| format!("无法保存 RNNoise 模型缓存: {error}"))?;
+        downloaded += bytes_read as u64;
+    }
+    file.flush()
+        .map_err(|error| format!("无法保存 RNNoise 模型缓存: {error}"))?;
+    drop(file);
+
+    if downloaded != TTS_RNNOISE_MODEL_SIZE_BYTES {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "RNNoise 模型下载不完整，期望 {} 字节，实际 {} 字节",
+            TTS_RNNOISE_MODEL_SIZE_BYTES, downloaded
+        ));
+    }
+
+    let hash = file_sha256(&temp_path)?;
+    if !hash.eq_ignore_ascii_case(TTS_RNNOISE_MODEL_SHA256) {
+        let _ = fs::remove_file(&temp_path);
+        return Err("RNNoise 模型 SHA256 校验失败".to_string());
+    }
+
+    fs::rename(&temp_path, output_path)
+        .map_err(|error| format!("无法更新 RNNoise 模型缓存: {error}"))
+}
+
+fn run_tts_denoise_filter(
+    input_path: &Path,
+    output_path: &Path,
+    model_path: &Path,
+) -> Result<(), String> {
+    let model_path = escape_ffmpeg_filter_path(model_path);
+    let filter = format!(
+        "arnndn=m='{model_path}':mix={TTS_RNNOISE_MIX:.2},adeclick=window={TTS_AUDIO_DECLICK_WINDOW:.1}:overlap={TTS_AUDIO_DECLICK_OVERLAP:.2},lowpass=f={TTS_AUDIO_LOWPASS_HZ}"
+    );
+
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-af")
+            .arg(filter)
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-y")
+            .arg(output_path),
+        "TTS 去噪失败",
+    )
+}
+
+fn apply_tts_tail_fade(path: &Path) -> Result<bool, String> {
+    let duration_ms = probe_audio_duration_ms(path)?;
+    let fade_ms = TTS_AUDIO_FORCE_TAIL_FADE_MS.min(duration_ms / 2);
+    if fade_ms == 0 {
+        return Ok(false);
+    }
+
+    let start_s = duration_ms.saturating_sub(fade_ms) as f64 / 1000.0;
+    let fade_s = fade_ms as f64 / 1000.0;
+    let output_path = tts_audio_temp_path(path, "tail-fade");
+    let filter = format!("afade=t=out:st={start_s:.3}:d={fade_s:.3}");
+    let result = run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(path)
+            .arg("-af")
+            .arg(filter)
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-y")
+            .arg(&output_path),
+        "TTS 尾部淡出失败",
+    )
+    .and_then(|_| ensure_non_empty_file(&output_path, "TTS 尾部淡出临时音频为空"))
+    .and_then(|_| {
+        fs::copy(&output_path, path)
+            .map(|_| ())
+            .map_err(|error| format!("无法写入 TTS 尾部淡出音频: {error}"))
+    });
+    let _ = fs::remove_file(&output_path);
+    result.map(|_| true)
+}
+
+fn measure_tts_tail_rms(path: &Path, window_ms: u64) -> Result<f64, String> {
+    let mut reader =
+        hound::WavReader::open(path).map_err(|error| format!("无法读取 TTS 音频: {error}"))?;
+    let spec = reader.spec();
+    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err("TTS 音频采样格式不支持".to_string());
+    }
+
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法解析 TTS 音频采样: {error}"))?;
+    if samples.is_empty() {
+        return Ok(0.0);
+    }
+
+    let channels = usize::from(spec.channels.max(1));
+    let frames = samples.len() / channels;
+    if frames == 0 {
+        return Ok(0.0);
+    }
+
+    let window_frames = ((u64::from(spec.sample_rate) * window_ms) / 1000).max(1) as usize;
+    let start_frame = frames.saturating_sub(window_frames);
+    let start_index = start_frame * channels;
+    let tail = &samples[start_index..];
+    if tail.is_empty() {
+        return Ok(0.0);
+    }
+
+    let square_sum = tail
+        .iter()
+        .map(|sample| {
+            let amplitude = normalized_sample_amplitude(*sample);
+            amplitude * amplitude
+        })
+        .sum::<f64>();
+
+    Ok((square_sum / tail.len() as f64).sqrt())
+}
+
+fn tts_audio_temp_path(path: &Path, suffix: &str) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("tts");
+    path.with_file_name(format!("{stem}.{suffix}.wav"))
+}
+
+fn escape_ffmpeg_filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
 }
 
 fn model_display_label(model: &DubbingModel) -> String {

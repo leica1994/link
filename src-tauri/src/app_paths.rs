@@ -7,6 +7,7 @@ const DUBBING_DIR_NAME: &str = "dubbing";
 const HTDEMUCS_DIR_NAME: &str = "htdemucs-libtorch";
 const LOG_DIR_NAME: &str = "logs";
 const MODELS_DIR_NAME: &str = "models";
+const RNNOISE_DIR_NAME: &str = "arnndn";
 const TEMP_DIR_NAME: &str = "temp";
 const WEBVIEW_DIR_NAME: &str = "webview";
 
@@ -54,6 +55,15 @@ pub fn htdemucs_model_dir() -> Result<PathBuf, String> {
         .join(HTDEMUCS_DIR_NAME);
     fs::create_dir_all(&cache_dir)
         .map_err(|error| format!("无法创建 HTDemucs 模型缓存目录: {error}"))?;
+    Ok(cache_dir)
+}
+
+pub fn rnnoise_model_dir() -> Result<PathBuf, String> {
+    let cache_dir = ensure_app_data_dir()?
+        .join(MODELS_DIR_NAME)
+        .join(RNNOISE_DIR_NAME);
+    fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("无法创建 RNNoise 模型缓存目录: {error}"))?;
     Ok(cache_dir)
 }
 
