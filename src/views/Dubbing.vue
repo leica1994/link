@@ -235,8 +235,56 @@
             </div>
 
             <div
-              v-else-if="dubbingSubtitleRows.length > 0 && !shouldShowDubbingStagePreview"
-              class="translate-preview translate-subtitle-list"
+              v-else-if="shouldShowTtsSynthesisView"
+              class="translate-preview translate-subtitle-list dubbing-tts-list"
+            >
+              <div
+                v-for="row in dubbingSubtitleRows"
+                :key="row.segment.uid || `dubbing-tts-${row.index}`"
+                class="translate-subtitle-row dubbing-subtitle-row dubbing-tts-row"
+              >
+                <span class="translate-subtitle-index">{{ row.index + 1 }}</span>
+                <span
+                  class="translate-subtitle-status"
+                  :class="`status-${normalizeTtsItemStatus(row.ttsItem?.status)}`"
+                >
+                  {{ ttsStatusLabel(row.ttsItem) }}
+                </span>
+                <span class="translate-subtitle-time translate-subtitle-start">
+                  {{ formatSegmentTime(row.segment.startTime) }}
+                </span>
+                <span class="translate-subtitle-time translate-subtitle-end">
+                  {{ formatSegmentTime(row.segment.endTime) }}
+                </span>
+                <p>{{ row.segment.text }}</p>
+                <div class="dubbing-tts-audio">
+                  <button
+                    class="dubbing-reference-play dubbing-tts-play"
+                    :class="{ active: isTtsAudioPlaying(row.ttsItem) }"
+                    type="button"
+                    :disabled="!canPlayTtsAudio(row.ttsItem)"
+                    :aria-label="ttsAudioAriaLabel(row.ttsItem, row.index)"
+                    @click="playTtsAudio(row.ttsItem)"
+                  >
+                    <Volume2 :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ ttsAudioButtonLabel(row.ttsItem) }}</span>
+                  </button>
+                  <span
+                    class="dubbing-reference-status"
+                    :class="`quality-${ttsStatusClass(row.ttsItem)}`"
+                  >
+                    {{ ttsStatusLabel(row.ttsItem) }}
+                  </span>
+                  <span v-if="ttsDetailLabel(row.ttsItem)" class="dubbing-reference-detail">
+                    {{ ttsDetailLabel(row.ttsItem) }}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div
+              v-else-if="shouldShowReferenceAudioView"
+              class="translate-preview translate-subtitle-list dubbing-reference-list"
             >
               <div
                 v-for="row in dubbingSubtitleRows"
@@ -350,6 +398,13 @@
               <div class="dubbing-model-copy">
                 <h2 :title="modelTitle(model)">{{ modelTitle(model) }}</h2>
                 <p>{{ modelSubtitle(model) }}</p>
+              </div>
+
+              <div class="dubbing-model-scheduler" :class="`status-${modelSchedulerStatusClass(model)}`">
+                <span>{{ modelSchedulerStatusLabel(model) }}</span>
+                <span>权重 {{ Math.round(model.schedulerWeight || 0) }}</span>
+                <span v-if="model.avgLatencyMs">{{ formatDurationLabel(model.avgLatencyMs) }}</span>
+                <span v-if="model.consecutiveFailures">连续失败 {{ model.consecutiveFailures }}</span>
               </div>
 
               <dl v-if="!isIndexTts2Model(model)" class="dubbing-model-meta">
@@ -674,9 +729,21 @@ type DubbingVoiceOption = {
   metadata: Record<string, unknown>
 }
 
+type DubbingModelSchedulerStatus = 'disabled' | 'ready' | 'inUse' | 'cooldown'
+
 type DubbingModel = DubbingVoiceOption & {
   id: string
   enabled: boolean
+  schedulerStatus: DubbingModelSchedulerStatus | string
+  schedulerWeight: number
+  successCount: number
+  failureCount: number
+  consecutiveFailures: number
+  avgLatencyMs?: number
+  cooldownUntil?: string
+  lastError: string
+  lastUsedAt?: string
+  lastCheckedAt?: string
   createdAt: string
   updatedAt: string
 }
@@ -747,10 +814,32 @@ type DubbingReferenceAudioItem = {
   quality?: string
 }
 
+type DubbingTtsItemStatus = 'pending' | 'queued' | 'running' | 'retrying' | 'done' | 'failed'
+
+type DubbingTtsItem = {
+  index: number
+  uid?: string
+  text: string
+  referenceAudioPath: string
+  rawOutputPath?: string
+  outputPath?: string
+  status: DubbingTtsItemStatus | string
+  modelId?: string
+  modelName?: string
+  engine?: string
+  engineLabel?: string
+  attemptCount?: number
+  latencyMs?: number
+  fileSize?: number
+  audioDurationMs?: number
+  error?: string
+}
+
 type DubbingSubtitleRow = {
   index: number
   segment: DubbingSubtitleSegment
   referenceAudio?: DubbingReferenceAudioItem
+  ttsItem?: DubbingTtsItem
 }
 
 type DubbingTaskSnapshot = {
@@ -851,6 +940,7 @@ let previewAudioUrl = ''
 let materialPrepareToken = 0
 let unlistenSourceDragDrop: UnlistenFn | undefined
 let unlistenDubbingProgress: UnlistenFn | undefined
+let unlistenDubbingModelsUpdated: UnlistenFn | undefined
 let isApplyingStoredSettings = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 
@@ -937,6 +1027,22 @@ const referenceAudioItemsByIndex = computed(() => {
   return new Map(referenceAudioItems.value.map((item) => [item.index, item]))
 })
 
+const ttsItems = computed(() => {
+  return readTtsItems(activeDubbingTask.value?.stages.ttsSynthesis?.snapshot?.items)
+})
+
+const ttsItemsByUid = computed(() => {
+  return new Map(
+    ttsItems.value
+      .filter((item): item is DubbingTtsItem & { uid: string } => Boolean(item.uid))
+      .map((item) => [item.uid, item]),
+  )
+})
+
+const ttsItemsByIndex = computed(() => {
+  return new Map(ttsItems.value.map((item) => [item.index, item]))
+})
+
 const dubbingSubtitleRows = computed<DubbingSubtitleRow[]>(() => {
   return preprocessedSubtitleSegments.value.map((segment, index) => ({
     index,
@@ -944,6 +1050,9 @@ const dubbingSubtitleRows = computed<DubbingSubtitleRow[]>(() => {
     referenceAudio:
       (segment.uid ? referenceAudioItemsByUid.value.get(segment.uid) : undefined) ??
       referenceAudioItemsByIndex.value.get(index),
+    ttsItem:
+      (segment.uid ? ttsItemsByUid.value.get(segment.uid) : undefined) ??
+      ttsItemsByIndex.value.get(index),
   }))
 })
 
@@ -1043,6 +1152,14 @@ const isReferenceAudioDone = computed(() => {
   )
 })
 
+const isTtsSynthesisDone = computed(() => {
+  const task = activeDubbingTask.value
+  return Boolean(
+    task?.stages.ttsSynthesis?.status === 'done' &&
+    hasDubbingArtifact(task, 'tts-audio-manifest'),
+  )
+})
+
 const needsCustomReferenceAudioInput = computed(() => {
   const task = activeDubbingTask.value
   if (
@@ -1096,15 +1213,45 @@ const currentDubbingStage = computed(() => {
   )
 })
 
+const shouldShowTtsSynthesisView = computed(() => {
+  const task = activeDubbingTask.value
+  const stage = task?.stages.ttsSynthesis
+  if (!task || !stage || dubbingSubtitleRows.value.length === 0) {
+    return false
+  }
+
+  return (
+    task.currentStage === 'tts-synthesis' ||
+    ['active', 'failed', 'interrupted', 'done'].includes(stage.status) ||
+    ttsItems.value.length > 0 ||
+    isTtsSynthesisDone.value
+  )
+})
+
+const shouldShowReferenceAudioView = computed(() => {
+  const task = activeDubbingTask.value
+  const stage = task?.stages.referenceAudio
+  if (!task || !stage || dubbingSubtitleRows.value.length === 0 || shouldShowTtsSynthesisView.value) {
+    return false
+  }
+
+  return (
+    task.currentStage === 'reference-audio' ||
+    ['active', 'failed', 'interrupted', 'done'].includes(stage.status) ||
+    referenceAudioItems.value.length > 0
+  )
+})
+
 const shouldShowDubbingProgress = computed(() => {
   return shouldShowMediaSeparationView.value || Boolean(currentDubbingStage.value)
 })
 
 const shouldShowDubbingStagePreview = computed(() => {
-  const stage = currentDubbingStage.value
-  if (stage?.key === 'reference-audio' && preprocessedSubtitleSegments.value.length > 0) {
+  if (shouldShowReferenceAudioView.value || shouldShowTtsSynthesisView.value) {
     return false
   }
+
+  const stage = currentDubbingStage.value
 
   return Boolean(
     stage &&
@@ -1147,6 +1294,14 @@ const dubbingStatusText = computed(() => {
     return '配音失败'
   }
 
+  if (
+    isDubbingRunning.value &&
+    currentDubbingStage.value?.key === 'tts-synthesis' &&
+    currentDubbingStage.value.status === 'active'
+  ) {
+    return 'TTS 配音生成中'
+  }
+
   if (isDubbingRunning.value && currentDubbingStage.value) {
     return currentDubbingStage.value.message
   }
@@ -1160,6 +1315,10 @@ const dubbingStatusText = computed(() => {
   }
 
   if (activeDubbingTask.value.status === 'preprocessed') {
+    if (isTtsSynthesisDone.value) {
+      return 'TTS 配音完成'
+    }
+
     if (isReferenceAudioDone.value) {
       return '参考音频生成完成'
     }
@@ -1205,7 +1364,7 @@ const canStartDubbing = computed(() => {
 
   return (
     ['ready', 'failed', 'interrupted'].includes(activeDubbingTask.value.status) ||
-    (activeDubbingTask.value.status === 'preprocessed' && !isReferenceAudioDone.value)
+    (activeDubbingTask.value.status === 'preprocessed' && !isTtsSynthesisDone.value)
   )
 })
 
@@ -1814,12 +1973,62 @@ const playReferenceAudio = async (item?: DubbingReferenceAudioItem) => {
   }
 }
 
+const playTtsAudio = async (item?: DubbingTtsItem) => {
+  if (!item?.outputPath || loadingReferenceAudioPath.value) {
+    return
+  }
+
+  if (playingReferenceAudioPath.value === item.outputPath) {
+    stopPreviewAudio()
+    return
+  }
+
+  if (!isTauriRuntime()) {
+    dubbingError.value = '请在桌面应用中播放 TTS 音频'
+    return
+  }
+
+  loadingReferenceAudioPath.value = item.outputPath
+  dubbingError.value = ''
+
+  try {
+    const result = await invoke<LoadDubbingReferenceAudioResult>('load_dubbing_reference_audio', {
+      request: { path: item.outputPath },
+    })
+    const audio = await playPreview(result.audioDataUrl)
+    playingReferenceAudioPath.value = item.outputPath
+    audio.addEventListener(
+      'ended',
+      () => {
+        if (playingReferenceAudioPath.value === item.outputPath) {
+          playingReferenceAudioPath.value = ''
+        }
+      },
+      { once: true },
+    )
+  } catch (error) {
+    dubbingError.value = stringifyError(error, '播放 TTS 音频失败')
+  } finally {
+    if (loadingReferenceAudioPath.value === item.outputPath) {
+      loadingReferenceAudioPath.value = ''
+    }
+  }
+}
+
 const canPlayReferenceAudio = (item?: DubbingReferenceAudioItem) => {
   return Boolean(item?.path) && !loadingReferenceAudioPath.value
 }
 
+const canPlayTtsAudio = (item?: DubbingTtsItem) => {
+  return Boolean(item?.outputPath && item.status === 'done') && !loadingReferenceAudioPath.value
+}
+
 const isReferenceAudioPlaying = (item?: DubbingReferenceAudioItem) => {
   return Boolean(item?.path && playingReferenceAudioPath.value === item.path)
+}
+
+const isTtsAudioPlaying = (item?: DubbingTtsItem) => {
+  return Boolean(item?.outputPath && playingReferenceAudioPath.value === item.outputPath)
 }
 
 const referenceAudioButtonLabel = (item?: DubbingReferenceAudioItem) => {
@@ -1830,12 +2039,28 @@ const referenceAudioButtonLabel = (item?: DubbingReferenceAudioItem) => {
   return isReferenceAudioPlaying(item) ? '播放中' : '播放'
 }
 
+const ttsAudioButtonLabel = (item?: DubbingTtsItem) => {
+  if (item?.outputPath && loadingReferenceAudioPath.value === item.outputPath) {
+    return '载入中'
+  }
+
+  return isTtsAudioPlaying(item) ? 'TTS 中' : 'TTS'
+}
+
 const referenceAudioAriaLabel = (item: DubbingReferenceAudioItem | undefined, index: number) => {
   if (!item?.path) {
     return `第 ${index + 1} 条参考音频未生成`
   }
 
   return `${isReferenceAudioPlaying(item) ? '停止' : '播放'}第 ${index + 1} 条参考音频`
+}
+
+const ttsAudioAriaLabel = (item: DubbingTtsItem | undefined, index: number) => {
+  if (!item?.outputPath) {
+    return `第 ${index + 1} 条 TTS 音频未生成`
+  }
+
+  return `${isTtsAudioPlaying(item) ? '停止' : '播放'}第 ${index + 1} 条 TTS 音频`
 }
 
 const referenceAudioStatusLabel = (item?: DubbingReferenceAudioItem) => {
@@ -1869,6 +2094,70 @@ const referenceAudioStatusLabel = (item?: DubbingReferenceAudioItem) => {
     default:
       return item.path ? '可用' : '等待'
   }
+}
+
+const ttsStatusLabel = (item?: DubbingTtsItem) => {
+  switch (item?.status) {
+    case 'queued':
+      return '等待模型'
+    case 'running':
+      return '生成中'
+    case 'retrying':
+      return '重试中'
+    case 'done':
+      return '已生成'
+    case 'failed':
+      return '失败'
+    case 'pending':
+    default:
+      return '等待'
+  }
+}
+
+const normalizeTtsItemStatus = (status?: string) => {
+  const value = status ?? 'pending'
+  return ['queued', 'running', 'retrying', 'done', 'failed', 'pending'].includes(value) ? value : 'pending'
+}
+
+const ttsStatusClass = (item?: DubbingTtsItem) => {
+  switch (item?.status) {
+    case 'done':
+      return 'ok'
+    case 'failed':
+      return 'warning'
+    case 'running':
+    case 'retrying':
+    case 'queued':
+      return 'normalized'
+    default:
+      return 'pending'
+  }
+}
+
+const ttsDetailLabel = (item?: DubbingTtsItem) => {
+  if (!item) {
+    return ''
+  }
+
+  const details: string[] = []
+  if (item.engineLabel || item.modelName) {
+    details.push([item.engineLabel, item.modelName].filter(Boolean).join(' · '))
+  }
+  if (item.attemptCount) {
+    details.push(`${item.attemptCount} 次`)
+  }
+  if (item.latencyMs !== undefined) {
+    details.push(`${Math.round(item.latencyMs)} ms`)
+  }
+  const durationLabel = formatDurationLabel(item.audioDurationMs)
+  if (durationLabel) {
+    details.push(durationLabel)
+  }
+  if (item.status === 'failed' && item.error) {
+    details.push(item.error)
+  }
+
+  return details.filter(Boolean).join(' · ')
 }
 
 const referenceAudioQualityClass = (item?: DubbingReferenceAudioItem) => {
@@ -1961,6 +2250,44 @@ const readReferenceAudioItem = (value: unknown): DubbingReferenceAudioItem | nul
   }
 }
 
+const readTtsItems = (value: unknown): DubbingTtsItem[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value.map(readTtsItem).filter((item): item is DubbingTtsItem => Boolean(item))
+}
+
+const readTtsItem = (value: unknown): DubbingTtsItem | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const index = readNumberValue(value.index)
+  if (index === undefined) {
+    return null
+  }
+
+  return {
+    index,
+    uid: readStringValue(value.uid),
+    text: readStringValue(value.text) ?? '',
+    referenceAudioPath: readStringValue(value.referenceAudioPath) ?? '',
+    rawOutputPath: readStringValue(value.rawOutputPath),
+    outputPath: readStringValue(value.outputPath),
+    status: readStringValue(value.status) ?? 'pending',
+    modelId: readStringValue(value.modelId),
+    modelName: readStringValue(value.modelName),
+    engine: readStringValue(value.engine),
+    engineLabel: readStringValue(value.engineLabel),
+    attemptCount: readNumberValue(value.attemptCount),
+    latencyMs: readNumberValue(value.latencyMs),
+    fileSize: readNumberValue(value.fileSize),
+    audioDurationMs: readNumberValue(value.audioDurationMs),
+    error: readStringValue(value.error),
+  }
+}
+
 const readStringValue = (value: unknown) => (typeof value === 'string' ? value : undefined)
 
 const readNumberValue = (value: unknown) => {
@@ -2019,6 +2346,40 @@ const modelSubtitle = (model: DubbingModel) => {
   }
 
   return model.modelKey
+}
+
+const modelSchedulerStatusLabel = (model: DubbingModel) => {
+  if (!model.enabled || model.schedulerStatus === 'disabled') {
+    return '关闭'
+  }
+
+  switch (model.schedulerStatus) {
+    case 'ready':
+      return '可调度'
+    case 'inUse':
+      return '使用中'
+    case 'cooldown':
+      return model.cooldownUntil ? '冷却中' : '暂停调度'
+    default:
+      return '可调度'
+  }
+}
+
+const modelSchedulerStatusClass = (model: DubbingModel) => {
+  if (!model.enabled || model.schedulerStatus === 'disabled') {
+    return 'disabled'
+  }
+
+  switch (model.schedulerStatus) {
+    case 'inUse':
+      return 'active'
+    case 'cooldown':
+      return 'cooldown'
+    case 'ready':
+      return 'ready'
+    default:
+      return 'ready'
+  }
 }
 
 const voiceKey = (engine: DubbingEngineKind, modelKey: string) => `${engine}:${modelKey}`
@@ -2097,6 +2458,16 @@ const registerDubbingProgressListener = async () => {
     }
 
     applyDubbingTaskSnapshot(snapshot)
+  })
+}
+
+const registerDubbingModelsUpdatedListener = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  unlistenDubbingModelsUpdated = await listen('dubbing-models-updated', () => {
+    void loadModels()
   })
 }
 
@@ -2347,6 +2718,7 @@ onMounted(() => {
   void loadStoredSettings()
   void loadModels()
   void registerDubbingProgressListener()
+  void registerDubbingModelsUpdatedListener()
   void registerSourceDragDropListener()
   window.addEventListener('keydown', handleKeydown)
 })
@@ -2371,6 +2743,7 @@ onBeforeUnmount(() => {
   }
 
   unlistenDubbingProgress?.()
+  unlistenDubbingModelsUpdated?.()
   unlistenSourceDragDrop?.()
   stopPreviewAudio()
 })

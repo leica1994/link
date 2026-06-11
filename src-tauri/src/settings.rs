@@ -407,6 +407,61 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;
 
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "scheduler_weight",
+        "ALTER TABLE dubbing_models ADD COLUMN scheduler_weight REAL NOT NULL DEFAULT 100.0",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "success_count",
+        "ALTER TABLE dubbing_models ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "failure_count",
+        "ALTER TABLE dubbing_models ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "consecutive_failures",
+        "ALTER TABLE dubbing_models ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "avg_latency_ms",
+        "ALTER TABLE dubbing_models ADD COLUMN avg_latency_ms INTEGER",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "cooldown_until",
+        "ALTER TABLE dubbing_models ADD COLUMN cooldown_until TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "last_error",
+        "ALTER TABLE dubbing_models ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "last_used_at",
+        "ALTER TABLE dubbing_models ADD COLUMN last_used_at TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "dubbing_models",
+        "last_checked_at",
+        "ALTER TABLE dubbing_models ADD COLUMN last_checked_at TEXT",
+    )?;
+
     for service in LLM_SERVICES {
         connection
             .execute(
@@ -427,6 +482,31 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("无法检查数据库字段: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("无法读取数据库字段: {error}"))?;
+
+    for value in columns {
+        if value.map_err(|error| format!("无法解析数据库字段: {error}"))? == column {
+            return Ok(());
+        }
+    }
+
+    connection
+        .execute(alter_sql, [])
+        .map(|_| ())
+        .map_err(|error| format!("无法迁移数据库字段 {table}.{column}: {error}"))
 }
 
 fn read_settings_map(connection: &Connection) -> Result<HashMap<String, String>, String> {

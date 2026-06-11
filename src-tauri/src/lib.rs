@@ -13,7 +13,7 @@ use app_log::{open_log_directory, AppLogger};
 use dubbing::{
     add_dubbing_model, delete_dubbing_model, list_dubbing_models, list_dubbing_voices,
     load_dubbing_reference_audio, prepare_dubbing_material, preview_dubbing_voice,
-    set_dubbing_model_enabled, start_dubbing_task,
+    set_dubbing_model_enabled, start_dubbing_task, DubbingTtsScheduler,
 };
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
@@ -51,9 +51,11 @@ pub fn run() {
                     error,
                 ))
             })?;
+            let dubbing_tts_scheduler = DubbingTtsScheduler::new();
             app.manage(store);
             app.manage(ai_service);
             app.manage(app_logger);
+            app.manage(dubbing_tts_scheduler);
 
             let window_config = app
                 .config()

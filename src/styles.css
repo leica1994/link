@@ -1205,7 +1205,10 @@ html[data-theme='dark'] .translate-subtitle-status {
 .translate-subtitle-status.status-segmenting,
 .translate-subtitle-status.status-correcting,
 .translate-subtitle-status.status-translating,
-.translate-subtitle-status.status-optimizing {
+.translate-subtitle-status.status-optimizing,
+.translate-subtitle-status.status-queued,
+.translate-subtitle-status.status-running,
+.translate-subtitle-status.status-retrying {
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   background: color-mix(in srgb, var(--accent-soft) 66%, transparent);
   color: var(--accent-strong);
@@ -1232,6 +1235,12 @@ html[data-theme='dark'] .translate-subtitle-status {
   color: #815518;
 }
 
+.translate-subtitle-status.status-failed {
+  border-color: rgba(184, 59, 59, 0.28);
+  background: rgba(184, 59, 59, 0.12);
+  color: #a93535;
+}
+
 html[data-theme='dark'] .translate-subtitle-status.status-segmented {
   color: #86c9e5;
 }
@@ -1245,6 +1254,10 @@ html[data-theme='dark'] .translate-subtitle-status.status-done {
 
 html[data-theme='dark'] .translate-subtitle-status.status-kept {
   color: #e5bc7a;
+}
+
+html[data-theme='dark'] .translate-subtitle-status.status-failed {
+  color: #f0a2a2;
 }
 
 .translate-subtitle-row p {
@@ -1267,6 +1280,21 @@ html[data-theme='dark'] .translate-subtitle-status.status-kept {
   align-items: center;
   justify-content: start;
   gap: 6px 8px;
+}
+
+.dubbing-tts-audio {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(70px, auto);
+  align-items: center;
+  justify-content: start;
+  gap: 6px 8px;
+}
+
+.dubbing-tts-play {
+  border-color: color-mix(in srgb, var(--text-muted) 24%, transparent);
+  background: color-mix(in srgb, var(--bg-muted) 70%, transparent);
+  color: var(--text-muted);
 }
 
 .dubbing-reference-play {
@@ -1748,6 +1776,59 @@ html[data-theme='dark'] .dubbing-media-step-track {
   overflow-wrap: anywhere;
 }
 
+.dubbing-model-scheduler {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.dubbing-model-scheduler span {
+  min-width: 0;
+  height: 22px;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 20%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-muted) 62%, transparent);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.dubbing-model-scheduler.status-ready span:first-child {
+  border-color: rgba(47, 138, 85, 0.28);
+  background: rgba(47, 138, 85, 0.12);
+  color: #2f7c50;
+}
+
+.dubbing-model-scheduler.status-active span:first-child {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 66%, transparent);
+  color: var(--accent-strong);
+}
+
+.dubbing-model-scheduler.status-cooldown span:first-child {
+  border-color: rgba(185, 121, 36, 0.3);
+  background: rgba(185, 121, 36, 0.12);
+  color: #815518;
+}
+
+.dubbing-model-scheduler.status-disabled span:first-child {
+  color: var(--text-subtle);
+}
+
+html[data-theme='dark'] .dubbing-model-scheduler.status-ready span:first-child {
+  color: #8dd0a8;
+}
+
+html[data-theme='dark'] .dubbing-model-scheduler.status-cooldown span:first-child {
+  color: #e5bc7a;
+}
+
 .dubbing-model-meta {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2175,7 +2256,8 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
     grid-row: 3;
   }
 
-  .dubbing-reference-audio {
+  .dubbing-reference-audio,
+  .dubbing-tts-audio {
     grid-column: 2 / -1;
     grid-row: 4;
     grid-template-columns: auto auto minmax(0, 1fr);

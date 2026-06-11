@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{FixedOffset, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
@@ -7,13 +7,14 @@ use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{connect, Message};
@@ -42,6 +43,7 @@ const INDEX_TTS2_ENDPOINT: &str = "http://127.0.0.1:7860";
 const INDEX_TTS2_API_NAME: &str = "gen_single";
 const INDEX_TTS2_SAMPLE_AUDIO: &[u8] = include_bytes!("../assets/audio_sample.mp3");
 const DUBBING_PROGRESS_EVENT: &str = "dubbing-progress";
+const DUBBING_MODELS_EVENT: &str = "dubbing-models-updated";
 const DUBBING_STAGE_MATERIAL: &str = "material";
 const DUBBING_STAGE_SUBTITLE_PREPROCESS: &str = "subtitle-preprocess";
 const DUBBING_STAGE_MEDIA_SEPARATION: &str = "media-separation";
@@ -61,6 +63,7 @@ const DUBBING_ARTIFACT_MUTED_VIDEO: &str = "muted-video";
 const DUBBING_ARTIFACT_SOURCE_AUDIO: &str = "source-audio";
 const DUBBING_ARTIFACT_BACKGROUND_MUSIC: &str = "background-music";
 const DUBBING_ARTIFACT_REFERENCE_AUDIO_MANIFEST: &str = "reference-audio-manifest";
+const DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST: &str = "tts-audio-manifest";
 const DUBBING_REFERENCE_AUDIO_EXISTING: &str = "existing-dubbing";
 const DUBBING_REFERENCE_AUDIO_CUSTOM: &str = "custom-audio-file";
 const DUBBING_VIDEO_EXTENSIONS: &[&str] =
@@ -83,6 +86,12 @@ const REFERENCE_AUDIO_LRA: f64 = 11.0;
 const MIN_DUBBING_SUBTITLE_DURATION_MS: u64 = 100;
 const DEFAULT_DUBBING_TEXT_DURATION_MS: u64 = 3_000;
 const BACKGROUND_MUSIC_METHOD: &str = "libtorch-htdemucs";
+const MIN_MODEL_WEIGHT: f64 = 10.0;
+const MAX_MODEL_WEIGHT: f64 = 200.0;
+const TTS_MAX_ATTEMPTS_PER_LINE: usize = 3;
+const TTS_RETRY_SLEEP_MS: u64 = 350;
+const TTS_MODEL_WAIT_SLEEP_MS: u64 = 500;
+const TTS_SYNTHESIS_ACTIVE_MESSAGE: &str = "TTS 配音生成中";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +117,16 @@ pub struct DubbingModel {
     pub gender: String,
     pub enabled: bool,
     pub metadata: Value,
+    pub scheduler_status: String,
+    pub scheduler_weight: f64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub consecutive_failures: u64,
+    pub avg_latency_ms: Option<u64>,
+    pub cooldown_until: Option<String>,
+    pub last_error: String,
+    pub last_used_at: Option<String>,
+    pub last_checked_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -300,6 +319,66 @@ struct DubbingReferenceAudioResult {
     stage_snapshot: Value,
 }
 
+struct DubbingTtsSynthesisResult {
+    manifest_path: PathBuf,
+    metadata: Value,
+    stage_snapshot: Value,
+    warnings: Vec<String>,
+    failed_count: usize,
+}
+
+#[derive(Clone)]
+struct DubbingTtsItem {
+    index: usize,
+    uid: String,
+    text: String,
+    reference_audio_path: PathBuf,
+    raw_output_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    status: String,
+    model_id: Option<String>,
+    model_name: Option<String>,
+    engine: Option<String>,
+    engine_label: Option<String>,
+    attempt_count: usize,
+    latency_ms: Option<u128>,
+    file_size: Option<u64>,
+    audio_duration_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct DubbingTtsWorkItem {
+    index: usize,
+    text: String,
+    reference_audio_path: PathBuf,
+    raw_output_path: PathBuf,
+    output_path: PathBuf,
+}
+
+struct DubbingTtsRequest<'a> {
+    model: &'a DubbingModel,
+    text: &'a str,
+    reference_audio_path: &'a Path,
+}
+
+struct DubbingTtsGateway;
+
+pub struct DubbingTtsScheduler {
+    state: Mutex<DubbingTtsSchedulerState>,
+    revive_lock: Mutex<()>,
+}
+
+struct DubbingTtsSchedulerState {
+    in_use: HashSet<String>,
+    current_weights: HashMap<String, f64>,
+}
+
+struct DubbingTtsSelectedModel {
+    model: DubbingModel,
+    waited: bool,
+}
+
 #[derive(Clone)]
 struct ReferenceAudioClip {
     index: usize,
@@ -362,6 +441,7 @@ trait DubbingEngine {
         locale: Option<&str>,
         endpoint: Option<&str>,
     ) -> Result<Vec<u8>, String>;
+    fn synthesize_tts(&self, request: &DubbingTtsRequest<'_>) -> Result<Vec<u8>, String>;
 }
 
 struct EdgeTtsEngine;
@@ -458,8 +538,9 @@ struct GradioQueueJoinResponse {
 #[tauri::command]
 pub fn list_dubbing_models(
     store: tauri::State<'_, SettingsStore>,
+    scheduler: tauri::State<'_, DubbingTtsScheduler>,
 ) -> Result<Vec<DubbingModel>, String> {
-    read_dubbing_models(&store)
+    read_dubbing_models(&store, Some(&*scheduler))
 }
 
 #[tauri::command]
@@ -660,6 +741,33 @@ pub fn prepare_dubbing_material(
             DUBBING_STAGE_REFERENCE_AUDIO,
             0,
             "等待参考音频生成",
+            "pending",
+            &now,
+        )?;
+        insert_dubbing_stage_if_missing(
+            connection,
+            &task_id,
+            DUBBING_STAGE_TTS_SYNTHESIS,
+            0,
+            "等待 TTS 配音",
+            "pending",
+            &now,
+        )?;
+        insert_dubbing_stage_if_missing(
+            connection,
+            &task_id,
+            DUBBING_STAGE_AUDIO_MERGE,
+            0,
+            "等待音频合成",
+            "pending",
+            &now,
+        )?;
+        insert_dubbing_stage_if_missing(
+            connection,
+            &task_id,
+            DUBBING_STAGE_VIDEO_COMPOSE,
+            0,
+            "等待视频合成",
             "pending",
             &now,
         )?;
@@ -1046,15 +1154,146 @@ fn start_dubbing_task_blocking(
             "复用已完成的参考音频",
             json!({ "taskId": &request.task_id }),
         );
+    } else {
+        log_session.info(
+            "reference_audio_started",
+            "开始生成参考音频",
+            json!({
+                "taskId": &request.task_id,
+                "source": &options.reference_audio_source,
+            }),
+        );
+        let now = Utc::now().to_rfc3339();
+        snapshot = store.with_connection(|connection| {
+            update_dubbing_task_state(
+                connection,
+                &request.task_id,
+                DUBBING_STAGE_REFERENCE_AUDIO,
+                DUBBING_STATUS_RUNNING,
+                0,
+                "参考音频生成中",
+                "",
+                None,
+                &now,
+            )?;
+            upsert_dubbing_stage(
+                connection,
+                &request.task_id,
+                DUBBING_STAGE_REFERENCE_AUDIO,
+                0,
+                "参考音频生成中",
+                "active",
+                json!({ "source": &options.reference_audio_source }),
+                &now,
+            )?;
+            read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+        })?;
+        emit_dubbing_progress(&app, &snapshot);
+
+        match run_reference_audio_generation(&app, &request.task_id, &snapshot, &options) {
+            Ok(reference_result) => {
+                let now = Utc::now().to_rfc3339();
+                snapshot = store.with_connection(|connection| {
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_REFERENCE_AUDIO_MANIFEST,
+                        &reference_result.manifest_path,
+                        reference_result.metadata.clone(),
+                        &now,
+                    )?;
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_REFERENCE_AUDIO,
+                        DUBBING_STATUS_PREPROCESSED,
+                        100,
+                        "参考音频生成完成",
+                        "",
+                        None,
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_REFERENCE_AUDIO,
+                        100,
+                        "参考音频生成完成",
+                        "done",
+                        reference_result.stage_snapshot,
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &snapshot);
+                log_session.info(
+                    "reference_audio_completed",
+                    "参考音频生成完成",
+                    json!({
+                        "taskId": &request.task_id,
+                        "source": &options.reference_audio_source,
+                    }),
+                );
+            }
+            Err(error) => {
+                let now = Utc::now().to_rfc3339();
+                let failed_snapshot = store.with_connection(|connection| {
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_REFERENCE_AUDIO,
+                        DUBBING_STATUS_FAILED,
+                        0,
+                        "参考音频生成失败",
+                        &error,
+                        None,
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_REFERENCE_AUDIO,
+                        0,
+                        "参考音频生成失败",
+                        "failed",
+                        json!({ "error": &error }),
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &failed_snapshot);
+                log_session.error(
+                    "reference_audio_failed",
+                    "参考音频生成失败",
+                    json!({
+                        "taskId": &request.task_id,
+                        "error": &error,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    snapshot = store.with_connection(|connection| {
+        read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+    })?;
+
+    if is_tts_synthesis_done(&snapshot, &options, &store) {
+        log_session.info(
+            "tts_synthesis_reused",
+            "复用已完成的 TTS 配音",
+            json!({ "taskId": &request.task_id }),
+        );
         return Ok(snapshot);
     }
 
     log_session.info(
-        "reference_audio_started",
-        "开始生成参考音频",
+        "tts_synthesis_started",
+        "开始 TTS 配音",
         json!({
             "taskId": &request.task_id,
-            "source": &options.reference_audio_source,
+            "segmentCount": snapshot.segments.len(),
         }),
     );
     let now = Utc::now().to_rfc3339();
@@ -1062,10 +1301,10 @@ fn start_dubbing_task_blocking(
         update_dubbing_task_state(
             connection,
             &request.task_id,
-            DUBBING_STAGE_REFERENCE_AUDIO,
+            DUBBING_STAGE_TTS_SYNTHESIS,
             DUBBING_STATUS_RUNNING,
             0,
-            "参考音频生成中",
+            "TTS 配音准备中",
             "",
             None,
             &now,
@@ -1073,59 +1312,113 @@ fn start_dubbing_task_blocking(
         upsert_dubbing_stage(
             connection,
             &request.task_id,
-            DUBBING_STAGE_REFERENCE_AUDIO,
+            DUBBING_STAGE_TTS_SYNTHESIS,
             0,
-            "参考音频生成中",
+            "TTS 配音准备中",
             "active",
-            json!({ "source": &options.reference_audio_source }),
+            json!({ "items": [] }),
             &now,
         )?;
         read_dubbing_task_snapshot_by_id(connection, &request.task_id)
     })?;
     emit_dubbing_progress(&app, &snapshot);
 
-    match run_reference_audio_generation(&app, &request.task_id, &snapshot, &options) {
-        Ok(reference_result) => {
+    match run_tts_synthesis(&app, &request.task_id, &snapshot, &options) {
+        Ok(tts_result) => {
             let now = Utc::now().to_rfc3339();
+            let warnings = deduplicate_warnings(
+                snapshot
+                    .warnings
+                    .iter()
+                    .cloned()
+                    .chain(tts_result.warnings.clone())
+                    .collect(),
+            );
+            if tts_result.failed_count > 0 {
+                let error = format!("{} 条字幕 TTS 配音失败", tts_result.failed_count);
+                let failed_snapshot = store.with_connection(|connection| {
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST,
+                        &tts_result.manifest_path,
+                        tts_result.metadata.clone(),
+                        &now,
+                    )?;
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_TTS_SYNTHESIS,
+                        DUBBING_STATUS_FAILED,
+                        100,
+                        "TTS 配音失败",
+                        &error,
+                        Some(&warnings),
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_TTS_SYNTHESIS,
+                        100,
+                        "TTS 配音失败",
+                        "failed",
+                        tts_result.stage_snapshot,
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &failed_snapshot);
+                log_session.error(
+                    "tts_synthesis_failed",
+                    "TTS 配音失败",
+                    json!({
+                        "taskId": &request.task_id,
+                        "failedCount": tts_result.failed_count,
+                    }),
+                );
+                return Err(error);
+            }
+
             snapshot = store.with_connection(|connection| {
                 upsert_dubbing_artifact(
                     connection,
                     &request.task_id,
-                    DUBBING_ARTIFACT_REFERENCE_AUDIO_MANIFEST,
-                    &reference_result.manifest_path,
-                    reference_result.metadata.clone(),
+                    DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST,
+                    &tts_result.manifest_path,
+                    tts_result.metadata.clone(),
                     &now,
                 )?;
                 update_dubbing_task_state(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_REFERENCE_AUDIO,
+                    DUBBING_STAGE_TTS_SYNTHESIS,
                     DUBBING_STATUS_PREPROCESSED,
                     100,
-                    "参考音频生成完成",
+                    "TTS 配音完成",
                     "",
-                    None,
+                    Some(&warnings),
                     &now,
                 )?;
                 upsert_dubbing_stage(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_REFERENCE_AUDIO,
+                    DUBBING_STAGE_TTS_SYNTHESIS,
                     100,
-                    "参考音频生成完成",
+                    "TTS 配音完成",
                     "done",
-                    reference_result.stage_snapshot,
+                    tts_result.stage_snapshot,
                     &now,
                 )?;
                 read_dubbing_task_snapshot_by_id(connection, &request.task_id)
             })?;
             emit_dubbing_progress(&app, &snapshot);
             log_session.info(
-                "reference_audio_completed",
-                "参考音频生成完成",
+                "tts_synthesis_completed",
+                "TTS 配音完成",
                 json!({
                     "taskId": &request.task_id,
-                    "source": &options.reference_audio_source,
+                    "segmentCount": snapshot.segments.len(),
                 }),
             );
             Ok(snapshot)
@@ -1136,10 +1429,10 @@ fn start_dubbing_task_blocking(
                 update_dubbing_task_state(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_REFERENCE_AUDIO,
+                    DUBBING_STAGE_TTS_SYNTHESIS,
                     DUBBING_STATUS_FAILED,
                     0,
-                    "参考音频生成失败",
+                    "TTS 配音失败",
                     &error,
                     None,
                     &now,
@@ -1147,9 +1440,9 @@ fn start_dubbing_task_blocking(
                 upsert_dubbing_stage(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_REFERENCE_AUDIO,
+                    DUBBING_STAGE_TTS_SYNTHESIS,
                     0,
-                    "参考音频生成失败",
+                    "TTS 配音失败",
                     "failed",
                     json!({ "error": &error }),
                     &now,
@@ -1158,8 +1451,8 @@ fn start_dubbing_task_blocking(
             })?;
             emit_dubbing_progress(&app, &failed_snapshot);
             log_session.error(
-                "reference_audio_failed",
-                "参考音频生成失败",
+                "tts_synthesis_failed",
+                "TTS 配音失败",
                 json!({
                     "taskId": &request.task_id,
                     "error": &error,
@@ -1172,7 +1465,9 @@ fn start_dubbing_task_blocking(
 
 #[tauri::command]
 pub fn add_dubbing_model(
+    app: AppHandle,
     store: tauri::State<'_, SettingsStore>,
+    scheduler: tauri::State<'_, DubbingTtsScheduler>,
     request: AddDubbingModelRequest,
 ) -> Result<DubbingModel, String> {
     let mut voice = engine_for(&request.engine)?
@@ -1182,25 +1477,42 @@ pub fn add_dubbing_model(
         .ok_or_else(|| "未找到该语音".to_string())?;
     apply_dubbing_model_options(&mut voice, request.endpoint.as_deref())?;
 
-    insert_dubbing_model(&store, voice)
+    let model = insert_dubbing_model(&store, voice, Some(&*scheduler))?;
+    emit_dubbing_models_updated(&app);
+    Ok(model)
 }
 
 #[tauri::command]
 pub fn set_dubbing_model_enabled(
+    app: AppHandle,
     store: tauri::State<'_, SettingsStore>,
+    scheduler: tauri::State<'_, DubbingTtsScheduler>,
     request: SetDubbingModelEnabledRequest,
 ) -> Result<DubbingModel, String> {
     let updated_at = Utc::now().to_rfc3339();
 
-    store.with_connection(|connection| {
+    let model = store.with_connection(|connection| {
         let changed = connection
             .execute(
-                "
-                UPDATE dubbing_models
-                SET enabled = ?2, updated_at = ?3
-                WHERE id = ?1
-                ",
-                params![request.id, if request.enabled { 1 } else { 0 }, updated_at],
+                if request.enabled {
+                    "
+                    UPDATE dubbing_models
+                    SET enabled = 1,
+                        scheduler_weight = MAX(scheduler_weight, 100.0),
+                        consecutive_failures = 0,
+                        cooldown_until = NULL,
+                        last_error = '',
+                        updated_at = ?2
+                    WHERE id = ?1
+                    "
+                } else {
+                    "
+                    UPDATE dubbing_models
+                    SET enabled = 0, updated_at = ?2
+                    WHERE id = ?1
+                    "
+                },
+                params![request.id, updated_at],
             )
             .map_err(|error| format!("无法更新配音模型: {error}"))?;
 
@@ -1208,13 +1520,17 @@ pub fn set_dubbing_model_enabled(
             return Err("未找到该配音模型".to_string());
         }
 
-        read_dubbing_model_by_id(connection, &request.id)
-    })
+        read_dubbing_model_by_id(connection, &request.id, Some(&*scheduler))
+    })?;
+    emit_dubbing_models_updated(&app);
+    Ok(model)
 }
 
 #[tauri::command]
 pub fn delete_dubbing_model(
+    app: AppHandle,
     store: tauri::State<'_, SettingsStore>,
+    scheduler: tauri::State<'_, DubbingTtsScheduler>,
     request: DeleteDubbingModelRequest,
 ) -> Result<(), String> {
     store.with_connection(|connection| {
@@ -1230,7 +1546,10 @@ pub fn delete_dubbing_model(
         }
 
         Ok(())
-    })
+    })?;
+    scheduler.remove_model(&request.id)?;
+    emit_dubbing_models_updated(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1281,12 +1600,24 @@ fn engine_for(engine: &str) -> Result<Box<dyn DubbingEngine>, String> {
     }
 }
 
-fn read_dubbing_models(store: &SettingsStore) -> Result<Vec<DubbingModel>, String> {
+impl DubbingTtsGateway {
+    fn synthesize(request: &DubbingTtsRequest<'_>) -> Result<Vec<u8>, String> {
+        engine_for(&request.model.engine)?.synthesize_tts(request)
+    }
+}
+
+fn read_dubbing_models(
+    store: &SettingsStore,
+    scheduler: Option<&DubbingTtsScheduler>,
+) -> Result<Vec<DubbingModel>, String> {
     store.with_connection(|connection| {
         let mut statement = connection
             .prepare(
                 "
-                SELECT id, engine, model_key, display_name, locale, gender, enabled, metadata, created_at, updated_at
+                SELECT id, engine, model_key, display_name, locale, gender, enabled, metadata,
+                       scheduler_weight, success_count, failure_count, consecutive_failures,
+                       avg_latency_ms, cooldown_until, last_error, last_used_at, last_checked_at,
+                       created_at, updated_at
                 FROM dubbing_models
                 ORDER BY created_at DESC
                 ",
@@ -1299,7 +1630,9 @@ fn read_dubbing_models(store: &SettingsStore) -> Result<Vec<DubbingModel>, Strin
 
         let mut models = Vec::new();
         for row in rows {
-            models.push(row.map_err(|error| format!("无法解析配音模型: {error}"))?);
+            let mut model = row.map_err(|error| format!("无法解析配音模型: {error}"))?;
+            apply_dubbing_model_scheduler_status(&mut model, scheduler)?;
+            models.push(model);
         }
 
         Ok(models)
@@ -1364,11 +1697,15 @@ fn apply_dubbing_model_options(
 fn read_dubbing_model_by_id(
     connection: &rusqlite::Connection,
     id: &str,
+    scheduler: Option<&DubbingTtsScheduler>,
 ) -> Result<DubbingModel, String> {
-    connection
+    let mut model = connection
         .query_row(
             "
-            SELECT id, engine, model_key, display_name, locale, gender, enabled, metadata, created_at, updated_at
+            SELECT id, engine, model_key, display_name, locale, gender, enabled, metadata,
+                   scheduler_weight, success_count, failure_count, consecutive_failures,
+                   avg_latency_ms, cooldown_until, last_error, last_used_at, last_checked_at,
+                   created_at, updated_at
             FROM dubbing_models
             WHERE id = ?1
             ",
@@ -1377,12 +1714,16 @@ fn read_dubbing_model_by_id(
         )
         .optional()
         .map_err(|error| format!("无法读取配音模型: {error}"))?
-        .ok_or_else(|| "未找到该配音模型".to_string())
+        .ok_or_else(|| "未找到该配音模型".to_string())?;
+    apply_dubbing_model_scheduler_status(&mut model, scheduler)?;
+
+    Ok(model)
 }
 
 fn insert_dubbing_model(
     store: &SettingsStore,
     voice: DubbingVoiceOption,
+    scheduler: Option<&DubbingTtsScheduler>,
 ) -> Result<DubbingModel, String> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -1427,7 +1768,7 @@ fn insert_dubbing_model(
                 }
             })?;
 
-        read_dubbing_model_by_id(connection, &id)
+        read_dubbing_model_by_id(connection, &id, scheduler)
     })
 }
 
@@ -1435,6 +1776,9 @@ fn map_dubbing_model(row: &Row<'_>) -> rusqlite::Result<DubbingModel> {
     let engine: String = row.get(1)?;
     let metadata_text: String = row.get(7)?;
     let metadata = serde_json::from_str(&metadata_text).unwrap_or_else(|_| json!({}));
+    let avg_latency_ms = row
+        .get::<_, Option<i64>>(12)?
+        .map(|value| value.max(0) as u64);
 
     Ok(DubbingModel {
         id: row.get(0)?,
@@ -1446,9 +1790,422 @@ fn map_dubbing_model(row: &Row<'_>) -> rusqlite::Result<DubbingModel> {
         gender: row.get(5)?,
         enabled: row.get::<_, i64>(6)? != 0,
         metadata,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        scheduler_status: String::new(),
+        scheduler_weight: row.get::<_, f64>(8)?.clamp(MIN_MODEL_WEIGHT, MAX_MODEL_WEIGHT),
+        success_count: row.get::<_, i64>(9)?.max(0) as u64,
+        failure_count: row.get::<_, i64>(10)?.max(0) as u64,
+        consecutive_failures: row.get::<_, i64>(11)?.max(0) as u64,
+        avg_latency_ms,
+        cooldown_until: row.get(13)?,
+        last_error: row.get(14)?,
+        last_used_at: row.get(15)?,
+        last_checked_at: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
+}
+
+fn apply_dubbing_model_scheduler_status(
+    model: &mut DubbingModel,
+    scheduler: Option<&DubbingTtsScheduler>,
+) -> Result<(), String> {
+    model.scheduler_status = if !model.enabled {
+        "disabled".to_string()
+    } else if scheduler.is_some_and(|value| value.is_in_use(&model.id).unwrap_or(false)) {
+        "inUse".to_string()
+    } else if is_model_in_cooldown(model) {
+        "cooldown".to_string()
+    } else {
+        "ready".to_string()
+    };
+
+    Ok(())
+}
+
+impl DubbingTtsScheduler {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(DubbingTtsSchedulerState {
+                in_use: HashSet::new(),
+                current_weights: HashMap::new(),
+            }),
+            revive_lock: Mutex::new(()),
+        }
+    }
+
+    fn is_in_use(&self, model_id: &str) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|error| format!("配音模型调度状态锁定失败: {error}"))?;
+        Ok(state.in_use.contains(model_id))
+    }
+
+    fn remove_model(&self, model_id: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| format!("配音模型调度状态锁定失败: {error}"))?;
+        state.in_use.remove(model_id);
+        state.current_weights.remove(model_id);
+        Ok(())
+    }
+
+    fn acquire_model(
+        &self,
+        app: &AppHandle,
+        store: &SettingsStore,
+        probe_item: &DubbingTtsWorkItem,
+    ) -> Result<DubbingTtsSelectedModel, String> {
+        let mut waited = false;
+
+        loop {
+            let models = read_dubbing_models(store, Some(self))?
+                .into_iter()
+                .filter(|model| model.enabled)
+                .collect::<Vec<_>>();
+
+            if models.is_empty() {
+                return Err("模型合集没有开启的配音模型".to_string());
+            }
+
+            let ready_models = models
+                .iter()
+                .filter(|model| model.scheduler_status == "ready")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !ready_models.is_empty() {
+                match self.select_ready_model(&ready_models) {
+                    Ok(model) => {
+                        emit_dubbing_models_updated(app);
+                        return Ok(DubbingTtsSelectedModel { model, waited });
+                    }
+                    Err(_) => {
+                        waited = true;
+                        thread::sleep(Duration::from_millis(TTS_MODEL_WAIT_SLEEP_MS));
+                        continue;
+                    }
+                }
+            }
+
+            let has_in_use = models
+                .iter()
+                .any(|model| self.is_in_use(&model.id).unwrap_or(false));
+            if has_in_use {
+                waited = true;
+                thread::sleep(Duration::from_millis(TTS_MODEL_WAIT_SLEEP_MS));
+                continue;
+            }
+
+            if self.revive_cooldown_models(app, store, probe_item, &models)? {
+                waited = true;
+                continue;
+            }
+
+            return Err("所有开启的配音模型均不可用，请检查模型合集".to_string());
+        }
+    }
+
+    fn select_ready_model(&self, models: &[DubbingModel]) -> Result<DubbingModel, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| format!("配音模型调度状态锁定失败: {error}"))?;
+        let mut sorted = models
+            .iter()
+            .filter(|model| !state.in_use.contains(&model.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if sorted.is_empty() {
+            return Err("暂无空闲配音模型".to_string());
+        }
+        sorted.sort_by(|left, right| left.id.cmp(&right.id));
+        let total_weight = sorted
+            .iter()
+            .map(|model| model.scheduler_weight.max(1.0))
+            .sum::<f64>();
+
+        let mut selected_index = 0usize;
+        let mut selected_score = f64::MIN;
+        for (index, model) in sorted.iter().enumerate() {
+            let current = state
+                .current_weights
+                .entry(model.id.clone())
+                .or_insert(0.0);
+            *current += model.scheduler_weight.max(1.0);
+            if *current > selected_score {
+                selected_score = *current;
+                selected_index = index;
+            }
+        }
+
+        let selected = sorted[selected_index].clone();
+        if let Some(current) = state.current_weights.get_mut(&selected.id) {
+            *current -= total_weight;
+        }
+        state.in_use.insert(selected.id.clone());
+
+        Ok(selected)
+    }
+
+    fn release_model(&self, model_id: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| format!("配音模型调度状态锁定失败: {error}"))?;
+        state.in_use.remove(model_id);
+        Ok(())
+    }
+
+    fn revive_cooldown_models(
+        &self,
+        app: &AppHandle,
+        store: &SettingsStore,
+        probe_item: &DubbingTtsWorkItem,
+        models: &[DubbingModel],
+    ) -> Result<bool, String> {
+        let _revive_guard = self
+            .revive_lock
+            .lock()
+            .map_err(|error| format!("配音模型测活状态锁定失败: {error}"))?;
+        let refreshed_models = read_dubbing_models(store, Some(self))?
+            .into_iter()
+            .filter(|model| {
+                model.enabled
+                    && !self.is_in_use(&model.id).unwrap_or(false)
+                    && is_model_in_cooldown(model)
+            })
+            .collect::<Vec<_>>();
+        let probe_models = if refreshed_models.is_empty() {
+            models
+                .iter()
+                .filter(|model| is_model_in_cooldown(model))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            refreshed_models
+        };
+
+        if probe_models.is_empty() {
+            return Ok(false);
+        }
+
+        let mut revived = false;
+        for model in probe_models {
+            let request = DubbingTtsRequest {
+                model: &model,
+                text: &probe_item.text,
+                reference_audio_path: &probe_item.reference_audio_path,
+            };
+            let result = DubbingTtsGateway::synthesize(&request);
+            match result {
+                Ok(audio) if !audio.is_empty() => {
+                    reset_dubbing_model_after_probe(store, &model.id)?;
+                    revived = true;
+                }
+                Ok(_) => {
+                    mark_dubbing_model_probe_failed(store, &model.id, "测活未返回音频")?;
+                }
+                Err(error) => {
+                    mark_dubbing_model_probe_failed(store, &model.id, &error)?;
+                }
+            }
+        }
+
+        if revived {
+            emit_dubbing_models_updated(app);
+        }
+
+        Ok(revived)
+    }
+}
+
+fn is_model_in_cooldown(model: &DubbingModel) -> bool {
+    model
+        .cooldown_until
+        .as_deref()
+        .and_then(parse_rfc3339_utc)
+        .is_some_and(|value| value > Utc::now())
+}
+
+fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn emit_dubbing_models_updated(app: &AppHandle) {
+    let _ = app.emit(DUBBING_MODELS_EVENT, json!({}));
+}
+
+fn record_dubbing_model_success(
+    store: &SettingsStore,
+    model_id: &str,
+    latency_ms: u128,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        let (weight, avg_latency_ms) = connection
+            .query_row(
+                "
+                SELECT scheduler_weight, avg_latency_ms
+                FROM dubbing_models
+                WHERE id = ?1
+                ",
+                params![model_id],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取配音模型调度数据: {error}"))?
+            .ok_or_else(|| "未找到该配音模型".to_string())?;
+        let latency_ms = latency_ms.min(i64::MAX as u128) as i64;
+        let new_average = avg_latency_ms
+            .map(|value| ((value.max(0) as f64 * 0.7) + (latency_ms as f64 * 0.3)).round() as i64)
+            .unwrap_or(latency_ms);
+        let speed_score = (10_000.0 / (latency_ms.max(1_000) as f64)).clamp(0.5, 2.0) * 100.0;
+        let new_weight = ((weight * 0.7) + (speed_score * 0.3) + 5.0).clamp(20.0, MAX_MODEL_WEIGHT);
+
+        connection
+            .execute(
+                "
+                UPDATE dubbing_models
+                SET scheduler_weight = ?2,
+                    success_count = success_count + 1,
+                    consecutive_failures = 0,
+                    avg_latency_ms = ?3,
+                    cooldown_until = NULL,
+                    last_error = '',
+                    last_used_at = ?4,
+                    updated_at = ?4
+                WHERE id = ?1
+                ",
+                params![model_id, new_weight, new_average, now],
+            )
+            .map_err(|error| format!("无法更新配音模型成功状态: {error}"))?;
+
+        Ok(())
+    })
+}
+
+fn record_dubbing_model_failure(
+    store: &SettingsStore,
+    model_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        let (weight, consecutive_failures) = connection
+            .query_row(
+                "
+                SELECT scheduler_weight, consecutive_failures
+                FROM dubbing_models
+                WHERE id = ?1
+                ",
+                params![model_id],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取配音模型调度数据: {error}"))?
+            .ok_or_else(|| "未找到该配音模型".to_string())?;
+        let consecutive_failures = consecutive_failures.max(0) + 1;
+        let cooldown_until = if consecutive_failures >= 3 {
+            Some((Utc::now() + model_cooldown_duration(consecutive_failures)).to_rfc3339())
+        } else {
+            None
+        };
+        let new_weight = (weight * 0.55).clamp(MIN_MODEL_WEIGHT, MAX_MODEL_WEIGHT);
+
+        connection
+            .execute(
+                "
+                UPDATE dubbing_models
+                SET scheduler_weight = ?2,
+                    failure_count = failure_count + 1,
+                    consecutive_failures = ?3,
+                    cooldown_until = ?4,
+                    last_error = ?5,
+                    last_used_at = ?6,
+                    updated_at = ?6
+                WHERE id = ?1
+                ",
+                params![
+                    model_id,
+                    new_weight,
+                    consecutive_failures,
+                    cooldown_until,
+                    summarize_tts_error(error),
+                    now,
+                ],
+            )
+            .map_err(|error| format!("无法更新配音模型失败状态: {error}"))?;
+
+        Ok(())
+    })
+}
+
+fn reset_dubbing_model_after_probe(store: &SettingsStore, model_id: &str) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        connection
+            .execute(
+                "
+                UPDATE dubbing_models
+                SET scheduler_weight = MAX(scheduler_weight, 100.0),
+                    consecutive_failures = 0,
+                    cooldown_until = NULL,
+                    last_error = '',
+                    last_checked_at = ?2,
+                    updated_at = ?2
+                WHERE id = ?1
+                ",
+                params![model_id, now],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("无法恢复配音模型调度状态: {error}"))
+    })
+}
+
+fn mark_dubbing_model_probe_failed(
+    store: &SettingsStore,
+    model_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        connection
+            .execute(
+                "
+                UPDATE dubbing_models
+                SET last_error = ?2,
+                    last_checked_at = ?3,
+                    updated_at = ?3
+                WHERE id = ?1
+                ",
+                params![model_id, summarize_tts_error(error), now],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("无法记录配音模型测活失败: {error}"))
+    })
+}
+
+fn model_cooldown_duration(consecutive_failures: i64) -> ChronoDuration {
+    let minutes = match consecutive_failures {
+        0..=2 => 0,
+        3 => 5,
+        4 => 10,
+        5 => 20,
+        _ => 30,
+    };
+    ChronoDuration::minutes(minutes)
+}
+
+fn summarize_tts_error(error: &str) -> String {
+    let value = error.trim().replace(['\r', '\n'], " ");
+    if value.chars().count() <= 180 {
+        return value;
+    }
+
+    value.chars().take(180).collect()
 }
 
 fn canonical_material_path(path: &str, missing_message: &str) -> Result<PathBuf, String> {
@@ -1987,6 +2744,66 @@ fn reference_audio_metadata_matches(
         }
         _ => false,
     }
+}
+
+fn is_tts_synthesis_done(
+    snapshot: &DubbingTaskSnapshot,
+    options: &DubbingTaskOptions,
+    store: &SettingsStore,
+) -> bool {
+    let stage_done = snapshot
+        .stages
+        .tts_synthesis
+        .as_ref()
+        .is_some_and(|stage| stage.status == "done");
+    if !stage_done {
+        return false;
+    }
+
+    snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST)
+        .filter(|artifact| Path::new(&artifact.path).is_file())
+        .is_some_and(|artifact| tts_synthesis_metadata_matches(snapshot, options, store, artifact))
+}
+
+fn tts_synthesis_metadata_matches(
+    snapshot: &DubbingTaskSnapshot,
+    options: &DubbingTaskOptions,
+    store: &SettingsStore,
+    artifact: &DubbingTaskArtifact,
+) -> bool {
+    let Ok(expected) = tts_synthesis_input_metadata(snapshot, options, store) else {
+        return false;
+    };
+
+    for key in [
+        "segmentCount",
+        "subtitleHash",
+        "referenceAudioManifestPath",
+        "enabledModelHash",
+    ] {
+        if artifact.metadata.get(key) != expected.get(key) {
+            return false;
+        }
+    }
+
+    let items = artifact
+        .metadata
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if items.len() != snapshot.segments.len() {
+        return false;
+    }
+
+    items.iter().all(|item| {
+        item.get("outputPath")
+            .and_then(Value::as_str)
+            .is_some_and(|path| Path::new(path).is_file())
+    })
 }
 
 fn background_music_artifact_file_exists(snapshot: &DubbingTaskSnapshot) -> bool {
@@ -2628,6 +3445,605 @@ fn write_reference_audio_manifest(path: &Path, manifest: &Value) -> Result<(), S
     let text = serde_json::to_string_pretty(manifest)
         .map_err(|error| format!("无法序列化参考音频清单: {error}"))?;
     fs::write(path, text).map_err(|error| format!("无法保存参考音频清单: {error}"))
+}
+
+fn run_tts_synthesis(
+    app: &AppHandle,
+    task_id: &str,
+    snapshot: &DubbingTaskSnapshot,
+    options: &DubbingTaskOptions,
+) -> Result<DubbingTtsSynthesisResult, String> {
+    let store = app.state::<SettingsStore>();
+    let output_dir = PathBuf::from(&snapshot.work_dir).join("tts_synthesis");
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir).map_err(|error| format!("无法清理 TTS 配音目录: {error}"))?;
+    }
+    let raw_dir = output_dir.join("raw");
+    fs::create_dir_all(&raw_dir).map_err(|error| format!("无法创建 TTS 原始音频目录: {error}"))?;
+
+    if snapshot.segments.is_empty() {
+        return Err("没有可生成 TTS 的字幕".to_string());
+    }
+
+    let reference_paths = reference_audio_paths_by_segment(snapshot)?;
+    let mut items = Vec::with_capacity(snapshot.segments.len());
+    let mut work_items = VecDeque::with_capacity(snapshot.segments.len());
+
+    for (index, segment) in snapshot.segments.iter().enumerate() {
+        let reference_audio_path = reference_paths
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("第 {} 条字幕缺少参考音频", index + 1))?;
+        let output_path = output_dir.join(format!("tts_{:04}.wav", index + 1));
+        items.push(DubbingTtsItem {
+            index,
+            uid: segment.uid.clone(),
+            text: segment.text.clone(),
+            reference_audio_path: reference_audio_path.clone(),
+            raw_output_path: None,
+            output_path: None,
+            status: "pending".to_string(),
+            model_id: None,
+            model_name: None,
+            engine: None,
+            engine_label: None,
+            attempt_count: 0,
+            latency_ms: None,
+            file_size: None,
+            audio_duration_ms: None,
+            error: None,
+        });
+        work_items.push_back(DubbingTtsWorkItem {
+            index,
+            text: segment.text.clone(),
+            reference_audio_path,
+            raw_output_path: raw_dir.join(format!("tts_{:04}.bin", index + 1)),
+            output_path,
+        });
+    }
+
+    let enabled_model_count = enabled_dubbing_model_count(&store)?;
+    if enabled_model_count == 0 {
+        return Err("模型合集没有开启的配音模型".to_string());
+    }
+
+    let progress = TtsSynthesisProgress::new(app.clone(), task_id.to_string(), items);
+    progress.emit(2, TTS_SYNTHESIS_ACTIVE_MESSAGE)?;
+
+    let work_queue = Arc::new(Mutex::new(work_items));
+    let worker_count = enabled_model_count.min(snapshot.segments.len()).max(1);
+    let (error_sender, error_receiver) = mpsc::channel::<String>();
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let app = app.clone();
+            let work_queue = work_queue.clone();
+            let progress = progress.clone();
+            let error_sender = error_sender.clone();
+            scope.spawn(move || loop {
+                let work_item = match work_queue.lock() {
+                    Ok(mut queue) => queue.pop_front(),
+                    Err(error) => {
+                        let _ = error_sender.send(format!("TTS 队列锁定失败: {error}"));
+                        None
+                    }
+                };
+                let Some(work_item) = work_item else {
+                    break;
+                };
+
+                if let Err(error) = run_tts_work_item(&app, &progress, work_item) {
+                    let _ = error_sender.send(error);
+                }
+            });
+        }
+    });
+    drop(error_sender);
+
+    let worker_errors = error_receiver.into_iter().collect::<Vec<_>>();
+    if !worker_errors.is_empty() {
+        return Err(worker_errors.join("；"));
+    }
+
+    let items = progress.items()?;
+    let failed_count = items.iter().filter(|item| item.status == "failed").count();
+    let warnings = items
+        .iter()
+        .filter(|item| item.status == "failed")
+        .filter_map(|item| {
+            item.error
+                .as_ref()
+                .map(|error| format!("第 {} 条字幕 TTS 配音失败: {error}", item.index + 1))
+        })
+        .collect::<Vec<_>>();
+    let manifest_path = output_dir.join("manifest.json");
+    let input_metadata = tts_synthesis_input_metadata(snapshot, options, &store)?;
+    let item_values = tts_item_values(&items);
+    let manifest = json!({
+        "segmentCount": snapshot.segments.len(),
+        "subtitleHash": input_metadata.get("subtitleHash").cloned().unwrap_or_else(|| json!("")),
+        "referenceAudioManifestPath": input_metadata.get("referenceAudioManifestPath").cloned().unwrap_or_else(|| json!("")),
+        "enabledModelHash": input_metadata.get("enabledModelHash").cloned().unwrap_or_else(|| json!("")),
+        "failedCount": failed_count,
+        "items": item_values.clone(),
+    });
+    write_tts_manifest(&manifest_path, &manifest)?;
+    let metadata = json!({
+        "segmentCount": snapshot.segments.len(),
+        "subtitleHash": input_metadata.get("subtitleHash").cloned().unwrap_or_else(|| json!("")),
+        "referenceAudioManifestPath": input_metadata.get("referenceAudioManifestPath").cloned().unwrap_or_else(|| json!("")),
+        "enabledModelHash": input_metadata.get("enabledModelHash").cloned().unwrap_or_else(|| json!("")),
+        "failedCount": failed_count,
+        "manifestPath": path_to_string(&manifest_path),
+        "items": item_values.clone(),
+    });
+
+    Ok(DubbingTtsSynthesisResult {
+        manifest_path,
+        metadata,
+        stage_snapshot: json!({ "items": item_values }),
+        warnings,
+        failed_count,
+    })
+}
+
+fn run_tts_work_item(
+    app: &AppHandle,
+    progress: &TtsSynthesisProgress,
+    work_item: DubbingTtsWorkItem,
+) -> Result<(), String> {
+    let store = app.state::<SettingsStore>();
+    let scheduler = app.state::<DubbingTtsScheduler>();
+    let mut last_error = String::new();
+
+    for attempt in 1..=TTS_MAX_ATTEMPTS_PER_LINE {
+        progress.update_item(work_item.index, "等待可用配音模型", |item| {
+            item.status = if attempt == 1 { "queued" } else { "retrying" }.to_string();
+            item.attempt_count = attempt;
+            item.error = if last_error.is_empty() {
+                None
+            } else {
+                Some(last_error.clone())
+            };
+        })?;
+
+        let selected = match scheduler.acquire_model(app, &store, &work_item) {
+            Ok(selected) => selected,
+            Err(error) => {
+                progress.update_item(work_item.index, "TTS 配音失败", |item| {
+                    item.status = "failed".to_string();
+                    item.error = Some(error.clone());
+                })?;
+                return Ok(());
+            }
+        };
+
+        if selected.waited {
+            progress.update_item(work_item.index, "模型空闲，开始生成", |_| {})?;
+        }
+
+        progress.update_item(work_item.index, "TTS 配音生成中", |item| {
+            item.status = "running".to_string();
+            item.model_id = Some(selected.model.id.clone());
+            item.model_name = Some(model_display_label(&selected.model));
+            item.engine = Some(selected.model.engine.clone());
+            item.engine_label = Some(selected.model.engine_label.clone());
+            item.attempt_count = attempt;
+            item.error = None;
+        })?;
+
+        let started_at = Instant::now();
+        let request = DubbingTtsRequest {
+            model: &selected.model,
+            text: &work_item.text,
+            reference_audio_path: &work_item.reference_audio_path,
+        };
+        let result = DubbingTtsGateway::synthesize(&request);
+        let latency_ms = started_at.elapsed().as_millis();
+        scheduler.release_model(&selected.model.id)?;
+
+        match result {
+            Ok(audio) if !audio.is_empty() => {
+                let raw_output_path = tts_raw_output_path(&work_item.raw_output_path, attempt, &audio);
+                fs::write(&raw_output_path, &audio)
+                    .map_err(|error| format!("无法保存 TTS 原始音频: {error}"))?;
+                ensure_non_empty_file(&raw_output_path, "TTS 原始音频为空")?;
+                convert_tts_audio_to_wav(&raw_output_path, &work_item.output_path)?;
+                ensure_non_empty_file(&work_item.output_path, "TTS 音频为空")?;
+                let file_size = file_size(&work_item.output_path).ok();
+                let audio_duration_ms = probe_audio_duration_ms(&work_item.output_path).ok();
+                record_dubbing_model_success(&store, &selected.model.id, latency_ms)?;
+                emit_dubbing_models_updated(app);
+                progress.update_item(work_item.index, "TTS 配音完成", |item| {
+                    item.status = "done".to_string();
+                    item.raw_output_path = Some(raw_output_path.clone());
+                    item.output_path = Some(work_item.output_path.clone());
+                    item.latency_ms = Some(latency_ms);
+                    item.file_size = file_size;
+                    item.audio_duration_ms = audio_duration_ms;
+                    item.error = None;
+                })?;
+                return Ok(());
+            }
+            Ok(_) => {
+                last_error = "TTS 未返回音频".to_string();
+            }
+            Err(error) => {
+                last_error = error;
+            }
+        }
+
+        record_dubbing_model_failure(&store, &selected.model.id, &last_error)?;
+        emit_dubbing_models_updated(app);
+        progress.update_item(work_item.index, "TTS 配音重试中", |item| {
+            item.status = if attempt == TTS_MAX_ATTEMPTS_PER_LINE {
+                "failed".to_string()
+            } else {
+                "retrying".to_string()
+            };
+            item.latency_ms = Some(latency_ms);
+            item.error = Some(last_error.clone());
+        })?;
+
+        if attempt < TTS_MAX_ATTEMPTS_PER_LINE {
+            thread::sleep(Duration::from_millis(TTS_RETRY_SLEEP_MS));
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct TtsSynthesisProgress {
+    app: AppHandle,
+    task_id: String,
+    items: Arc<Mutex<Vec<DubbingTtsItem>>>,
+}
+
+impl TtsSynthesisProgress {
+    fn new(app: AppHandle, task_id: String, items: Vec<DubbingTtsItem>) -> Self {
+        Self {
+            app,
+            task_id,
+            items: Arc::new(Mutex::new(items)),
+        }
+    }
+
+    fn update_item<F>(&self, index: usize, message: &str, update: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut DubbingTtsItem),
+    {
+        let (progress, items) = {
+            let mut items = self
+                .items
+                .lock()
+                .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))?;
+            if let Some(item) = items.iter_mut().find(|item| item.index == index) {
+                update(item);
+            }
+            (tts_stage_progress(&items), tts_item_values(&items))
+        };
+        let _ = message;
+        emit_tts_synthesis_progress(
+            &self.app,
+            &self.task_id,
+            progress,
+            TTS_SYNTHESIS_ACTIVE_MESSAGE,
+            items,
+        )
+            .map(|_| ())
+    }
+
+    fn emit(&self, progress: u8, message: &str) -> Result<(), String> {
+        let items = {
+            let items = self
+                .items
+                .lock()
+                .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))?;
+            tts_item_values(&items)
+        };
+        emit_tts_synthesis_progress(&self.app, &self.task_id, progress, message, items).map(|_| ())
+    }
+
+    fn items(&self) -> Result<Vec<DubbingTtsItem>, String> {
+        self.items
+            .lock()
+            .map(|items| items.clone())
+            .map_err(|error| format!("TTS 配音进度锁定失败: {error}"))
+    }
+}
+
+fn emit_tts_synthesis_progress(
+    app: &AppHandle,
+    task_id: &str,
+    progress: u8,
+    message: &str,
+    items: Vec<Value>,
+) -> Result<DubbingTaskSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let progress = progress.min(99);
+    let now = Utc::now().to_rfc3339();
+    let snapshot = store.with_connection(|connection| {
+        update_dubbing_task_state(
+            connection,
+            task_id,
+            DUBBING_STAGE_TTS_SYNTHESIS,
+            DUBBING_STATUS_RUNNING,
+            progress,
+            message,
+            "",
+            None,
+            &now,
+        )?;
+        upsert_dubbing_stage(
+            connection,
+            task_id,
+            DUBBING_STAGE_TTS_SYNTHESIS,
+            progress,
+            message,
+            "active",
+            json!({ "items": items }),
+            &now,
+        )?;
+        read_dubbing_task_snapshot_by_id(connection, task_id)
+    })?;
+    emit_dubbing_progress(app, &snapshot);
+
+    Ok(snapshot)
+}
+
+fn tts_stage_progress(items: &[DubbingTtsItem]) -> u8 {
+    if items.is_empty() {
+        return 0;
+    }
+
+    let completed = items
+        .iter()
+        .filter(|item| matches!(item.status.as_str(), "done" | "failed"))
+        .count();
+    ((completed as f64 / items.len() as f64) * 100.0).round().min(99.0) as u8
+}
+
+fn tts_item_values(items: &[DubbingTtsItem]) -> Vec<Value> {
+    items.iter().map(tts_item_value).collect()
+}
+
+fn tts_item_value(item: &DubbingTtsItem) -> Value {
+    json!({
+        "index": item.index,
+        "uid": item.uid,
+        "text": item.text,
+        "referenceAudioPath": path_to_string(&item.reference_audio_path),
+        "rawOutputPath": item.raw_output_path.as_ref().map(|path| path_to_string(path)),
+        "outputPath": item.output_path.as_ref().map(|path| path_to_string(path)),
+        "status": item.status,
+        "modelId": item.model_id,
+        "modelName": item.model_name,
+        "engine": item.engine,
+        "engineLabel": item.engine_label,
+        "attemptCount": item.attempt_count,
+        "latencyMs": item.latency_ms,
+        "fileSize": item.file_size,
+        "audioDurationMs": item.audio_duration_ms,
+        "error": item.error,
+    })
+}
+
+fn write_tts_manifest(path: &Path, manifest: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|error| format!("无法序列化 TTS 配音清单: {error}"))?;
+    fs::write(path, text).map_err(|error| format!("无法保存 TTS 配音清单: {error}"))
+}
+
+fn reference_audio_paths_by_segment(
+    snapshot: &DubbingTaskSnapshot,
+) -> Result<Vec<PathBuf>, String> {
+    let items = read_reference_audio_stage_items(snapshot)?;
+    let by_uid = items
+        .iter()
+        .filter_map(|item| {
+            let uid = item.get("uid").and_then(Value::as_str)?;
+            let path = item.get("path").and_then(Value::as_str)?;
+            Some((uid.to_string(), PathBuf::from(path)))
+        })
+        .collect::<HashMap<_, _>>();
+    let by_index = items
+        .iter()
+        .filter_map(|item| {
+            let index = item.get("index").and_then(Value::as_u64)? as usize;
+            let path = item.get("path").and_then(Value::as_str)?;
+            Some((index, PathBuf::from(path)))
+        })
+        .collect::<HashMap<_, _>>();
+
+    snapshot
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let path = segment
+                .uid
+                .is_empty()
+                .then(|| None)
+                .unwrap_or_else(|| by_uid.get(&segment.uid).cloned())
+                .or_else(|| by_index.get(&index).cloned())
+                .ok_or_else(|| format!("第 {} 条字幕缺少参考音频", index + 1))?;
+            if path.is_file() {
+                Ok(path)
+            } else {
+                Err(format!("第 {} 条字幕参考音频不存在", index + 1))
+            }
+        })
+        .collect()
+}
+
+fn read_reference_audio_stage_items(snapshot: &DubbingTaskSnapshot) -> Result<Vec<Value>, String> {
+    if let Some(items) = snapshot
+        .stages
+        .reference_audio
+        .as_ref()
+        .and_then(|stage| stage.snapshot.get("items"))
+        .and_then(Value::as_array)
+    {
+        return Ok(items.clone());
+    }
+
+    let manifest_path = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_REFERENCE_AUDIO_MANIFEST)
+        .map(|artifact| PathBuf::from(&artifact.path))
+        .ok_or_else(|| "参考音频清单不存在".to_string())?;
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("无法读取参考音频清单: {error}"))?;
+    serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("无法解析参考音频清单: {error}"))?
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "参考音频清单缺少条目".to_string())
+}
+
+fn enabled_dubbing_model_count(store: &SettingsStore) -> Result<usize, String> {
+    store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM dubbing_models WHERE enabled = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value.max(0) as usize)
+            .map_err(|error| format!("无法读取开启的配音模型数量: {error}"))
+    })
+}
+
+fn tts_synthesis_input_metadata(
+    snapshot: &DubbingTaskSnapshot,
+    _options: &DubbingTaskOptions,
+    store: &SettingsStore,
+) -> Result<Value, String> {
+    let reference_manifest_path = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_REFERENCE_AUDIO_MANIFEST)
+        .map(|artifact| artifact.path.clone())
+        .ok_or_else(|| "参考音频清单不存在".to_string())?;
+
+    Ok(json!({
+        "segmentCount": snapshot.segments.len(),
+        "subtitleHash": subtitle_segments_hash(&snapshot.segments),
+        "referenceAudioManifestPath": reference_manifest_path,
+        "enabledModelHash": enabled_model_hash(store)?,
+    }))
+}
+
+fn subtitle_segments_hash(segments: &[TranscriptionSegment]) -> String {
+    let mut hasher = Sha256::new();
+    for segment in segments {
+        hasher.update(segment.uid.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(segment.text.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(segment.start_time.to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(segment.end_time.to_string().as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn enabled_model_hash(store: &SettingsStore) -> Result<String, String> {
+    store.with_connection(|connection| {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT id, engine, model_key, metadata
+                FROM dubbing_models
+                WHERE enabled = 1
+                ORDER BY id ASC
+                ",
+            )
+            .map_err(|error| format!("无法读取配音模型调度集合: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| format!("无法读取配音模型调度集合: {error}"))?;
+        let mut hasher = Sha256::new();
+        for row in rows {
+            let (id, engine, model_key, metadata) =
+                row.map_err(|error| format!("无法解析配音模型调度集合: {error}"))?;
+            hasher.update(id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(engine.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(model_key.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(metadata.as_bytes());
+            hasher.update(b"\0");
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+}
+
+fn tts_raw_output_path(base_path: &Path, attempt: usize, audio: &[u8]) -> PathBuf {
+    let extension = audio_extension(audio);
+    let stem = base_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("tts");
+    base_path.with_file_name(format!("{stem}_attempt_{attempt}.{extension}"))
+}
+
+fn audio_extension(audio: &[u8]) -> &'static str {
+    match audio_mime_type(audio) {
+        "audio/wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        "audio/mp4" => "m4a",
+        _ => "bin",
+    }
+}
+
+fn convert_tts_audio_to_wav(input_path: &Path, output_path: &Path) -> Result<(), String> {
+    run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-vn")
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-y")
+            .arg(output_path),
+        "TTS 音频转码失败",
+    )
+}
+
+fn model_display_label(model: &DubbingModel) -> String {
+    if model.engine == INDEX_TTS2_ENGINE {
+        model
+            .metadata
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&model.model_key)
+            .to_string()
+    } else {
+        model.display_name.clone()
+    }
 }
 
 fn source_audio_path(snapshot: &DubbingTaskSnapshot) -> Result<PathBuf, String> {
@@ -4444,6 +5860,10 @@ impl DubbingEngine for EdgeTtsEngine {
     ) -> Result<Vec<u8>, String> {
         synthesize_edge_tts_audio(model_key, preview_text_for_voice(model_key, locale))
     }
+
+    fn synthesize_tts(&self, request: &DubbingTtsRequest<'_>) -> Result<Vec<u8>, String> {
+        synthesize_edge_tts_audio(&request.model.model_key, request.text)
+    }
 }
 
 impl DubbingEngine for NanoAiTtsEngine {
@@ -4506,6 +5926,10 @@ impl DubbingEngine for NanoAiTtsEngine {
             .or(Some("zh-CN"));
         synthesize_nano_ai_tts_audio(model_key, preview_text_for_voice(model_key, preview_locale))
     }
+
+    fn synthesize_tts(&self, request: &DubbingTtsRequest<'_>) -> Result<Vec<u8>, String> {
+        synthesize_nano_ai_tts_audio(&request.model.model_key, request.text)
+    }
 }
 
 impl DubbingEngine for IndexTts2Engine {
@@ -4536,6 +5960,18 @@ impl DubbingEngine for IndexTts2Engine {
             template,
             preview_text_for_voice(model_key, locale.or(Some(template.locale))),
             &endpoint,
+            None,
+        )
+    }
+
+    fn synthesize_tts(&self, request: &DubbingTtsRequest<'_>) -> Result<Vec<u8>, String> {
+        let template = index_tts2_template(&request.model.model_key)?;
+        let endpoint = model_endpoint_from_metadata(&request.model.metadata)?;
+        synthesize_index_tts2_audio(
+            template,
+            request.text,
+            &endpoint,
+            Some(request.reference_audio_path),
         )
     }
 }
@@ -4594,14 +6030,20 @@ fn normalize_index_tts2_endpoint(endpoint: Option<&str>) -> Result<String, Strin
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
+fn model_endpoint_from_metadata(metadata: &Value) -> Result<String, String> {
+    normalize_index_tts2_endpoint(metadata.get("endpoint").and_then(Value::as_str))
+}
+
 fn synthesize_index_tts2_audio(
     template: &IndexTts2Template,
     text: &str,
     endpoint: &str,
+    reference_audio_path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
     let client = index_tts2_client()?;
     let gradio = load_gradio_config(&client, endpoint)?;
-    let uploaded_audio = upload_index_tts2_reference_audio(&client, &gradio.upload_url)?;
+    let uploaded_audio =
+        upload_index_tts2_reference_audio(&client, &gradio.upload_url, reference_audio_path)?;
     let session_hash = connect_id();
     let output = submit_index_tts2_job(
         &client,
@@ -4707,10 +6149,35 @@ fn load_gradio_config(client: &Client, endpoint: &str) -> Result<GradioRuntimeCo
     })
 }
 
-fn upload_index_tts2_reference_audio(client: &Client, upload_url: &str) -> Result<Value, String> {
-    let audio_part = Part::bytes(INDEX_TTS2_SAMPLE_AUDIO.to_vec())
-        .file_name("audio_sample.mp3")
-        .mime_str("audio/mpeg")
+fn upload_index_tts2_reference_audio(
+    client: &Client,
+    upload_url: &str,
+    reference_audio_path: Option<&Path>,
+) -> Result<Value, String> {
+    let (audio, file_name, mime_type) = if let Some(path) = reference_audio_path {
+        let audio = fs::read(path)
+            .map_err(|error| format!("无法读取 Index-TTS 2.0 参考音频: {error}"))?;
+        if audio.is_empty() {
+            return Err("Index-TTS 2.0 参考音频为空".to_string());
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("reference_audio.wav")
+            .to_string();
+        let mime_type = audio_mime_type_for_path(path, &audio).to_string();
+        (audio, file_name, mime_type)
+    } else {
+        (
+            INDEX_TTS2_SAMPLE_AUDIO.to_vec(),
+            "audio_sample.mp3".to_string(),
+            "audio/mpeg".to_string(),
+        )
+    };
+    let audio_part = Part::bytes(audio)
+        .file_name(file_name.clone())
+        .mime_str(&mime_type)
         .map_err(|error| format!("无法准备 Index-TTS 2.0 参考音频: {error}"))?;
     let uploaded_paths = client
         .post(upload_url)
@@ -4728,7 +6195,7 @@ fn upload_index_tts2_reference_audio(client: &Client, upload_url: &str) -> Resul
 
     Ok(json!({
         "path": uploaded_path,
-        "orig_name": "audio_sample.mp3",
+        "orig_name": file_name,
         "meta": { "_type": "gradio.FileData" },
     }))
 }
