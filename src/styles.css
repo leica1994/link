@@ -1532,6 +1532,48 @@ html[data-theme='dark'] .dubbing-reference-status.quality-warning {
   padding: 24px 36px;
 }
 
+.dubbing-output-file {
+  display: grid;
+  grid-template-columns: 18px auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  margin-top: 12px;
+  padding: 0 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-surface) 72%, transparent);
+}
+
+html[data-theme='dark'] .dubbing-output-file {
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.dubbing-output-file svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+}
+
+.dubbing-output-file-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.dubbing-output-file-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dubbing-media-steps {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2219,6 +2261,14 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
 
   .dubbing-stage-page {
     padding: 18px;
+  }
+
+  .dubbing-output-file {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .dubbing-output-file-path {
+    grid-column: 2;
   }
 
   .dubbing-media-steps {

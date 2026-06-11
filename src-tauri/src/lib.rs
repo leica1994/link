@@ -3,6 +3,7 @@ mod app_log;
 mod app_paths;
 mod dubbing;
 mod dubbing_alignment;
+mod dubbing_compose;
 mod htdemucs;
 mod settings;
 mod subtitle_ai;

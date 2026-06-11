@@ -24,9 +24,9 @@ use crate::app_log::AppLogger;
 use crate::app_paths;
 use crate::dubbing_alignment::{
     run_dubbing_alignment, DubbingAlignmentInput, DubbingAlignmentProgress,
-    DubbingAlignmentSegmentInput,
-    DubbingAlignmentSegmentResult,
+    DubbingAlignmentSegmentInput, DubbingAlignmentSegmentResult,
 };
+use crate::dubbing_compose::{run_dubbing_compose, DubbingComposeInput, DubbingComposeProgress};
 use crate::htdemucs::{self, HtDemucsProgress};
 use crate::settings::SettingsStore;
 use crate::transcription::{serialize_subtitle, SubtitleFormat, TranscriptionSegment};
@@ -61,6 +61,7 @@ const DUBBING_STATUS_RUNNING: &str = "running";
 const DUBBING_STATUS_PREPROCESSED: &str = "preprocessed";
 const DUBBING_STATUS_FAILED: &str = "failed";
 const DUBBING_STATUS_INTERRUPTED: &str = "interrupted";
+const DUBBING_STATUS_DONE: &str = "done";
 const DUBBING_ARTIFACT_SOURCE_VIDEO: &str = "source-video";
 const DUBBING_ARTIFACT_SOURCE_SUBTITLE: &str = "source-subtitle";
 const DUBBING_ARTIFACT_PREPROCESSED_SUBTITLE: &str = "preprocessed-subtitle";
@@ -74,6 +75,8 @@ const DUBBING_ARTIFACT_ALIGNED_TTS_AUDIO: &str = "aligned-tts-audio";
 const DUBBING_ARTIFACT_ALIGNED_SUBTITLE: &str = "aligned-subtitle";
 const DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC: &str = "aligned-background-music";
 const DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST: &str = "audio-video-alignment-manifest";
+const DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO: &str = "final-dubbed-video";
+const DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST: &str = "video-compose-manifest";
 const DUBBING_REFERENCE_AUDIO_EXISTING: &str = "existing-dubbing";
 const DUBBING_REFERENCE_AUDIO_CUSTOM: &str = "custom-audio-file";
 const DUBBING_VIDEO_EXTENSIONS: &[&str] =
@@ -1470,15 +1473,232 @@ fn start_dubbing_task_blocking(
             "复用已完成的音视频对齐结果",
             json!({ "taskId": &request.task_id }),
         );
+    } else {
+        log_session.info(
+            "audio_video_alignment_started",
+            "开始音视频对齐",
+            json!({
+                "taskId": &request.task_id,
+                "segmentCount": snapshot.segments.len(),
+            }),
+        );
+        let now = Utc::now().to_rfc3339();
+        snapshot = store.with_connection(|connection| {
+            update_dubbing_task_state(
+                connection,
+                &request.task_id,
+                DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                DUBBING_STATUS_RUNNING,
+                0,
+                "音视频对齐准备中",
+                "",
+                None,
+                &now,
+            )?;
+            upsert_dubbing_stage(
+                connection,
+                &request.task_id,
+                DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                0,
+                "音视频对齐准备中",
+                "active",
+                json!({ "segments": [] }),
+                &now,
+            )?;
+            read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+        })?;
+        emit_dubbing_progress(&app, &snapshot);
+
+        let alignment_input = audio_video_alignment_input(&snapshot, &options)?;
+        let progress_app = app.clone();
+        let progress_task_id = request.task_id.clone();
+        match run_dubbing_alignment(alignment_input, |progress| {
+            emit_audio_video_alignment_progress(&progress_app, &progress_task_id, progress)
+                .map(|_| ())
+        }) {
+            Ok(alignment_result) => {
+                let now = Utc::now().to_rfc3339();
+                let warnings = deduplicate_warnings(
+                    snapshot
+                        .warnings
+                        .iter()
+                        .cloned()
+                        .chain(alignment_result.warnings.clone())
+                        .collect(),
+                );
+                snapshot = store.with_connection(|connection| {
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_ALIGNED_MUTED_VIDEO,
+                        &alignment_result.aligned_video_path,
+                        json!({
+                            "source": DUBBING_ARTIFACT_MUTED_VIDEO,
+                            "manifestPath": path_to_string(&alignment_result.manifest_path),
+                        }),
+                        &now,
+                    )?;
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_ALIGNED_TTS_AUDIO,
+                        &alignment_result.aligned_audio_path,
+                        json!({
+                            "source": DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST,
+                            "manifestPath": path_to_string(&alignment_result.manifest_path),
+                        }),
+                        &now,
+                    )?;
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_ALIGNED_SUBTITLE,
+                        &alignment_result.aligned_subtitle_path,
+                        json!({
+                            "format": "srt",
+                            "manifestPath": path_to_string(&alignment_result.manifest_path),
+                        }),
+                        &now,
+                    )?;
+                    if let Some(background_music_path) =
+                        &alignment_result.aligned_background_music_path
+                    {
+                        upsert_dubbing_artifact(
+                            connection,
+                            &request.task_id,
+                            DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC,
+                            background_music_path,
+                            json!({
+                                "source": DUBBING_ARTIFACT_BACKGROUND_MUSIC,
+                                "manifestPath": path_to_string(&alignment_result.manifest_path),
+                            }),
+                            &now,
+                        )?;
+                    } else {
+                        delete_dubbing_artifact(
+                            connection,
+                            &request.task_id,
+                            DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC,
+                        )?;
+                    }
+                    upsert_dubbing_artifact(
+                        connection,
+                        &request.task_id,
+                        DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST,
+                        &alignment_result.manifest_path,
+                        alignment_result.manifest.clone(),
+                        &now,
+                    )?;
+                    replace_dubbing_alignment_segments(
+                        connection,
+                        &request.task_id,
+                        &alignment_result.segments,
+                    )?;
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                        DUBBING_STATUS_PREPROCESSED,
+                        100,
+                        "音视频对齐完成",
+                        "",
+                        Some(&warnings),
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                        100,
+                        "音视频对齐完成",
+                        "done",
+                        alignment_result.stage_snapshot,
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &snapshot);
+                log_session.info(
+                    "audio_video_alignment_completed",
+                    "音视频对齐完成",
+                    json!({
+                        "taskId": &request.task_id,
+                        "segmentCount": snapshot.segments.len(),
+                    }),
+                );
+            }
+            Err(error) => {
+                let now = Utc::now().to_rfc3339();
+                let failed_snapshot = store.with_connection(|connection| {
+                    let stage_snapshot = stage_snapshot_with_error(
+                        read_dubbing_stage_snapshot(
+                            connection,
+                            &request.task_id,
+                            DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                        ),
+                        &error,
+                    );
+                    let failed_progress = stage_snapshot
+                        .get("progress")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        .min(99) as u8;
+                    update_dubbing_task_state(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                        DUBBING_STATUS_FAILED,
+                        failed_progress,
+                        "音视频对齐失败",
+                        &error,
+                        None,
+                        &now,
+                    )?;
+                    upsert_dubbing_stage(
+                        connection,
+                        &request.task_id,
+                        DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                        failed_progress,
+                        "音视频对齐失败",
+                        "failed",
+                        stage_snapshot,
+                        &now,
+                    )?;
+                    read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                })?;
+                emit_dubbing_progress(&app, &failed_snapshot);
+                log_session.error(
+                    "audio_video_alignment_failed",
+                    "音视频对齐失败",
+                    json!({
+                        "taskId": &request.task_id,
+                        "error": &error,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    snapshot = store.with_connection(|connection| {
+        read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+    })?;
+
+    if is_video_compose_done(&snapshot, &options) {
+        log_session.info(
+            "video_compose_reused",
+            "复用已完成的视频合成结果",
+            json!({ "taskId": &request.task_id }),
+        );
         return Ok(snapshot);
     }
 
     log_session.info(
-        "audio_video_alignment_started",
-        "开始音视频对齐",
+        "video_compose_started",
+        "开始视频合成",
         json!({
             "taskId": &request.task_id,
-            "segmentCount": snapshot.segments.len(),
+            "backgroundMusic": options.is_background_music_enabled,
         }),
     );
     let now = Utc::now().to_rfc3339();
@@ -1486,10 +1706,10 @@ fn start_dubbing_task_blocking(
         update_dubbing_task_state(
             connection,
             &request.task_id,
-            DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+            DUBBING_STAGE_VIDEO_COMPOSE,
             DUBBING_STATUS_RUNNING,
             0,
-            "音视频对齐准备中",
+            "视频合成准备中",
             "",
             None,
             &now,
@@ -1497,131 +1717,140 @@ fn start_dubbing_task_blocking(
         upsert_dubbing_stage(
             connection,
             &request.task_id,
-            DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+            DUBBING_STAGE_VIDEO_COMPOSE,
             0,
-            "音视频对齐准备中",
+            "视频合成准备中",
             "active",
-            json!({ "segments": [] }),
+            json!({
+                "backgroundMusicEnabled": options.is_background_music_enabled,
+                "backgroundMusicVolume": options.background_music_volume,
+            }),
             &now,
+        )?;
+        delete_dubbing_artifact(
+            connection,
+            &request.task_id,
+            DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO,
+        )?;
+        delete_dubbing_artifact(
+            connection,
+            &request.task_id,
+            DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST,
         )?;
         read_dubbing_task_snapshot_by_id(connection, &request.task_id)
     })?;
     emit_dubbing_progress(&app, &snapshot);
 
-    let alignment_input = audio_video_alignment_input(&snapshot, &options)?;
-    let progress_app = app.clone();
-    let progress_task_id = request.task_id.clone();
-    match run_dubbing_alignment(alignment_input, |progress| {
-        emit_audio_video_alignment_progress(&progress_app, &progress_task_id, progress)
-        .map(|_| ())
-    }) {
-        Ok(alignment_result) => {
+    let compose_input = match video_compose_input(&snapshot, &options) {
+        Ok(input) => input,
+        Err(error) => {
             let now = Utc::now().to_rfc3339();
-            let warnings = deduplicate_warnings(
-                snapshot
-                    .warnings
-                    .iter()
-                    .cloned()
-                    .chain(alignment_result.warnings.clone())
-                    .collect(),
-            );
-            snapshot = store.with_connection(|connection| {
-                upsert_dubbing_artifact(
-                    connection,
-                    &request.task_id,
-                    DUBBING_ARTIFACT_ALIGNED_MUTED_VIDEO,
-                    &alignment_result.aligned_video_path,
-                    json!({
-                        "source": DUBBING_ARTIFACT_MUTED_VIDEO,
-                        "manifestPath": path_to_string(&alignment_result.manifest_path),
-                    }),
-                    &now,
-                )?;
-                upsert_dubbing_artifact(
-                    connection,
-                    &request.task_id,
-                    DUBBING_ARTIFACT_ALIGNED_TTS_AUDIO,
-                    &alignment_result.aligned_audio_path,
-                    json!({
-                        "source": DUBBING_ARTIFACT_TTS_AUDIO_MANIFEST,
-                        "manifestPath": path_to_string(&alignment_result.manifest_path),
-                    }),
-                    &now,
-                )?;
-                upsert_dubbing_artifact(
-                    connection,
-                    &request.task_id,
-                    DUBBING_ARTIFACT_ALIGNED_SUBTITLE,
-                    &alignment_result.aligned_subtitle_path,
-                    json!({
-                        "format": "srt",
-                        "manifestPath": path_to_string(&alignment_result.manifest_path),
-                    }),
-                    &now,
-                )?;
-                if let Some(background_music_path) = &alignment_result.aligned_background_music_path
-                {
-                    upsert_dubbing_artifact(
+            let failed_snapshot = store.with_connection(|connection| {
+                let stage_snapshot = stage_snapshot_with_error(
+                    read_dubbing_stage_snapshot(
                         connection,
                         &request.task_id,
-                        DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC,
-                        background_music_path,
-                        json!({
-                            "source": DUBBING_ARTIFACT_BACKGROUND_MUSIC,
-                            "manifestPath": path_to_string(&alignment_result.manifest_path),
-                        }),
-                        &now,
-                    )?;
-                } else {
-                    delete_dubbing_artifact(
-                        connection,
-                        &request.task_id,
-                        DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC,
-                    )?;
-                }
-                upsert_dubbing_artifact(
-                    connection,
-                    &request.task_id,
-                    DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST,
-                    &alignment_result.manifest_path,
-                    alignment_result.manifest.clone(),
-                    &now,
-                )?;
-                replace_dubbing_alignment_segments(
-                    connection,
-                    &request.task_id,
-                    &alignment_result.segments,
-                )?;
+                        DUBBING_STAGE_VIDEO_COMPOSE,
+                    ),
+                    &error,
+                );
                 update_dubbing_task_state(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
-                    DUBBING_STATUS_PREPROCESSED,
-                    100,
-                    "音视频对齐完成",
-                    "",
-                    Some(&warnings),
+                    DUBBING_STAGE_VIDEO_COMPOSE,
+                    DUBBING_STATUS_FAILED,
+                    0,
+                    "视频合成失败",
+                    &error,
+                    None,
                     &now,
                 )?;
                 upsert_dubbing_stage(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                    DUBBING_STAGE_VIDEO_COMPOSE,
+                    0,
+                    "视频合成失败",
+                    "failed",
+                    stage_snapshot,
+                    &now,
+                )?;
+                read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+            })?;
+            emit_dubbing_progress(&app, &failed_snapshot);
+            log_session.error(
+                "video_compose_failed",
+                "视频合成失败",
+                json!({
+                    "taskId": &request.task_id,
+                    "error": &error,
+                }),
+            );
+            return Err(error);
+        }
+    };
+
+    let progress_app = app.clone();
+    let progress_task_id = request.task_id.clone();
+    match run_dubbing_compose(compose_input, |progress| {
+        emit_video_compose_progress(&progress_app, &progress_task_id, progress).map(|_| ())
+    }) {
+        Ok(compose_result) => {
+            let now = Utc::now().to_rfc3339();
+            snapshot = store.with_connection(|connection| {
+                upsert_dubbing_artifact(
+                    connection,
+                    &request.task_id,
+                    DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO,
+                    &compose_result.final_video_path,
+                    json!({
+                        "manifestPath": path_to_string(&compose_result.manifest_path),
+                        "durationMs": compose_result.duration_ms,
+                        "fileSize": compose_result.file_size,
+                        "resolution": compose_result.resolution,
+                        "videoCodec": compose_result.video_codec,
+                        "audioCodec": compose_result.audio_codec,
+                    }),
+                    &now,
+                )?;
+                upsert_dubbing_artifact(
+                    connection,
+                    &request.task_id,
+                    DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST,
+                    &compose_result.manifest_path,
+                    compose_result.manifest.clone(),
+                    &now,
+                )?;
+                update_dubbing_task_state(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_VIDEO_COMPOSE,
+                    DUBBING_STATUS_DONE,
                     100,
-                    "音视频对齐完成",
+                    "配音完成",
+                    "",
+                    None,
+                    &now,
+                )?;
+                upsert_dubbing_stage(
+                    connection,
+                    &request.task_id,
+                    DUBBING_STAGE_VIDEO_COMPOSE,
+                    100,
+                    "视频合成完成",
                     "done",
-                    alignment_result.stage_snapshot,
+                    compose_result.stage_snapshot,
                     &now,
                 )?;
                 read_dubbing_task_snapshot_by_id(connection, &request.task_id)
             })?;
             emit_dubbing_progress(&app, &snapshot);
             log_session.info(
-                "audio_video_alignment_completed",
-                "音视频对齐完成",
+                "video_compose_completed",
+                "视频合成完成",
                 json!({
                     "taskId": &request.task_id,
-                    "segmentCount": snapshot.segments.len(),
+                    "outputPath": path_to_string(&compose_result.final_video_path),
                 }),
             );
             Ok(snapshot)
@@ -1633,7 +1862,7 @@ fn start_dubbing_task_blocking(
                     read_dubbing_stage_snapshot(
                         connection,
                         &request.task_id,
-                        DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                        DUBBING_STAGE_VIDEO_COMPOSE,
                     ),
                     &error,
                 );
@@ -1645,10 +1874,10 @@ fn start_dubbing_task_blocking(
                 update_dubbing_task_state(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                    DUBBING_STAGE_VIDEO_COMPOSE,
                     DUBBING_STATUS_FAILED,
                     failed_progress,
-                    "音视频对齐失败",
+                    "视频合成失败",
                     &error,
                     None,
                     &now,
@@ -1656,9 +1885,9 @@ fn start_dubbing_task_blocking(
                 upsert_dubbing_stage(
                     connection,
                     &request.task_id,
-                    DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+                    DUBBING_STAGE_VIDEO_COMPOSE,
                     failed_progress,
-                    "音视频对齐失败",
+                    "视频合成失败",
                     "failed",
                     stage_snapshot,
                     &now,
@@ -1667,8 +1896,8 @@ fn start_dubbing_task_blocking(
             })?;
             emit_dubbing_progress(&app, &failed_snapshot);
             log_session.error(
-                "audio_video_alignment_failed",
-                "音视频对齐失败",
+                "video_compose_failed",
+                "视频合成失败",
                 json!({
                     "taskId": &request.task_id,
                     "error": &error,
@@ -3100,14 +3329,18 @@ fn tts_synthesis_metadata_matches(
         return false;
     };
 
-    snapshot.segments.iter().enumerate().all(|(index, segment)| {
-        let Some(reference_audio_path) = reference_paths.get(index) else {
-            return false;
-        };
-        find_tts_resume_item(&items, segment, index).is_some_and(|item| {
-            is_reusable_tts_item(item, segment, index, reference_audio_path)
+    snapshot
+        .segments
+        .iter()
+        .enumerate()
+        .all(|(index, segment)| {
+            let Some(reference_audio_path) = reference_paths.get(index) else {
+                return false;
+            };
+            find_tts_resume_item(&items, segment, index).is_some_and(|item| {
+                is_reusable_tts_item(item, segment, index, reference_audio_path)
+            })
         })
-    })
 }
 
 fn is_audio_video_alignment_done(
@@ -3246,6 +3479,134 @@ fn audio_video_alignment_input(
         tts_interval_ms: options.tts_interval_ms,
         segments,
     })
+}
+
+fn is_video_compose_done(snapshot: &DubbingTaskSnapshot, options: &DubbingTaskOptions) -> bool {
+    let stage_done = snapshot
+        .stages
+        .video_compose
+        .as_ref()
+        .is_some_and(|stage| stage.status == "done");
+    if !stage_done {
+        return false;
+    }
+
+    if !dubbing_artifact_file_exists(snapshot, DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO)
+        || !dubbing_artifact_file_exists(snapshot, DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST)
+    {
+        return false;
+    }
+
+    snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST)
+        .is_some_and(|artifact| video_compose_metadata_matches(snapshot, options, artifact))
+}
+
+fn video_compose_metadata_matches(
+    snapshot: &DubbingTaskSnapshot,
+    options: &DubbingTaskOptions,
+    artifact: &DubbingTaskArtifact,
+) -> bool {
+    let Some(alignment_manifest) = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST)
+        .filter(|artifact| Path::new(&artifact.path).is_file())
+    else {
+        return false;
+    };
+    let Ok(alignment_manifest_hash) = file_sha256(Path::new(&alignment_manifest.path)) else {
+        return false;
+    };
+
+    if artifact
+        .metadata
+        .get("alignmentManifestPath")
+        .and_then(Value::as_str)
+        != Some(alignment_manifest.path.as_str())
+    {
+        return false;
+    }
+    if artifact
+        .metadata
+        .get("alignmentManifestHash")
+        .and_then(Value::as_str)
+        != Some(alignment_manifest_hash.as_str())
+    {
+        return false;
+    }
+    if artifact
+        .metadata
+        .get("backgroundMusicEnabled")
+        .and_then(Value::as_bool)
+        != Some(options.is_background_music_enabled)
+    {
+        return false;
+    }
+
+    let metadata_volume = artifact
+        .metadata
+        .get("backgroundMusicVolume")
+        .and_then(Value::as_f64)
+        .unwrap_or(-1.0);
+    (metadata_volume - normalized_background_music_volume(options.background_music_volume)).abs()
+        <= 0.0001
+}
+
+fn video_compose_input(
+    snapshot: &DubbingTaskSnapshot,
+    options: &DubbingTaskOptions,
+) -> Result<DubbingComposeInput, String> {
+    let aligned_video_path = artifact_path(
+        snapshot,
+        DUBBING_ARTIFACT_ALIGNED_MUTED_VIDEO,
+        "对齐视频不存在",
+    )?;
+    let aligned_audio_path = artifact_path(
+        snapshot,
+        DUBBING_ARTIFACT_ALIGNED_TTS_AUDIO,
+        "对齐 TTS 音频不存在",
+    )?;
+    let aligned_subtitle_path = artifact_path(
+        snapshot,
+        DUBBING_ARTIFACT_ALIGNED_SUBTITLE,
+        "对齐字幕不存在",
+    )?;
+    let alignment_manifest_path = artifact_path(
+        snapshot,
+        DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST,
+        "音视频对齐清单不存在",
+    )?;
+    let aligned_background_music_path = if options.is_background_music_enabled {
+        Some(artifact_path(
+            snapshot,
+            DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC,
+            "对齐背景音乐不存在",
+        )?)
+    } else {
+        None
+    };
+
+    Ok(DubbingComposeInput {
+        work_dir: PathBuf::from(&snapshot.work_dir),
+        aligned_video_path,
+        aligned_audio_path,
+        aligned_subtitle_path,
+        aligned_background_music_path,
+        alignment_manifest_path,
+        background_music_enabled: options.is_background_music_enabled,
+        background_music_volume: options.background_music_volume,
+    })
+}
+
+fn normalized_background_music_volume(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
 }
 
 fn artifact_path(
@@ -3387,6 +3748,45 @@ fn emit_audio_video_alignment_progress(
             DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
             progress,
             &alignment_progress.message,
+            "active",
+            stage_snapshot,
+            &now,
+        )?;
+        read_dubbing_task_snapshot_by_id(connection, task_id)
+    })?;
+    emit_dubbing_progress(app, &snapshot);
+
+    Ok(snapshot)
+}
+
+fn emit_video_compose_progress(
+    app: &AppHandle,
+    task_id: &str,
+    compose_progress: &DubbingComposeProgress,
+) -> Result<DubbingTaskSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let progress = compose_progress.progress.min(99);
+    let stage_snapshot = serde_json::to_value(compose_progress)
+        .map_err(|error| format!("无法序列化视频合成进度: {error}"))?;
+    let now = Utc::now().to_rfc3339();
+    let snapshot = store.with_connection(|connection| {
+        update_dubbing_task_state(
+            connection,
+            task_id,
+            DUBBING_STAGE_VIDEO_COMPOSE,
+            DUBBING_STATUS_RUNNING,
+            progress,
+            &compose_progress.message,
+            "",
+            None,
+            &now,
+        )?;
+        upsert_dubbing_stage(
+            connection,
+            task_id,
+            DUBBING_STAGE_VIDEO_COMPOSE,
+            progress,
+            &compose_progress.message,
             "active",
             stage_snapshot,
             &now,
@@ -4425,27 +4825,26 @@ fn build_tts_work_items_from_resume(
             .and_then(Value::as_u64)
             .map(|value| value as usize)
             .filter(|value| *value > 0);
-        let mut item =
-            resume_item
-                .map(|value| tts_item_from_resume_value(value, segment, index, &reference_audio_path))
-                .unwrap_or_else(|| DubbingTtsItem {
-                    index,
-                    uid: segment.uid.clone(),
-                    text: segment.text.clone(),
-                    reference_audio_path: reference_audio_path.clone(),
-                    raw_output_path: None,
-                    output_path: None,
-                    status: "pending".to_string(),
-                    model_id: None,
-                    model_name: None,
-                    engine: None,
-                    engine_label: None,
-                    attempt_count: 0,
-                    latency_ms: None,
-                    file_size: None,
-                    audio_duration_ms: None,
-                    error: None,
-                });
+        let mut item = resume_item
+            .map(|value| tts_item_from_resume_value(value, segment, index, &reference_audio_path))
+            .unwrap_or_else(|| DubbingTtsItem {
+                index,
+                uid: segment.uid.clone(),
+                text: segment.text.clone(),
+                reference_audio_path: reference_audio_path.clone(),
+                raw_output_path: None,
+                output_path: None,
+                status: "pending".to_string(),
+                model_id: None,
+                model_name: None,
+                engine: None,
+                engine_label: None,
+                attempt_count: 0,
+                latency_ms: None,
+                file_size: None,
+                audio_duration_ms: None,
+                error: None,
+            });
         item.status = "queued".to_string();
         item.output_path = None;
         item.raw_output_path = None;

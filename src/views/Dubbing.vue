@@ -172,7 +172,14 @@
                 >
                   {{ startDubbingButtonText }}
                 </button>
-                <button class="settings-action" type="button" disabled>导出视频</button>
+                <button
+                  class="settings-action"
+                  type="button"
+                  :disabled="!canOpenDubbingOutput"
+                  @click="openDubbingOutput"
+                >
+                  打开结果目录
+                </button>
               </div>
             </div>
 
@@ -268,6 +275,49 @@
                     <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
                   </div>
                 </div>
+              </div>
+            </div>
+
+            <div v-else-if="shouldShowVideoComposeView" class="translate-preview dubbing-stage-page">
+              <div class="dubbing-media-steps dubbing-compose-steps" aria-label="视频合成子阶段进度">
+                <div
+                  v-for="step in videoComposeSteps"
+                  :key="step.key"
+                  class="dubbing-media-step"
+                  :class="step.status"
+                >
+                  <div class="dubbing-media-step-top">
+                    <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                    <span class="dubbing-media-step-title">{{ step.label }}</span>
+                    <span class="dubbing-media-step-status">{{ dubbingStageStatusLabel(step.status) }}</span>
+                  </div>
+
+                  <span class="dubbing-media-step-subtitle">{{ step.description }}</span>
+
+                  <div class="dubbing-media-step-progress">
+                    <span
+                      class="dubbing-media-step-track"
+                      role="progressbar"
+                      :aria-valuenow="step.progress"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      :aria-label="`${step.label}进度`"
+                    >
+                      <span
+                        class="dubbing-media-step-bar"
+                        :style="{ width: `${step.progress}%` }"
+                        aria-hidden="true"
+                      />
+                    </span>
+                    <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="finalVideoPath" class="dubbing-output-file" aria-label="最终视频">
+                <FileVideo :stroke-width="2.1" aria-hidden="true" />
+                <span class="dubbing-output-file-name">{{ finalVideoFileName }}</span>
+                <span class="dubbing-output-file-path">{{ finalVideoPath }}</span>
               </div>
             </div>
 
@@ -715,6 +765,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { DragDropEvent } from '@tauri-apps/api/webview'
 import { open } from '@tauri-apps/plugin-dialog'
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import {
@@ -916,6 +967,7 @@ type DubbingMediaStep = {
 }
 
 type DubbingAlignmentStep = DubbingMediaStep
+type DubbingComposeStep = DubbingMediaStep
 
 type DubbingAlignmentSegment = {
   index: number
@@ -992,6 +1044,37 @@ const alignmentStepDefinitions = [
     key: 'output-finalize',
     label: '产物收尾',
     description: '拼接、时长纠偏、字幕和清单输出',
+    activeAt: 88,
+    doneAt: 99,
+  },
+] as const
+
+const composeStepDefinitions = [
+  {
+    key: 'input-validation',
+    label: '合成准备',
+    description: '确认对齐产物和输出位置',
+    activeAt: 0,
+    doneAt: 20,
+  },
+  {
+    key: 'audio-mix',
+    label: '输出音轨',
+    description: '按音量生成最终输出音轨',
+    activeAt: 20,
+    doneAt: 35,
+  },
+  {
+    key: 'video-mux',
+    label: 'MP4 封装',
+    description: '写入画面轨和输出音轨',
+    activeAt: 35,
+    doneAt: 88,
+  },
+  {
+    key: 'output-validation',
+    label: '成片校验',
+    description: '校验最终文件、分辨率和清单',
     activeAt: 88,
     doneAt: 99,
   },
@@ -1280,7 +1363,7 @@ const shouldShowAudioVideoAlignmentView = computed(() => {
     return false
   }
 
-  return hasEnteredAudioVideoAlignment.value
+  return hasEnteredAudioVideoAlignment.value && !hasEnteredVideoCompose.value
 })
 
 const audioVideoAlignmentSteps = computed<DubbingAlignmentStep[]>(() => {
@@ -1325,6 +1408,98 @@ const audioVideoAlignmentSteps = computed<DubbingAlignmentStep[]>(() => {
   })
 })
 
+const videoComposeStage = computed(() => activeDubbingTask.value?.stages.videoCompose ?? null)
+
+const videoComposeSnapshot = computed(() => videoComposeStage.value?.snapshot ?? {})
+
+const videoComposeProgress = computed(() => {
+  return clampProgress(videoComposeStage.value?.progress ?? 0)
+})
+
+const videoComposeBackgroundEnabled = computed(() => {
+  return readBooleanValue(videoComposeSnapshot.value.backgroundMusicEnabled) ?? isBackgroundMusicEnabled.value
+})
+
+const finalVideoArtifact = computed(() => {
+  return (
+    activeDubbingTask.value?.artifacts.find((artifact) => artifact.kind === 'final-dubbed-video' && artifact.path) ??
+    null
+  )
+})
+
+const finalVideoPath = computed(() => finalVideoArtifact.value?.path ?? '')
+
+const finalVideoFileName = computed(() => (finalVideoPath.value ? fileNameFromPath(finalVideoPath.value) : ''))
+
+const canOpenDubbingOutput = computed(() => Boolean(finalVideoPath.value) && isTauriRuntime())
+
+const hasEnteredVideoCompose = computed(() => {
+  const task = activeDubbingTask.value
+  const stage = videoComposeStage.value
+  if (!task || !stage) {
+    return false
+  }
+
+  return (
+    task.currentStage === 'video-compose' ||
+    ['active', 'failed', 'interrupted', 'done'].includes(stage.status) ||
+    stage.progress > 0 ||
+    hasDubbingArtifact(task, 'video-compose-manifest') ||
+    hasDubbingArtifact(task, 'final-dubbed-video')
+  )
+})
+
+const shouldShowVideoComposeView = computed(() => {
+  const stage = videoComposeStage.value
+  if (!activeDubbingTask.value || !stage || stage.status === 'pending') {
+    return false
+  }
+
+  return hasEnteredVideoCompose.value
+})
+
+const videoComposeSteps = computed<DubbingComposeStep[]>(() => {
+  const stage = videoComposeStage.value
+  const stageStatus = stage?.status ?? 'pending'
+  const progress = videoComposeProgress.value
+  const snapshotSteps = readAlignmentSteps(videoComposeSnapshot.value.steps)
+  const snapshotStepsByKey = new Map(snapshotSteps.map((step) => [step.key, step]))
+
+  return composeStepDefinitions.map((definition) => {
+    const snapshotStep = snapshotStepsByKey.get(definition.key)
+    const isAudioMixStep = definition.key === 'audio-mix'
+    const backgroundDisabled = isAudioMixStep && !videoComposeBackgroundEnabled.value
+
+    if (snapshotStep) {
+      return {
+        ...snapshotStep,
+        label: definition.label,
+        description: composeStepDescription(definition.key, definition.description),
+        progress: backgroundDisabled ? 100 : snapshotStep.progress,
+        status: backgroundDisabled ? 'done' : snapshotStep.status,
+      }
+    }
+
+    if (backgroundDisabled) {
+      return {
+        key: definition.key,
+        label: definition.label,
+        description: composeStepDescription(definition.key, definition.description),
+        progress: 100,
+        status: 'done',
+      }
+    }
+
+    return {
+      key: definition.key,
+      label: definition.label,
+      description: composeStepDescription(definition.key, definition.description),
+      progress: mediaStepProgress(progress, definition.activeAt, definition.doneAt, stageStatus),
+      status: mediaStepStatus(progress, definition.doneAt, definition.activeAt, stageStatus),
+    }
+  })
+})
+
 const hasDubbingArtifact = (task: DubbingTaskSnapshot, kind: string) => {
   return task.artifacts.some((artifact) => artifact.kind === kind && Boolean(artifact.path))
 }
@@ -1353,6 +1528,23 @@ const isTtsSynthesisDone = computed(() => {
   return Boolean(
     task?.stages.ttsSynthesis?.status === 'done' &&
     hasDubbingArtifact(task, 'tts-audio-manifest'),
+  )
+})
+
+const isAudioVideoAlignmentDone = computed(() => {
+  const task = activeDubbingTask.value
+  return Boolean(
+    task?.stages.audioVideoAlignment?.status === 'done' &&
+    hasDubbingArtifact(task, 'audio-video-alignment-manifest'),
+  )
+})
+
+const isVideoComposeDone = computed(() => {
+  const task = activeDubbingTask.value
+  return Boolean(
+    task?.stages.videoCompose?.status === 'done' &&
+    hasDubbingArtifact(task, 'final-dubbed-video') &&
+    hasDubbingArtifact(task, 'video-compose-manifest'),
   )
 })
 
@@ -1436,6 +1628,7 @@ const shouldShowReferenceAudioView = computed(() => {
     !stage ||
     dubbingSubtitleRows.value.length === 0 ||
     shouldShowAudioVideoAlignmentView.value ||
+    shouldShowVideoComposeView.value ||
     shouldShowTtsSynthesisView.value
   ) {
     return false
@@ -1452,6 +1645,7 @@ const shouldShowDubbingProgress = computed(() => {
   return (
     shouldShowMediaSeparationView.value ||
     shouldShowAudioVideoAlignmentView.value ||
+    shouldShowVideoComposeView.value ||
     Boolean(currentDubbingStage.value)
   )
 })
@@ -1460,7 +1654,8 @@ const shouldShowDubbingStagePreview = computed(() => {
   if (
     shouldShowReferenceAudioView.value ||
     shouldShowTtsSynthesisView.value ||
-    shouldShowAudioVideoAlignmentView.value
+    shouldShowAudioVideoAlignmentView.value ||
+    shouldShowVideoComposeView.value
   ) {
     return false
   }
@@ -1480,6 +1675,10 @@ const displayedDubbingProgress = computed(() => {
 
   if (shouldShowAudioVideoAlignmentView.value) {
     return audioVideoAlignmentProgress.value
+  }
+
+  if (shouldShowVideoComposeView.value) {
+    return videoComposeProgress.value
   }
 
   return currentDubbingStage.value?.progress ?? 0
@@ -1512,6 +1711,10 @@ const dubbingStatusText = computed(() => {
     return '音视频对齐'
   }
 
+  if (shouldShowVideoComposeView.value) {
+    return isVideoComposeDone.value ? '配音完成' : '视频合成'
+  }
+
   if (dubbingErrorMessage.value) {
     return '配音失败'
   }
@@ -1537,6 +1740,14 @@ const dubbingStatusText = computed(() => {
   }
 
   if (activeDubbingTask.value.status === 'preprocessed') {
+    if (isVideoComposeDone.value) {
+      return '配音完成'
+    }
+
+    if (isAudioVideoAlignmentDone.value) {
+      return '音视频对齐完成'
+    }
+
     if (isTtsSynthesisDone.value) {
       return 'TTS 配音完成'
     }
@@ -1586,7 +1797,7 @@ const canStartDubbing = computed(() => {
 
   return (
     ['ready', 'failed', 'interrupted'].includes(activeDubbingTask.value.status) ||
-    (activeDubbingTask.value.status === 'preprocessed' && !isTtsSynthesisDone.value)
+    (activeDubbingTask.value.status === 'preprocessed' && !isVideoComposeDone.value)
   )
 })
 
@@ -1846,6 +2057,19 @@ const startDubbing = async () => {
     dubbingError.value = stringifyError(error, '配音失败')
   } finally {
     isDubbingRunning.value = false
+  }
+}
+
+const openDubbingOutput = async () => {
+  if (!finalVideoPath.value || !isTauriRuntime()) {
+    return
+  }
+
+  dubbingError.value = ''
+  try {
+    await revealItemInDir(finalVideoPath.value)
+  } catch (error) {
+    dubbingError.value = stringifyError(error, '打开结果目录失败')
   }
 }
 
@@ -2616,6 +2840,27 @@ const alignmentStepDescription = (key: string, fallback: string) => {
     }
     case 'output-finalize':
       return audioVideoAlignmentStage.value?.status === 'done' ? '字幕、清单和对齐产物已输出' : fallback
+    default:
+      return fallback
+  }
+}
+
+const composeStepDescription = (key: string, fallback: string) => {
+  switch (key) {
+    case 'input-validation':
+      return videoComposeBackgroundEnabled.value ? fallback : '确认对齐视频和配音音轨'
+    case 'audio-mix':
+      return videoComposeBackgroundEnabled.value
+        ? `写入配音和背景音乐 · 音量 ${backgroundMusicVolume.value.toFixed(1)}`
+        : '写入对齐配音音轨'
+    case 'video-mux':
+      return finalVideoPath.value ? `已输出 ${finalVideoFileName.value}` : fallback
+    case 'output-validation': {
+      const resolution = readStringValue(videoComposeSnapshot.value.resolution)
+      const durationMs = readNumberValue(videoComposeSnapshot.value.durationMs)
+      const parts = [resolution, durationMs ? formatDurationLabel(durationMs) : ''].filter(Boolean)
+      return parts.length > 0 ? parts.join(' · ') : fallback
+    }
     default:
       return fallback
   }
