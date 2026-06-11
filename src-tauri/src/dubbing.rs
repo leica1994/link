@@ -76,6 +76,7 @@ const DUBBING_ARTIFACT_ALIGNED_SUBTITLE: &str = "aligned-subtitle";
 const DUBBING_ARTIFACT_ALIGNED_BACKGROUND_MUSIC: &str = "aligned-background-music";
 const DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST: &str = "audio-video-alignment-manifest";
 const DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO: &str = "final-dubbed-video";
+const DUBBING_ARTIFACT_FINAL_SUBTITLE: &str = "final-subtitle";
 const DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST: &str = "video-compose-manifest";
 const DUBBING_REFERENCE_AUDIO_EXISTING: &str = "existing-dubbing";
 const DUBBING_REFERENCE_AUDIO_CUSTOM: &str = "custom-audio-file";
@@ -317,6 +318,14 @@ struct DubbingSubtitlePreprocessResult {
     segments: Vec<TranscriptionSegment>,
     output_path: PathBuf,
     warnings: Vec<String>,
+}
+
+struct DubbingFinalSubtitleResult {
+    output_path: PathBuf,
+    format: String,
+    source_segment_count: usize,
+    aligned_segment_count: usize,
+    synced_segment_count: usize,
 }
 
 struct DubbingMediaSeparationResult {
@@ -1735,6 +1744,11 @@ fn start_dubbing_task_blocking(
         delete_dubbing_artifact(
             connection,
             &request.task_id,
+            DUBBING_ARTIFACT_FINAL_SUBTITLE,
+        )?;
+        delete_dubbing_artifact(
+            connection,
+            &request.task_id,
             DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST,
         )?;
         read_dubbing_task_snapshot_by_id(connection, &request.task_id)
@@ -1796,7 +1810,65 @@ fn start_dubbing_task_blocking(
         emit_video_compose_progress(&progress_app, &progress_task_id, progress).map(|_| ())
     }) {
         Ok(compose_result) => {
+            let final_subtitle_result =
+                match generate_final_subtitle(&snapshot, &compose_result.final_video_path) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let now = Utc::now().to_rfc3339();
+                        let failed_snapshot = store.with_connection(|connection| {
+                            let stage_snapshot = stage_snapshot_with_error(
+                                compose_result.stage_snapshot.clone(),
+                                &error,
+                            );
+                            update_dubbing_task_state(
+                                connection,
+                                &request.task_id,
+                                DUBBING_STAGE_VIDEO_COMPOSE,
+                                DUBBING_STATUS_FAILED,
+                                99,
+                                "最终字幕生成失败",
+                                &error,
+                                None,
+                                &now,
+                            )?;
+                            upsert_dubbing_stage(
+                                connection,
+                                &request.task_id,
+                                DUBBING_STAGE_VIDEO_COMPOSE,
+                                99,
+                                "最终字幕生成失败",
+                                "failed",
+                                stage_snapshot,
+                                &now,
+                            )?;
+                            read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                        })?;
+                        emit_dubbing_progress(&app, &failed_snapshot);
+                        log_session.error(
+                            "final_subtitle_failed",
+                            "最终字幕生成失败",
+                            json!({
+                                "taskId": &request.task_id,
+                                "error": &error,
+                            }),
+                        );
+                        return Err(error);
+                    }
+                };
+
             let now = Utc::now().to_rfc3339();
+            let final_subtitle_path = path_to_string(&final_subtitle_result.output_path);
+            let mut stage_snapshot = compose_result.stage_snapshot.clone();
+            if let Some(object) = stage_snapshot.as_object_mut() {
+                object.insert(
+                    "finalSubtitlePath".to_string(),
+                    json!(final_subtitle_path.clone()),
+                );
+                object.insert(
+                    "finalSubtitleFormat".to_string(),
+                    json!(final_subtitle_result.format.clone()),
+                );
+            }
             snapshot = store.with_connection(|connection| {
                 upsert_dubbing_artifact(
                     connection,
@@ -1810,6 +1882,25 @@ fn start_dubbing_task_blocking(
                         "resolution": compose_result.resolution,
                         "videoCodec": compose_result.video_codec,
                         "audioCodec": compose_result.audio_codec,
+                    }),
+                    &now,
+                )?;
+                upsert_dubbing_artifact(
+                    connection,
+                    &request.task_id,
+                    DUBBING_ARTIFACT_FINAL_SUBTITLE,
+                    &final_subtitle_result.output_path,
+                    json!({
+                        "format": final_subtitle_result.format.clone(),
+                        "sourceSubtitlePath": &snapshot.subtitle_path,
+                        "alignedSubtitlePath": artifact_path(
+                            &snapshot,
+                            DUBBING_ARTIFACT_ALIGNED_SUBTITLE,
+                            "对齐字幕不存在",
+                        ).map(|path| path_to_string(&path)).unwrap_or_default(),
+                        "sourceSegmentCount": final_subtitle_result.source_segment_count,
+                        "alignedSegmentCount": final_subtitle_result.aligned_segment_count,
+                        "syncedSegmentCount": final_subtitle_result.synced_segment_count,
                     }),
                     &now,
                 )?;
@@ -1839,7 +1930,7 @@ fn start_dubbing_task_blocking(
                     100,
                     "视频合成完成",
                     "done",
-                    compose_result.stage_snapshot,
+                    stage_snapshot,
                     &now,
                 )?;
                 read_dubbing_task_snapshot_by_id(connection, &request.task_id)
@@ -1851,6 +1942,7 @@ fn start_dubbing_task_blocking(
                 json!({
                     "taskId": &request.task_id,
                     "outputPath": path_to_string(&compose_result.final_video_path),
+                    "finalSubtitlePath": final_subtitle_path,
                 }),
             );
             Ok(snapshot)
@@ -3492,6 +3584,7 @@ fn is_video_compose_done(snapshot: &DubbingTaskSnapshot, options: &DubbingTaskOp
     }
 
     if !dubbing_artifact_file_exists(snapshot, DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO)
+        || !dubbing_artifact_file_exists(snapshot, DUBBING_ARTIFACT_FINAL_SUBTITLE)
         || !dubbing_artifact_file_exists(snapshot, DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST)
     {
         return false;
@@ -3502,6 +3595,7 @@ fn is_video_compose_done(snapshot: &DubbingTaskSnapshot, options: &DubbingTaskOp
         .iter()
         .find(|artifact| artifact.kind == DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST)
         .is_some_and(|artifact| video_compose_metadata_matches(snapshot, options, artifact))
+        && final_subtitle_metadata_matches(snapshot)
 }
 
 fn video_compose_metadata_matches(
@@ -3553,6 +3647,241 @@ fn video_compose_metadata_matches(
         .unwrap_or(-1.0);
     (metadata_volume - normalized_background_music_volume(options.background_music_volume)).abs()
         <= 0.0001
+}
+
+fn final_subtitle_metadata_matches(snapshot: &DubbingTaskSnapshot) -> bool {
+    let Some(aligned_subtitle) = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_ALIGNED_SUBTITLE)
+        .filter(|artifact| Path::new(&artifact.path).is_file())
+    else {
+        return false;
+    };
+    let expected_format =
+        path_extension(Path::new(&snapshot.subtitle_path)).unwrap_or_else(|| "srt".to_string());
+
+    snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_FINAL_SUBTITLE)
+        .filter(|artifact| Path::new(&artifact.path).is_file())
+        .is_some_and(|artifact| {
+            path_extension(Path::new(&artifact.path)).as_deref() == Some(expected_format.as_str())
+                && artifact.metadata.get("format").and_then(Value::as_str)
+                    == Some(expected_format.as_str())
+                && artifact
+                    .metadata
+                    .get("sourceSubtitlePath")
+                    .and_then(Value::as_str)
+                    == Some(snapshot.subtitle_path.as_str())
+                && artifact
+                    .metadata
+                    .get("alignedSubtitlePath")
+                    .and_then(Value::as_str)
+                    == Some(aligned_subtitle.path.as_str())
+        })
+}
+
+fn generate_final_subtitle(
+    snapshot: &DubbingTaskSnapshot,
+    final_video_path: &Path,
+) -> Result<DubbingFinalSubtitleResult, String> {
+    let source_subtitle_path = final_subtitle_source_path(snapshot)?;
+    let aligned_subtitle_path = artifact_path(
+        snapshot,
+        DUBBING_ARTIFACT_ALIGNED_SUBTITLE,
+        "对齐字幕不存在",
+    )?;
+    let output_dir = final_video_path
+        .parent()
+        .ok_or_else(|| "无法定位最终字幕输出目录".to_string())?;
+    fs::create_dir_all(output_dir).map_err(|error| format!("无法创建最终字幕目录: {error}"))?;
+
+    let format = path_extension(Path::new(&snapshot.subtitle_path))
+        .or_else(|| path_extension(&source_subtitle_path))
+        .unwrap_or_else(|| "srt".to_string());
+    let output_path = final_video_path.with_extension(&format);
+
+    let source_segments = load_dubbing_subtitle_input(&source_subtitle_path)?.segments;
+    let aligned_segments = load_dubbing_subtitle_input(&aligned_subtitle_path)?.segments;
+    if source_segments.is_empty() {
+        return Err("原始字幕内容为空，无法生成最终字幕".to_string());
+    }
+    if aligned_segments.is_empty() {
+        return Err("对齐字幕内容为空，无法生成最终字幕".to_string());
+    }
+
+    let source_segment_count = source_segments.len();
+    let aligned_segment_count = aligned_segments.len();
+    let (segments, synced_segment_count) =
+        sync_final_subtitle_segments(source_segments, aligned_segments);
+    let subtitle_text = serialize_dubbing_final_subtitle(&segments, &format);
+    fs::write(&output_path, subtitle_text).map_err(|error| format!("无法保存最终字幕: {error}"))?;
+    ensure_non_empty_file(&output_path, "最终字幕为空")?;
+
+    Ok(DubbingFinalSubtitleResult {
+        output_path,
+        format,
+        source_segment_count,
+        aligned_segment_count,
+        synced_segment_count,
+    })
+}
+
+fn final_subtitle_source_path(snapshot: &DubbingTaskSnapshot) -> Result<PathBuf, String> {
+    snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == DUBBING_ARTIFACT_SOURCE_SUBTITLE)
+        .map(|artifact| PathBuf::from(&artifact.path))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let path = PathBuf::from(&snapshot.subtitle_path);
+            path.is_file().then_some(path)
+        })
+        .ok_or_else(|| "原始字幕不存在，无法生成最终字幕".to_string())
+}
+
+fn sync_final_subtitle_segments(
+    source_segments: Vec<TranscriptionSegment>,
+    aligned_segments: Vec<TranscriptionSegment>,
+) -> (Vec<TranscriptionSegment>, usize) {
+    let synced_count = source_segments.len().min(aligned_segments.len());
+    let mut segments = Vec::with_capacity(source_segments.len().max(synced_count));
+
+    for index in 0..synced_count {
+        let mut segment = source_segments[index].clone();
+        segment.start_time = aligned_segments[index].start_time;
+        segment.end_time = aligned_segments[index].end_time;
+        segments.push(segment);
+    }
+
+    if source_segments.len() > synced_count {
+        segments.extend(source_segments[synced_count..].iter().cloned());
+    }
+
+    (segments, synced_count)
+}
+
+fn serialize_dubbing_final_subtitle(segments: &[TranscriptionSegment], format: &str) -> String {
+    match format {
+        "vtt" => serialize_subtitle(segments, SubtitleFormat::Vtt),
+        "ass" | "ssa" => serialize_subtitle(segments, SubtitleFormat::Ass),
+        "lrc" => serialize_lrc(segments),
+        "sbv" => serialize_sbv(segments),
+        "smi" | "sami" => serialize_sami(segments),
+        "ttml" | "dfxp" => serialize_ttml(segments),
+        "txt" => serialize_txt(segments),
+        _ => serialize_subtitle(segments, SubtitleFormat::Srt),
+    }
+}
+
+fn serialize_lrc(segments: &[TranscriptionSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            format!(
+                "[{}]{}",
+                format_lrc_time(segment.start_time),
+                single_line_subtitle_text(&segment.text)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn serialize_sbv(segments: &[TranscriptionSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            format!(
+                "{},{}\n{}\n",
+                format_dot_time(segment.start_time, false),
+                format_dot_time(segment.end_time, false),
+                segment.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn serialize_sami(segments: &[TranscriptionSegment]) -> String {
+    let mut content =
+        String::from("<SAMI>\n<HEAD>\n<TITLE>Link Final Subtitle</TITLE>\n</HEAD>\n<BODY>\n");
+    for segment in segments {
+        let text = html_escape::encode_text(&segment.text)
+            .to_string()
+            .replace('\n', "<br>");
+        content.push_str(&format!(
+            "<SYNC Start={}><P Class=ENCC>{}</P></SYNC>\n",
+            segment.start_time, text
+        ));
+    }
+    content.push_str("</BODY>\n</SAMI>\n");
+    content
+}
+
+fn serialize_ttml(segments: &[TranscriptionSegment]) -> String {
+    let mut content = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <tt xmlns=\"http://www.w3.org/ns/ttml\">\n\
+         <body>\n\
+         <div>\n",
+    );
+    for segment in segments {
+        let text = html_escape::encode_text(&segment.text)
+            .to_string()
+            .replace('\n', "<br/>");
+        content.push_str(&format!(
+            "<p begin=\"{}\" end=\"{}\">{}</p>\n",
+            format_dot_time(segment.start_time, true),
+            format_dot_time(segment.end_time, true),
+            text
+        ));
+    }
+    content.push_str("</div>\n</body>\n</tt>\n");
+    content
+}
+
+fn serialize_txt(segments: &[TranscriptionSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn format_lrc_time(ms: u64) -> String {
+    let centiseconds = (ms % 1000) / 10;
+    let total_seconds = ms / 1000;
+    let seconds = total_seconds % 60;
+    let minutes = total_seconds / 60;
+    format!("{minutes:02}:{seconds:02}.{centiseconds:02}")
+}
+
+fn format_dot_time(ms: u64, padded_hours: bool) -> String {
+    let milliseconds = ms % 1000;
+    let total_seconds = ms / 1000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+
+    if padded_hours {
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+    } else {
+        format!("{hours}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+    }
+}
+
+fn single_line_subtitle_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn video_compose_input(

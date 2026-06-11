@@ -314,11 +314,6 @@
                 </div>
               </div>
 
-              <div v-if="finalVideoPath" class="dubbing-output-file" aria-label="最终视频">
-                <FileVideo :stroke-width="2.1" aria-hidden="true" />
-                <span class="dubbing-output-file-name">{{ finalVideoFileName }}</span>
-                <span class="dubbing-output-file-path">{{ finalVideoPath }}</span>
-              </div>
             </div>
 
             <div
@@ -1427,11 +1422,19 @@ const finalVideoArtifact = computed(() => {
   )
 })
 
+const finalSubtitleArtifact = computed(() => {
+  return activeDubbingTask.value?.artifacts.find((artifact) => artifact.kind === 'final-subtitle' && artifact.path) ?? null
+})
+
 const finalVideoPath = computed(() => finalVideoArtifact.value?.path ?? '')
+
+const finalSubtitlePath = computed(() => finalSubtitleArtifact.value?.path ?? '')
 
 const finalVideoFileName = computed(() => (finalVideoPath.value ? fileNameFromPath(finalVideoPath.value) : ''))
 
-const canOpenDubbingOutput = computed(() => Boolean(finalVideoPath.value) && isTauriRuntime())
+const dubbingOutputPath = computed(() => finalVideoPath.value || finalSubtitlePath.value)
+
+const canOpenDubbingOutput = computed(() => Boolean(dubbingOutputPath.value) && isTauriRuntime())
 
 const hasEnteredVideoCompose = computed(() => {
   const task = activeDubbingTask.value
@@ -2061,13 +2064,13 @@ const startDubbing = async () => {
 }
 
 const openDubbingOutput = async () => {
-  if (!finalVideoPath.value || !isTauriRuntime()) {
+  if (!dubbingOutputPath.value || !isTauriRuntime()) {
     return
   }
 
   dubbingError.value = ''
   try {
-    await revealItemInDir(finalVideoPath.value)
+    await revealItemInDir(dubbingOutputPath.value)
   } catch (error) {
     dubbingError.value = stringifyError(error, '打开结果目录失败')
   }
