@@ -234,6 +234,43 @@
               </div>
             </div>
 
+            <div v-else-if="shouldShowAudioVideoAlignmentView" class="translate-preview dubbing-stage-page">
+              <div class="dubbing-media-steps dubbing-alignment-steps" aria-label="音视频对齐子阶段进度">
+                <div
+                  v-for="step in audioVideoAlignmentSteps"
+                  :key="step.key"
+                  class="dubbing-media-step"
+                  :class="step.status"
+                >
+                  <div class="dubbing-media-step-top">
+                    <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                    <span class="dubbing-media-step-title">{{ step.label }}</span>
+                    <span class="dubbing-media-step-status">{{ dubbingStageStatusLabel(step.status) }}</span>
+                  </div>
+
+                  <span class="dubbing-media-step-subtitle">{{ step.description }}</span>
+
+                  <div class="dubbing-media-step-progress">
+                    <span
+                      class="dubbing-media-step-track"
+                      role="progressbar"
+                      :aria-valuenow="step.progress"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      :aria-label="`${step.label}进度`"
+                    >
+                      <span
+                        class="dubbing-media-step-bar"
+                        :style="{ width: `${step.progress}%` }"
+                        aria-hidden="true"
+                      />
+                    </span>
+                    <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <div
               v-else-if="shouldShowTtsSynthesisView"
               class="translate-preview translate-subtitle-list dubbing-tts-list"
@@ -771,7 +808,7 @@ type DubbingStageProgress = {
   mediaSeparation?: DubbingProgressStage
   referenceAudio?: DubbingProgressStage
   ttsSynthesis?: DubbingProgressStage
-  audioMerge?: DubbingProgressStage
+  audioVideoAlignment?: DubbingProgressStage
   videoCompose?: DubbingProgressStage
 }
 
@@ -878,6 +915,25 @@ type DubbingMediaStep = {
   status: DubbingStageStatus
 }
 
+type DubbingAlignmentStep = DubbingMediaStep
+
+type DubbingAlignmentSegment = {
+  index: number
+  uid?: string
+  text: string
+  sourceStartMs?: number
+  sourceEndMs?: number
+  ttsDurationMs?: number
+  pauseDurationMs?: number
+  alignedStartMs?: number
+  alignedEndMs?: number
+  blockDurationMs?: number
+  videoMode?: string
+  pts?: number
+  freezeTailMs?: number
+  warning?: string
+}
+
 type DubbingBackgroundModelSnapshot = {
   state?: string
   downloadProgress?: number
@@ -894,6 +950,51 @@ const dubbingEngineOptions = [
   { value: DubbingEngineKind.EdgeTts, label: 'EDGE-TTS' },
   { value: DubbingEngineKind.NanoAiTts, label: '纳米AI TTS' },
   { value: DubbingEngineKind.IndexTts2, label: 'Index-TTS 2.0' },
+] as const
+
+const alignmentStepDefinitions = [
+  {
+    key: 'input-validation',
+    label: '输入校验',
+    description: '读取无声视频、TTS 清单、背景音乐',
+    activeAt: 0,
+    doneAt: 12,
+  },
+  {
+    key: 'timeline-planning',
+    label: '时间轴规划',
+    description: '计算字幕块、间隙、慢放/冻结策略',
+    activeAt: 12,
+    doneAt: 22,
+  },
+  {
+    key: 'video-alignment',
+    label: '视频对齐',
+    description: '裁切、慢放、冻结尾帧',
+    activeAt: 22,
+    doneAt: 55,
+  },
+  {
+    key: 'main-audio-rebuild',
+    label: '主音频重建',
+    description: '静音画布、TTS 叠加、拼接',
+    activeAt: 58,
+    doneAt: 75,
+  },
+  {
+    key: 'background-music-sync',
+    label: '背景音乐同步',
+    description: '背景音乐按对齐时间轴同步',
+    activeAt: 78,
+    doneAt: 85,
+  },
+  {
+    key: 'output-finalize',
+    label: '产物收尾',
+    description: '拼接、时长纠偏、字幕和清单输出',
+    activeAt: 88,
+    doneAt: 99,
+  },
 ] as const
 
 const activeTab = ref<DubbingTab>(DubbingTab.Workflow)
@@ -1129,6 +1230,101 @@ const mediaSeparationSteps = computed<DubbingMediaStep[]>(() => {
   ]
 })
 
+const audioVideoAlignmentStage = computed(() => activeDubbingTask.value?.stages.audioVideoAlignment ?? null)
+
+const audioVideoAlignmentSnapshot = computed(() => audioVideoAlignmentStage.value?.snapshot ?? {})
+
+const audioVideoAlignmentProgress = computed(() => {
+  return clampProgress(audioVideoAlignmentStage.value?.progress ?? 0)
+})
+
+const audioVideoAlignmentSegments = computed(() => {
+  return readAlignmentSegments(audioVideoAlignmentSnapshot.value.segments)
+})
+
+const audioVideoAlignmentModeCounts = computed(() => {
+  return readModeCounts(audioVideoAlignmentSnapshot.value.modeCounts)
+})
+
+const audioVideoAlignmentSegmentCount = computed(() => {
+  return (
+    readNumberValue(audioVideoAlignmentSnapshot.value.segmentCount) ??
+    audioVideoAlignmentSegments.value.length ??
+    activeDubbingTask.value?.segments.length ??
+    0
+  )
+})
+
+const audioVideoAlignmentBackgroundEnabled = computed(() => {
+  return readBooleanValue(audioVideoAlignmentSnapshot.value.backgroundMusicEnabled) ?? isBackgroundMusicEnabled.value
+})
+
+const hasEnteredAudioVideoAlignment = computed(() => {
+  const task = activeDubbingTask.value
+  const stage = audioVideoAlignmentStage.value
+  if (!task || !stage) {
+    return false
+  }
+
+  return (
+    task.currentStage === 'audio-video-alignment' ||
+    ['active', 'failed', 'interrupted', 'done'].includes(stage.status) ||
+    stage.progress > 0 ||
+    hasDubbingArtifact(task, 'audio-video-alignment-manifest')
+  )
+})
+
+const shouldShowAudioVideoAlignmentView = computed(() => {
+  const stage = audioVideoAlignmentStage.value
+  if (!activeDubbingTask.value || !stage || stage.status === 'pending') {
+    return false
+  }
+
+  return hasEnteredAudioVideoAlignment.value
+})
+
+const audioVideoAlignmentSteps = computed<DubbingAlignmentStep[]>(() => {
+  const stage = audioVideoAlignmentStage.value
+  const stageStatus = stage?.status ?? 'pending'
+  const progress = audioVideoAlignmentProgress.value
+  const snapshotSteps = readAlignmentSteps(audioVideoAlignmentSnapshot.value.steps)
+  const snapshotStepsByKey = new Map(snapshotSteps.map((step) => [step.key, step]))
+
+  return alignmentStepDefinitions.map((definition) => {
+    const snapshotStep = snapshotStepsByKey.get(definition.key)
+    const isBackgroundStep = definition.key === 'background-music-sync'
+    const backgroundDisabled = isBackgroundStep && !audioVideoAlignmentBackgroundEnabled.value
+
+    if (snapshotStep) {
+      return {
+        ...snapshotStep,
+        label: definition.label,
+        description: alignmentStepDescription(definition.key, definition.description),
+        progress: backgroundDisabled ? 100 : snapshotStep.progress,
+        status: backgroundDisabled ? 'done' : snapshotStep.status,
+      }
+    }
+
+    if (backgroundDisabled) {
+      return {
+        key: definition.key,
+        label: definition.label,
+        description: alignmentStepDescription(definition.key, definition.description),
+        progress: 100,
+        status: 'done',
+      }
+    }
+
+    return {
+      key: definition.key,
+      label: definition.label,
+      description: alignmentStepDescription(definition.key, definition.description),
+      progress: mediaStepProgress(progress, definition.activeAt, definition.doneAt, stageStatus),
+      status: mediaStepStatus(progress, definition.doneAt, definition.activeAt, stageStatus),
+    }
+  })
+})
+
 const hasDubbingArtifact = (task: DubbingTaskSnapshot, kind: string) => {
   return task.artifacts.some((artifact) => artifact.kind === kind && Boolean(artifact.path))
 }
@@ -1188,7 +1384,7 @@ const visibleDubbingStages = computed<VisibleDubbingStage[]>(() => {
     { key: 'media-separation', label: '音视频分离', stage: stages.mediaSeparation },
     { key: 'reference-audio', label: '参考音频生成', stage: stages.referenceAudio },
     { key: 'tts-synthesis', label: 'TTS 配音', stage: stages.ttsSynthesis },
-    { key: 'audio-merge', label: '音频合成', stage: stages.audioMerge },
+    { key: 'audio-video-alignment', label: '音视频对齐', stage: stages.audioVideoAlignment },
     { key: 'video-compose', label: '视频合成', stage: stages.videoCompose },
   ]
     .filter((item): item is { key: string; label: string; stage: DubbingProgressStage } => Boolean(item.stage))
@@ -1220,18 +1416,28 @@ const shouldShowTtsSynthesisView = computed(() => {
     return false
   }
 
+  if (hasEnteredAudioVideoAlignment.value) {
+    return false
+  }
+
   return (
     task.currentStage === 'tts-synthesis' ||
-    ['active', 'failed', 'interrupted', 'done'].includes(stage.status) ||
-    ttsItems.value.length > 0 ||
-    isTtsSynthesisDone.value
+    ['failed', 'interrupted'].includes(stage.status) ||
+    (!hasEnteredAudioVideoAlignment.value &&
+      (['active', 'done'].includes(stage.status) || ttsItems.value.length > 0 || isTtsSynthesisDone.value))
   )
 })
 
 const shouldShowReferenceAudioView = computed(() => {
   const task = activeDubbingTask.value
   const stage = task?.stages.referenceAudio
-  if (!task || !stage || dubbingSubtitleRows.value.length === 0 || shouldShowTtsSynthesisView.value) {
+  if (
+    !task ||
+    !stage ||
+    dubbingSubtitleRows.value.length === 0 ||
+    shouldShowAudioVideoAlignmentView.value ||
+    shouldShowTtsSynthesisView.value
+  ) {
     return false
   }
 
@@ -1243,11 +1449,19 @@ const shouldShowReferenceAudioView = computed(() => {
 })
 
 const shouldShowDubbingProgress = computed(() => {
-  return shouldShowMediaSeparationView.value || Boolean(currentDubbingStage.value)
+  return (
+    shouldShowMediaSeparationView.value ||
+    shouldShowAudioVideoAlignmentView.value ||
+    Boolean(currentDubbingStage.value)
+  )
 })
 
 const shouldShowDubbingStagePreview = computed(() => {
-  if (shouldShowReferenceAudioView.value || shouldShowTtsSynthesisView.value) {
+  if (
+    shouldShowReferenceAudioView.value ||
+    shouldShowTtsSynthesisView.value ||
+    shouldShowAudioVideoAlignmentView.value
+  ) {
     return false
   }
 
@@ -1262,6 +1476,10 @@ const shouldShowDubbingStagePreview = computed(() => {
 const displayedDubbingProgress = computed(() => {
   if (shouldShowMediaSeparationView.value) {
     return mediaSeparationProgress.value
+  }
+
+  if (shouldShowAudioVideoAlignmentView.value) {
+    return audioVideoAlignmentProgress.value
   }
 
   return currentDubbingStage.value?.progress ?? 0
@@ -1288,6 +1506,10 @@ const dubbingStatusText = computed(() => {
 
   if (shouldShowMediaSeparationView.value) {
     return '音视频分离'
+  }
+
+  if (shouldShowAudioVideoAlignmentView.value) {
+    return '音视频对齐'
   }
 
   if (dubbingErrorMessage.value) {
@@ -2288,6 +2510,140 @@ const readTtsItem = (value: unknown): DubbingTtsItem | null => {
   }
 }
 
+const readAlignmentSteps = (value: unknown): DubbingAlignmentStep[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .map(readAlignmentStep)
+    .filter((step): step is DubbingAlignmentStep => Boolean(step))
+}
+
+const readAlignmentStep = (value: unknown): DubbingAlignmentStep | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const key = readStringValue(value.key)
+  if (!key) {
+    return null
+  }
+
+  return {
+    key,
+    label: readStringValue(value.label) ?? key,
+    description: readStringValue(value.description) ?? '',
+    progress: clampProgress(readNumberValue(value.progress) ?? 0),
+    status: normalizeDubbingStageStatus(readStringValue(value.status)),
+  }
+}
+
+const readAlignmentSegments = (value: unknown): DubbingAlignmentSegment[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .map(readAlignmentSegment)
+    .filter((segment): segment is DubbingAlignmentSegment => Boolean(segment))
+}
+
+const readAlignmentSegment = (value: unknown): DubbingAlignmentSegment | null => {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const index = readNumberValue(value.index)
+  if (index === undefined) {
+    return null
+  }
+
+  return {
+    index,
+    uid: readStringValue(value.uid),
+    text: readStringValue(value.text) ?? '',
+    sourceStartMs: readNumberValue(value.sourceStartMs),
+    sourceEndMs: readNumberValue(value.sourceEndMs),
+    ttsDurationMs: readNumberValue(value.ttsDurationMs),
+    pauseDurationMs: readNumberValue(value.pauseDurationMs),
+    alignedStartMs: readNumberValue(value.alignedStartMs),
+    alignedEndMs: readNumberValue(value.alignedEndMs),
+    blockDurationMs: readNumberValue(value.blockDurationMs),
+    videoMode: readStringValue(value.videoMode),
+    pts: readNumberValue(value.pts),
+    freezeTailMs: readNumberValue(value.freezeTailMs),
+    warning: readStringValue(value.warning),
+  }
+}
+
+const readModeCounts = (value: unknown) => {
+  if (!isRecord(value)) {
+    return new Map<string, number>()
+  }
+
+  return new Map(
+    Object.entries(value)
+      .map(([key, count]) => [key, readNumberValue(count) ?? 0] as const)
+      .filter(([, count]) => count > 0),
+  )
+}
+
+const alignmentStepDescription = (key: string, fallback: string) => {
+  switch (key) {
+    case 'input-validation':
+      return audioVideoAlignmentSegmentCount.value > 0
+        ? `读取无声视频、TTS 清单、背景音乐 · ${audioVideoAlignmentSegmentCount.value} 条字幕`
+        : fallback
+    case 'timeline-planning': {
+      const modeLabel = alignmentModeCountsLabel(audioVideoAlignmentModeCounts.value)
+      return modeLabel ? `策略：${modeLabel}` : fallback
+    }
+    case 'video-alignment': {
+      const count = readNumberValue(audioVideoAlignmentSnapshot.value.processedVideoClips) ?? 0
+      return count > 0 ? `已处理 ${count} 个视频片段` : fallback
+    }
+    case 'main-audio-rebuild': {
+      const count = readNumberValue(audioVideoAlignmentSnapshot.value.processedAudioClips) ?? 0
+      return count > 0 ? `已处理 ${count} 个主音频片段` : fallback
+    }
+    case 'background-music-sync': {
+      if (!audioVideoAlignmentBackgroundEnabled.value) {
+        return '背景音乐已关闭，跳过同步'
+      }
+      const count = readNumberValue(audioVideoAlignmentSnapshot.value.processedBackgroundClips) ?? 0
+      return count > 0 ? `已处理 ${count} 个背景音乐片段` : fallback
+    }
+    case 'output-finalize':
+      return audioVideoAlignmentStage.value?.status === 'done' ? '字幕、清单和对齐产物已输出' : fallback
+    default:
+      return fallback
+  }
+}
+
+const alignmentModeCountsLabel = (counts: Map<string, number>) => {
+  return Array.from(counts.entries())
+    .map(([mode, count]) => `${alignmentModeLabel(mode)} ${count}`)
+    .join(' · ')
+}
+
+const alignmentModeLabel = (mode: string) => {
+  switch (mode) {
+    case 'normal':
+      return '常速'
+    case 'consume-gap':
+      return '占用间隙'
+    case 'slowdown':
+      return '慢放'
+    case 'freeze-tail':
+      return '冻结尾帧'
+    case 'gap':
+      return '间隙'
+    default:
+      return mode
+  }
+}
+
 const readStringValue = (value: unknown) => (typeof value === 'string' ? value : undefined)
 
 const readNumberValue = (value: unknown) => {
@@ -2635,6 +2991,16 @@ const mediaStepStatus = (
   }
 
   return progress >= activeAt ? 'active' : 'pending'
+}
+
+const normalizeDubbingStageStatus = (status?: string): DubbingStageStatus => {
+  return status === 'active' ||
+    status === 'done' ||
+    status === 'failed' ||
+    status === 'interrupted' ||
+    status === 'pending'
+    ? status
+    : 'pending'
 }
 
 const dubbingStageStatusLabel = (status: DubbingStageStatus) => {

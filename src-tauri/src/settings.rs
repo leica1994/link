@@ -403,6 +403,25 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 UNIQUE(task_id, kind),
                 FOREIGN KEY(task_id) REFERENCES dubbing_tasks(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS dubbing_alignment_segments (
+                task_id TEXT NOT NULL,
+                segment_index INTEGER NOT NULL,
+                uid TEXT NOT NULL DEFAULT '',
+                source_start_ms INTEGER NOT NULL,
+                source_end_ms INTEGER NOT NULL,
+                tts_duration_ms INTEGER NOT NULL,
+                pause_duration_ms INTEGER NOT NULL,
+                aligned_start_ms INTEGER NOT NULL,
+                aligned_end_ms INTEGER NOT NULL,
+                block_duration_ms INTEGER NOT NULL,
+                video_mode TEXT NOT NULL,
+                pts REAL NOT NULL,
+                freeze_tail_ms INTEGER NOT NULL,
+                warning TEXT,
+                PRIMARY KEY (task_id, segment_index),
+                FOREIGN KEY(task_id) REFERENCES dubbing_tasks(id) ON DELETE CASCADE
+            );
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;
