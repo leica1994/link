@@ -3,7 +3,8 @@ use crate::app_log::{AppLogger, LogSession};
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::SubtitleProcessingResult;
 use crate::transcription::{
-    normalize_subtitle_format, save_transcription_file, serialize_subtitle, TranscriptionSegment,
+    escape_ass_text, ms_to_ass_time, normalize_subtitle_format, save_transcription_file,
+    serialize_subtitle, SubtitleFormat, TranscriptionSegment,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -352,10 +353,15 @@ pub fn save_subtitle_translation_file(
         return Err("没有可导出的字幕内容".to_string());
     }
 
-    let output_segments =
-        build_output_segments(&source_segments, &translated_segments, &output_mode);
+    let output_format = normalize_subtitle_format(&output_format);
     let subtitle_text =
-        serialize_subtitle(&output_segments, normalize_subtitle_format(&output_format));
+        if output_mode == "bilingual" && matches!(output_format, SubtitleFormat::Ass) {
+            serialize_bilingual_ass(&source_segments, &translated_segments)
+        } else {
+            let output_segments =
+                build_output_segments(&source_segments, &translated_segments, &output_mode);
+            serialize_subtitle(&output_segments, output_format)
+        };
     save_transcription_file(path, subtitle_text)
 }
 
@@ -1365,6 +1371,65 @@ fn build_output_segments(
             .collect(),
         _ => translated_segments.to_vec(),
     }
+}
+
+fn serialize_bilingual_ass(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &[TranscriptionSegment],
+) -> String {
+    let mut content = String::from(
+        "[Script Info]\n\
+         Author: Link\n\
+         ScriptType: v4.00+\n\
+         Collisions: Normal\n\
+         PlayResX: 1280\n\
+         PlayResY: 720\n\n\
+         [V4+ Styles]\n\
+         Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n\
+         Style: Default,Microsoft YaHei,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,2,10,10,18,1\n\
+         Style: Secondary,Microsoft YaHei,26,&H00E6E8F1,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,2,10,10,66,1\n\n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+    );
+
+    for (source, translated) in source_segments.iter().zip(translated_segments.iter()) {
+        let source_text = source.text.trim();
+        let translated_text = translated.text.trim();
+        let start_time = ms_to_ass_time(source.start_time);
+        let end_time = ms_to_ass_time(source.end_time);
+
+        if !source_text.is_empty() {
+            content.push_str(&format!(
+                "Dialogue: 0,{},{},Secondary,,0,0,0,,{}\n",
+                start_time,
+                end_time,
+                escape_ass_single_line_text(source_text)
+            ));
+        }
+
+        if !translated_text.is_empty() {
+            content.push_str(&format!(
+                "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+                start_time,
+                end_time,
+                escape_ass_single_line_text(translated_text)
+            ));
+        }
+    }
+
+    content
+}
+
+fn escape_ass_single_line_text(text: &str) -> String {
+    let normalized = text.replace("\\N", " ").replace("\\n", " ");
+    let single_line = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    escape_ass_text(&single_line)
 }
 
 fn load_subtitle_segments(path: &Path) -> Result<Vec<TranscriptionSegment>, String> {

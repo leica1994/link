@@ -1641,7 +1641,7 @@ fn ms_to_vtt_time(ms: u64) -> String {
     ms_to_srt_time(ms).replace(',', ".")
 }
 
-fn ms_to_ass_time(ms: u64) -> String {
+pub(crate) fn ms_to_ass_time(ms: u64) -> String {
     let centiseconds = (ms % 1000) / 10;
     let total_seconds = ms / 1000;
     let seconds = total_seconds % 60;
@@ -1652,6 +1652,6 @@ fn ms_to_ass_time(ms: u64) -> String {
     format!("{hours}:{minutes:02}:{seconds:02}.{centiseconds:02}")
 }
 
-fn escape_ass_text(text: &str) -> String {
+pub(crate) fn escape_ass_text(text: &str) -> String {
     text.replace('\n', "\\N").replace('{', "").replace('}', "")
 }
