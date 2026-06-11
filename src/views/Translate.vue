@@ -686,8 +686,6 @@ const translationWarnings = ref<string[]>([])
 const sourceSubtitleSegments = ref<TranscriptionSegment[]>([])
 const translatedSubtitleSegments = ref<TranscriptionSegment[]>([])
 const translationText = ref('')
-const sourceTranslationText = ref('')
-const targetTranslationText = ref('')
 const lastTranslationRevision = ref(0)
 let isApplyingStoredSettings = false
 let hasLoadedOnce = false
@@ -724,10 +722,12 @@ const canStartTranscription = computed(() => {
   return Boolean(selectedVideoPath.value) && !isTranscribing.value
 })
 const canExportTranscription = computed(() => {
-  return Boolean(transcriptionText.value) && !isTranscribing.value
+  return transcriptionSegments.value.length > 0 && !isTranscribing.value
 })
 const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value && !isTranslationProcessing.value)
-const canExportTranslation = computed(() => Boolean(translationText.value) && !isTranslationProcessing.value)
+const canExportTranslation = computed(() => {
+  return sourceSubtitleSegments.value.length > 0 && translatedSubtitleSegments.value.length > 0 && !isTranslationProcessing.value
+})
 const translationRows = computed<TranslationResultRow[]>(() => {
   const total = Math.max(sourceSubtitleSegments.value.length, translatedSubtitleSegments.value.length)
 
@@ -1130,8 +1130,6 @@ const applySubtitleFile = (path: string) => {
   sourceSubtitleSegments.value = []
   translatedSubtitleSegments.value = []
   translationText.value = ''
-  sourceTranslationText.value = ''
-  targetTranslationText.value = ''
   lastTranslationRevision.value = Number.MAX_SAFE_INTEGER
   void loadSubtitlePreview(path)
 }
@@ -1300,7 +1298,7 @@ const startTranscription = async () => {
 }
 
 const exportTranscription = async () => {
-  if (!transcriptionText.value || !isTauriRuntime()) {
+  if (transcriptionSegments.value.length === 0 || !isTauriRuntime()) {
     return
   }
 
@@ -1322,9 +1320,10 @@ const exportTranscription = async () => {
       return
     }
 
-    await invoke('save_transcription_file', {
+    await invoke('save_subtitle_segments_file', {
       path: ensureSubtitleExtension(outputPath, selectedTranscriptionFormat.value),
-      content: transcriptionText.value,
+      outputFormat: selectedTranscriptionFormat.value,
+      segments: transcriptionSegments.value,
     })
     lastOutputPath.value = ensureSubtitleExtension(outputPath, selectedTranscriptionFormat.value)
     transcriptionMessage.value = '字幕已导出'
@@ -1370,8 +1369,6 @@ const startTranslationProcessing = async () => {
   translationWarnings.value = []
   translatedSubtitleSegments.value = []
   translationText.value = ''
-  sourceTranslationText.value = ''
-  targetTranslationText.value = ''
   lastTranslationRevision.value = 0
   translationMessage.value = '准备处理字幕'
 
@@ -1390,8 +1387,6 @@ const startTranslationProcessing = async () => {
     sourceSubtitleSegments.value = result.sourceSegments
     translatedSubtitleSegments.value = result.translatedSegments
     translationText.value = result.subtitleText
-    sourceTranslationText.value = result.sourceSubtitleText
-    targetTranslationText.value = result.targetSubtitleText
     translationWarnings.value = result.warnings ?? []
     translationProgress.value = 100
     translationStageProgress.value = markTranslationStageProgressDone(translationStageProgress.value)
@@ -1406,7 +1401,7 @@ const startTranslationProcessing = async () => {
 }
 
 const exportTranslationResult = async () => {
-  if (!translationText.value || !isTauriRuntime()) {
+  if (sourceSubtitleSegments.value.length === 0 || translatedSubtitleSegments.value.length === 0 || !isTauriRuntime()) {
     return
   }
 
@@ -1430,18 +1425,27 @@ const exportTranslationResult = async () => {
     }
 
     const targetPath = ensureSubtitleExtension(outputPath, selectedTranslationFormat.value)
-    await invoke('save_transcription_file', {
-      path: targetPath,
-      content: shouldExportSeparateFiles ? targetTranslationText.value : translationText.value,
-    })
 
     if (shouldExportSeparateFiles) {
-      await invoke('save_transcription_file', {
+      await invoke('save_subtitle_segments_file', {
+        path: targetPath,
+        outputFormat: selectedTranslationFormat.value,
+        segments: translatedSubtitleSegments.value,
+      })
+      await invoke('save_subtitle_segments_file', {
         path: siblingExportPath(targetPath, '原文', selectedTranslationFormat.value),
-        content: sourceTranslationText.value,
+        outputFormat: selectedTranslationFormat.value,
+        segments: sourceSubtitleSegments.value,
       })
       translationMessage.value = '原文与译文已导出'
     } else {
+      await invoke('save_subtitle_translation_file', {
+        path: targetPath,
+        outputFormat: selectedTranslationFormat.value,
+        outputMode: selectedOutputMode.value,
+        sourceSegments: sourceSubtitleSegments.value,
+        translatedSegments: translatedSubtitleSegments.value,
+      })
       translationMessage.value = '结果已导出'
     }
   } catch (error) {

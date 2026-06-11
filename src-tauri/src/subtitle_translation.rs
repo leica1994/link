@@ -2,7 +2,9 @@ use crate::ai::AiService;
 use crate::app_log::{AppLogger, LogSession};
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::SubtitleProcessingResult;
-use crate::transcription::{normalize_subtitle_format, serialize_subtitle, TranscriptionSegment};
+use crate::transcription::{
+    normalize_subtitle_format, save_transcription_file, serialize_subtitle, TranscriptionSegment,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -336,6 +338,25 @@ pub async fn start_subtitle_translation(
         log_path: log_session.path_string(),
         warnings,
     })
+}
+
+#[tauri::command]
+pub fn save_subtitle_translation_file(
+    path: String,
+    output_format: String,
+    output_mode: String,
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+) -> Result<(), String> {
+    if source_segments.is_empty() || translated_segments.is_empty() {
+        return Err("没有可导出的字幕内容".to_string());
+    }
+
+    let output_segments =
+        build_output_segments(&source_segments, &translated_segments, &output_mode);
+    let subtitle_text =
+        serialize_subtitle(&output_segments, normalize_subtitle_format(&output_format));
+    save_transcription_file(path, subtitle_text)
 }
 
 impl TranslationWorkflowProgress {

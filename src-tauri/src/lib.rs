@@ -18,9 +18,11 @@ use dubbing::{
     set_dubbing_model_enabled, start_dubbing_task, DubbingTtsScheduler,
 };
 use settings::{load_settings, save_settings, SettingsStore};
-use subtitle_translation::{load_subtitle_preview, start_subtitle_translation};
+use subtitle_translation::{
+    load_subtitle_preview, save_subtitle_translation_file, start_subtitle_translation,
+};
 use tauri::{Manager, WebviewWindowBuilder};
-use transcription::{save_transcription_file, start_transcription};
+use transcription::{save_subtitle_segments_file, save_transcription_file, start_transcription};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -80,8 +82,10 @@ pub fn run() {
             open_log_directory,
             start_transcription,
             save_transcription_file,
+            save_subtitle_segments_file,
             load_subtitle_preview,
             start_subtitle_translation,
+            save_subtitle_translation_file,
             list_dubbing_models,
             list_dubbing_voices,
             add_dubbing_model,

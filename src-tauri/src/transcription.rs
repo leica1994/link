@@ -86,7 +86,7 @@ struct WorkflowProgress {
     stages: std::sync::Arc<std::sync::Mutex<TranscriptionStageProgress>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptionSegment {
     pub text: String,
@@ -96,11 +96,11 @@ pub struct TranscriptionSegment {
     pub uid: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
-    #[serde(skip_serializing)]
+    #[serde(default, skip_serializing)]
     pub words: Vec<TranscriptionWord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptionWord {
     pub text: String,
@@ -876,6 +876,20 @@ pub fn save_transcription_file(path: String, content: String) -> Result<(), Stri
     }
 
     fs::write(&output_path, content).map_err(|error| format!("无法保存字幕文件: {error}"))
+}
+
+#[tauri::command]
+pub fn save_subtitle_segments_file(
+    path: String,
+    output_format: String,
+    segments: Vec<TranscriptionSegment>,
+) -> Result<(), String> {
+    if segments.is_empty() {
+        return Err("没有可导出的字幕内容".to_string());
+    }
+
+    let subtitle_text = serialize_subtitle(&segments, normalize_subtitle_format(&output_format));
+    save_transcription_file(path, subtitle_text)
 }
 
 fn log_transcription_settings(log_session: &LogSession, settings: &AppSettings) {
