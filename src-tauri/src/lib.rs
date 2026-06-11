@@ -9,6 +9,7 @@ mod settings;
 mod subtitle_ai;
 mod subtitle_translation;
 mod transcription;
+mod youtube_monitor;
 
 use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
@@ -23,6 +24,10 @@ use subtitle_translation::{
 };
 use tauri::{Manager, WebviewWindowBuilder};
 use transcription::{save_subtitle_segments_file, save_transcription_file, start_transcription};
+use youtube_monitor::{
+    add_youtube_channel, delete_youtube_channel, get_ytdlp_status, list_youtube_channels,
+    list_youtube_videos, mark_youtube_channel_seen, refresh_youtube_channel, YoutubeMonitorService,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -56,10 +61,12 @@ pub fn run() {
                 ))
             })?;
             let dubbing_tts_scheduler = DubbingTtsScheduler::new();
+            let youtube_monitor_service = YoutubeMonitorService::new();
             app.manage(store);
             app.manage(ai_service);
             app.manage(app_logger);
             app.manage(dubbing_tts_scheduler);
+            app.manage(youtube_monitor_service);
 
             let window_config = app
                 .config()
@@ -95,6 +102,13 @@ pub fn run() {
             load_dubbing_reference_audio,
             prepare_dubbing_material,
             start_dubbing_task,
+            get_ytdlp_status,
+            list_youtube_channels,
+            add_youtube_channel,
+            delete_youtube_channel,
+            list_youtube_videos,
+            mark_youtube_channel_seen,
+            refresh_youtube_channel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

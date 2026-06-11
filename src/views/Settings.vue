@@ -400,6 +400,34 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="network-settings-title">
+        <div id="network-settings-title" class="section-heading">
+          <Globe aria-hidden="true" />
+          <span>网络代理</span>
+        </div>
+
+        <div class="settings-panel">
+          <div class="setting-row">
+            <Globe class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">yt-dlp 代理</div>
+              <div class="setting-subtitle">留空直连；填写后监控检查会通过该代理访问 YouTube</div>
+            </div>
+            <input
+              v-model="youtubeMonitorProxy"
+              class="setting-control settings-input"
+              type="text"
+              placeholder="http://127.0.0.1:7890"
+              autocomplete="off"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              aria-label="yt-dlp 代理"
+            />
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="log-settings-title">
         <div id="log-settings-title" class="section-heading">
           <FolderOpen aria-hidden="true" />
@@ -745,6 +773,7 @@ import {
   Film,
   FolderOpen,
   Gauge,
+  Globe,
   KeyRound,
   Languages,
   Link as LinkIcon,
@@ -860,6 +889,7 @@ type AppSettings = {
   dubbingCustomReferenceAudioPath: string
   dubbingIsBackgroundMusicEnabled: boolean
   dubbingBackgroundMusicVolume: number
+  youtubeMonitorProxy: string
 }
 
 type LlmConnectionCheckResult = {
@@ -1276,6 +1306,7 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
       ? settings.dubbingIsBackgroundMusicEnabled
       : true,
   dubbingBackgroundMusicVolume: readNumberSetting(settings.dubbingBackgroundMusicVolume, 0.5, 0, 1),
+  youtubeMonitorProxy: typeof settings.youtubeMonitorProxy === 'string' ? settings.youtubeMonitorProxy : '',
 })
 
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
@@ -1314,6 +1345,7 @@ const draftCustomReferenceAudioPath = ref('')
 const isReferenceAudioDialogOpen = ref(false)
 const dubbingIsBackgroundMusicEnabled = ref(true)
 const dubbingBackgroundMusicVolume = ref(0.5)
+const youtubeMonitorProxy = ref('')
 const logDirectoryError = ref('')
 const isSettingsLoaded = ref(false)
 let isApplyingStoredSettings = false
@@ -1449,6 +1481,7 @@ const createSettingsSnapshot = (): AppSettings => ({
   dubbingCustomReferenceAudioPath: dubbingCustomReferenceAudioPath.value,
   dubbingIsBackgroundMusicEnabled: dubbingIsBackgroundMusicEnabled.value,
   dubbingBackgroundMusicVolume: dubbingBackgroundMusicVolume.value,
+  youtubeMonitorProxy: youtubeMonitorProxy.value.trim(),
 })
 
 const applySettings = (settings: AppSettings) => {
@@ -1477,6 +1510,7 @@ const applySettings = (settings: AppSettings) => {
   dubbingCustomReferenceAudioPath.value = settings.dubbingCustomReferenceAudioPath
   dubbingIsBackgroundMusicEnabled.value = settings.dubbingIsBackgroundMusicEnabled
   dubbingBackgroundMusicVolume.value = settings.dubbingBackgroundMusicVolume
+  youtubeMonitorProxy.value = settings.youtubeMonitorProxy
   resetLlmConnectionStatus()
 
   nextTick(() => {

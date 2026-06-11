@@ -86,6 +86,7 @@ export type AppSettings = {
   dubbingCustomReferenceAudioPath: string
   dubbingIsBackgroundMusicEnabled: boolean
   dubbingBackgroundMusicVolume: number
+  youtubeMonitorProxy: string
 }
 
 export const transcriptionModelOptions = [
@@ -510,6 +511,7 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
       ? settings.dubbingIsBackgroundMusicEnabled
       : true,
   dubbingBackgroundMusicVolume: readNumberSetting(settings.dubbingBackgroundMusicVolume, 0.5, 0, 1),
+  youtubeMonitorProxy: typeof settings.youtubeMonitorProxy === 'string' ? settings.youtubeMonitorProxy : '',
 })
 
 export const getOptionLabel = <T extends string>(

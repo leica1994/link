@@ -46,6 +46,7 @@ pub struct AppSettings {
     pub dubbing_custom_reference_audio_path: String,
     pub dubbing_is_background_music_enabled: bool,
     pub dubbing_background_music_volume: f64,
+    pub youtube_monitor_proxy: String,
 }
 
 pub struct SettingsStore {
@@ -156,6 +157,11 @@ impl SettingsStore {
                 &setting_values,
                 "dubbing_background_music_volume",
                 0.5,
+            ),
+            youtube_monitor_proxy: read_string_setting(
+                &setting_values,
+                "youtube_monitor_proxy",
+                "",
             ),
         })
     }
@@ -275,6 +281,11 @@ impl SettingsStore {
             "dubbing_background_music_volume",
             &settings.dubbing_background_music_volume.to_string(),
         )?;
+        upsert_setting(
+            &transaction,
+            "youtube_monitor_proxy",
+            &settings.youtube_monitor_proxy,
+        )?;
 
         for (service, config) in normalize_llm_configs(&settings.llm_configs) {
             transaction
@@ -335,6 +346,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "
+            PRAGMA foreign_keys = ON;
+
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -422,6 +435,70 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 PRIMARY KEY (task_id, segment_index),
                 FOREIGN KEY(task_id) REFERENCES dubbing_tasks(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS youtube_channels (
+                id TEXT PRIMARY KEY NOT NULL,
+                url TEXT NOT NULL UNIQUE,
+                canonical_url TEXT NOT NULL DEFAULT '',
+                external_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                handle TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                thumbnail_url TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'idle',
+                last_checked_at TEXT,
+                last_success_at TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                latest_video_external_id TEXT NOT NULL DEFAULT '',
+                video_count INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS youtube_videos (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL DEFAULT '',
+                upload_date TEXT,
+                timestamp INTEGER,
+                duration REAL,
+                view_count INTEGER,
+                published_rank INTEGER NOT NULL DEFAULT 0,
+                is_unread INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(channel_id, external_id),
+                FOREIGN KEY(channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS youtube_refresh_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                channel_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                inserted_count INTEGER NOT NULL DEFAULT 0,
+                updated_count INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                FOREIGN KEY(channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_youtube_channels_updated_at
+                ON youtube_channels(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_seen
+                ON youtube_videos(channel_id, is_unread, first_seen_at);
+            CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_timestamp
+                ON youtube_videos(channel_id, timestamp, upload_date);
+            CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_rank
+                ON youtube_videos(channel_id, published_rank);
+            CREATE INDEX IF NOT EXISTS idx_youtube_refresh_runs_channel_started
+                ON youtube_refresh_runs(channel_id, started_at);
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;
@@ -479,6 +556,18 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         "dubbing_models",
         "last_checked_at",
         "ALTER TABLE dubbing_models ADD COLUMN last_checked_at TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "youtube_channels",
+        "latest_video_external_id",
+        "ALTER TABLE youtube_channels ADD COLUMN latest_video_external_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "youtube_videos",
+        "published_rank",
+        "ALTER TABLE youtube_videos ADD COLUMN published_rank INTEGER NOT NULL DEFAULT 0",
     )?;
 
     for service in LLM_SERVICES {
