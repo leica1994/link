@@ -462,10 +462,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 external_id TEXT NOT NULL,
                 title TEXT NOT NULL DEFAULT '',
                 url TEXT NOT NULL DEFAULT '',
-                upload_date TEXT,
-                timestamp INTEGER,
                 duration REAL,
-                view_count INTEGER,
                 published_rank INTEGER NOT NULL DEFAULT 0,
                 is_unread INTEGER NOT NULL DEFAULT 1,
                 first_seen_at TEXT NOT NULL,
@@ -493,8 +490,6 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON youtube_channels(updated_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_seen
                 ON youtube_videos(channel_id, is_unread, first_seen_at);
-            CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_timestamp
-                ON youtube_videos(channel_id, timestamp, upload_date);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_rank
                 ON youtube_videos(channel_id, published_rank);
             CREATE INDEX IF NOT EXISTS idx_youtube_refresh_runs_channel_started

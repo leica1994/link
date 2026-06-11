@@ -321,16 +321,8 @@
                     <a class="youtube-video-url" :href="video.url" target="_blank" rel="noreferrer">{{ video.url }}</a>
                   </span>
                   <span class="youtube-video-meta" role="cell">
-                    <CalendarClock :stroke-width="2.1" aria-hidden="true" />
-                    {{ formatVideoDate(video) }}
-                  </span>
-                  <span class="youtube-video-meta" role="cell">
                     <Clock :stroke-width="2.1" aria-hidden="true" />
                     {{ formatDuration(video.duration) }}
-                  </span>
-                  <span class="youtube-video-meta" role="cell">
-                    <Eye :stroke-width="2.1" aria-hidden="true" />
-                    {{ formatViews(video.viewCount) }}
                   </span>
                   <a class="youtube-video-open" :href="video.url" target="_blank" rel="noreferrer" aria-label="打开视频">
                     <ExternalLink :stroke-width="2.1" aria-hidden="true" />
@@ -431,13 +423,11 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowLeft,
-  CalendarClock,
   CheckCheck,
   ChevronRight,
   CircleAlert,
   Clock,
   ExternalLink,
-  Eye,
   ListVideo,
   LoaderCircle,
   Plus,
@@ -489,10 +479,7 @@ type YoutubeVideo = {
   externalId: string
   title: string
   url: string
-  uploadDate?: string | null
-  timestamp?: number | null
   duration?: number | null
-  viewCount?: number | null
   isUnread: boolean
   firstSeenAt: string
   lastSeenAt: string
@@ -931,18 +918,6 @@ const formatDateTime = (value?: string | null) => {
   })
 }
 
-const formatVideoDate = (video: YoutubeVideo) => {
-  if (video.timestamp) {
-    return formatDateTime(new Date(video.timestamp * 1000).toISOString())
-  }
-
-  if (video.uploadDate && /^\d{8}$/.test(video.uploadDate)) {
-    return `${video.uploadDate.slice(0, 4)}-${video.uploadDate.slice(4, 6)}-${video.uploadDate.slice(6, 8)}`
-  }
-
-  return video.uploadDate || '--'
-}
-
 const formatDuration = (duration?: number | null) => {
   if (!duration || !Number.isFinite(duration)) {
     return '--'
@@ -957,14 +932,6 @@ const formatDuration = (duration?: number | null) => {
   }
 
   return `${minutes}:${String(seconds).padStart(2, '0')}`
-}
-
-const formatViews = (views?: number | null) => {
-  if (views === undefined || views === null || !Number.isFinite(views)) {
-    return '--'
-  }
-
-  return new Intl.NumberFormat('zh-CN', { notation: 'compact' }).format(views)
 }
 
 const handleKeydown = (event: KeyboardEvent) => {

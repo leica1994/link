@@ -23,6 +23,8 @@ const RUN_STATUS_FAILED: &str = "failed";
 const DEFAULT_VIDEO_PAGE_SIZE: u32 = 100;
 const MAX_VIDEO_PAGE_SIZE: u32 = 200;
 const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
+const YTDLP_YOUTUBE_LANGUAGE_ARGS: &str = "youtube:lang=zh-CN";
+const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 
 pub struct YoutubeMonitorService {
     running_channels: Mutex<HashSet<String>>,
@@ -109,10 +111,7 @@ pub struct YoutubeVideo {
     pub external_id: String,
     pub title: String,
     pub url: String,
-    pub upload_date: Option<String>,
-    pub timestamp: Option<i64>,
     pub duration: Option<f64>,
-    pub view_count: Option<i64>,
     pub is_unread: bool,
     pub first_seen_at: String,
     pub last_seen_at: String,
@@ -180,10 +179,7 @@ struct VideoEntry {
     external_id: String,
     title: String,
     url: String,
-    upload_date: Option<String>,
-    timestamp: Option<i64>,
     duration: Option<f64>,
-    view_count: Option<i64>,
     metadata: Value,
 }
 
@@ -388,6 +384,10 @@ fn run_ytdlp_refresh(
         "--ignore-errors",
         "--no-warnings",
         "--no-progress",
+        "--extractor-args",
+        YTDLP_YOUTUBE_LANGUAGE_ARGS,
+        "--add-headers",
+        YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
         YTDLP_SOCKET_TIMEOUT_SECONDS,
         &channel.url,
@@ -710,19 +710,19 @@ fn read_channel_duplicate(
                        (
                          SELECT title FROM youtube_videos
                          WHERE channel_id = youtube_channels.id
-                         ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                         ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                          LIMIT 1
                        ),
                        (
                          SELECT url FROM youtube_videos
                          WHERE channel_id = youtube_channels.id
-                         ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                         ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                          LIMIT 1
                        ),
                        (
                          SELECT first_seen_at FROM youtube_videos
                          WHERE channel_id = youtube_channels.id
-                         ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                         ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                          LIMIT 1
                        )
                 FROM youtube_channels
@@ -747,19 +747,19 @@ fn read_channel_duplicate(
                    (
                      SELECT title FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    ),
                    (
                      SELECT url FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    ),
                    (
                      SELECT first_seen_at FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    )
             FROM youtube_channels
@@ -783,19 +783,19 @@ fn read_youtube_channels(connection: &rusqlite::Connection) -> Result<Vec<Youtub
                    (
                      SELECT title FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    ),
                    (
                      SELECT url FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    ),
                    (
                      SELECT first_seen_at FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    )
             FROM youtube_channels
@@ -830,19 +830,19 @@ fn read_youtube_channel_by_id(
                    (
                      SELECT title FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    ),
                    (
                      SELECT url FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    ),
                    (
                      SELECT first_seen_at FROM youtube_videos
                      WHERE channel_id = youtube_channels.id
-                     ORDER BY published_rank DESC, COALESCE(timestamp, 0) DESC, upload_date DESC, datetime(first_seen_at) ASC
+                     ORDER BY published_rank DESC, datetime(first_seen_at) ASC
                      LIMIT 1
                    )
             FROM youtube_channels
@@ -886,8 +886,6 @@ fn read_latest_youtube_video_external_id(
             WHERE channel_id = ?1
             ORDER BY
               published_rank DESC,
-              COALESCE(timestamp, 0) DESC,
-              upload_date DESC,
               datetime(first_seen_at) ASC
             LIMIT 1
             ",
@@ -967,16 +965,14 @@ fn read_youtube_videos_page(
     let mut statement = connection
         .prepare(
             "
-            SELECT id, channel_id, external_id, title, url, upload_date, timestamp,
-                   duration, view_count, is_unread, first_seen_at, last_seen_at, metadata
+            SELECT id, channel_id, external_id, title, url, duration,
+                   is_unread, first_seen_at, last_seen_at, metadata
             FROM youtube_videos
             WHERE channel_id = ?1
               AND (?2 = '' OR lower(title) LIKE ?2 OR lower(url) LIKE ?2)
               AND (?3 = 0 OR is_unread = 1)
             ORDER BY
               published_rank DESC,
-              COALESCE(timestamp, 0) DESC,
-              upload_date DESC,
               datetime(first_seen_at) ASC
             LIMIT ?4 OFFSET ?5
             ",
@@ -1002,7 +998,7 @@ fn read_youtube_videos_page(
 }
 
 fn map_youtube_video(row: &Row<'_>) -> rusqlite::Result<YoutubeVideo> {
-    let metadata_text: String = row.get(12)?;
+    let metadata_text: String = row.get(9)?;
     let metadata = serde_json::from_str(&metadata_text).unwrap_or_else(|_| json!({}));
 
     Ok(YoutubeVideo {
@@ -1011,13 +1007,10 @@ fn map_youtube_video(row: &Row<'_>) -> rusqlite::Result<YoutubeVideo> {
         external_id: row.get(2)?,
         title: row.get(3)?,
         url: row.get(4)?,
-        upload_date: row.get(5)?,
-        timestamp: row.get(6)?,
-        duration: row.get(7)?,
-        view_count: row.get(8)?,
-        is_unread: row.get::<_, i64>(9)? != 0,
-        first_seen_at: row.get(10)?,
-        last_seen_at: row.get(11)?,
+        duration: row.get(5)?,
+        is_unread: row.get::<_, i64>(6)? != 0,
+        first_seen_at: row.get(7)?,
+        last_seen_at: row.get(8)?,
         metadata,
     })
 }
@@ -1050,22 +1043,16 @@ fn upsert_youtube_video(
                 UPDATE youtube_videos
                 SET title = ?1,
                     url = ?2,
-                    upload_date = ?3,
-                    timestamp = ?4,
-                    duration = ?5,
-                    view_count = ?6,
-                    metadata = ?7,
-                    published_rank = CASE WHEN ?8 > published_rank THEN ?8 ELSE published_rank END,
-                    last_seen_at = ?9
-                WHERE id = ?10
+                    duration = ?3,
+                    metadata = ?4,
+                    published_rank = CASE WHEN ?5 > published_rank THEN ?5 ELSE published_rank END,
+                    last_seen_at = ?6
+                WHERE id = ?7
                 ",
                 params![
                     entry.title,
                     entry.url,
-                    entry.upload_date,
-                    entry.timestamp,
                     entry.duration,
-                    entry.view_count,
                     metadata,
                     published_rank,
                     now,
@@ -1080,10 +1067,10 @@ fn upsert_youtube_video(
         .execute(
             "
             INSERT INTO youtube_videos (
-                id, channel_id, external_id, title, url, upload_date, timestamp,
-                duration, view_count, published_rank, is_unread, first_seen_at, last_seen_at, metadata
+                id, channel_id, external_id, title, url, duration,
+                published_rank, is_unread, first_seen_at, last_seen_at, metadata
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10)
             ",
             params![
                 Uuid::new_v4().to_string(),
@@ -1091,10 +1078,7 @@ fn upsert_youtube_video(
                 entry.external_id,
                 entry.title,
                 entry.url,
-                entry.upload_date,
-                entry.timestamp,
                 entry.duration,
-                entry.view_count,
                 published_rank,
                 now,
                 now,
@@ -1315,10 +1299,7 @@ fn extract_video_entry(value: Value) -> Option<VideoEntry> {
         external_id,
         title: string_field(&value, "title").unwrap_or_else(|| "未命名视频".to_string()),
         url,
-        upload_date: string_field(&value, "upload_date"),
-        timestamp: int_field(&value, "timestamp"),
         duration: number_field(&value, "duration"),
-        view_count: int_field(&value, "view_count"),
         metadata: value,
     })
 }
@@ -1365,15 +1346,6 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn int_field(value: &Value, key: &str) -> Option<i64> {
-    value.get(key).and_then(|value| {
-        value
-            .as_i64()
-            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-            .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
-    })
 }
 
 fn number_field(value: &Value, key: &str) -> Option<f64> {

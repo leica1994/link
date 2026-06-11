@@ -2620,10 +2620,10 @@ html[data-theme='dark'] .youtube-refresh-strip {
 }
 
 .youtube-video-row {
-  min-width: 920px;
+  min-width: 720px;
   min-height: 72px;
   display: grid;
-  grid-template-columns: 54px minmax(300px, 1fr) 138px 94px 100px 34px;
+  grid-template-columns: 54px minmax(300px, 1fr) 94px 34px;
   align-items: center;
   gap: 12px;
   padding: 12px 16px;
