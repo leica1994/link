@@ -106,7 +106,7 @@ const TTS_MAX_ATTEMPTS_PER_LINE: usize = 3;
 const TTS_RETRY_SLEEP_MS: u64 = 350;
 const TTS_MODEL_WAIT_SLEEP_MS: u64 = 500;
 const TTS_SYNTHESIS_ACTIVE_MESSAGE: &str = "TTS 配音生成中";
-const TTS_AUDIO_POST_PROCESSING_VERSION: u32 = 1;
+const TTS_AUDIO_POST_PROCESSING_VERSION: u32 = 2;
 const TTS_RNNOISE_MODEL_FILE_NAME: &str = "std.rnnn";
 const TTS_RNNOISE_MODEL_URL: &str =
     "https://raw.githubusercontent.com/richardpl/arnndn-models/master/std.rnnn";
@@ -115,7 +115,7 @@ const TTS_RNNOISE_MODEL_SHA256: &str =
     "6b8943dc4a9b6b24425873992a44f29c0577503276456af46a8854774faeb294";
 const TTS_RNNOISE_MIX: f64 = 0.7;
 const TTS_AUDIO_DECLICK_WINDOW: f64 = 10.0;
-const TTS_AUDIO_DECLICK_OVERLAP: f64 = 0.75;
+const TTS_AUDIO_DECLICK_OVERLAP_PERCENT: u32 = 75;
 const TTS_AUDIO_LOWPASS_HZ: u32 = 6_500;
 const TTS_AUDIO_TAIL_RMS_WINDOW_MS: u64 = 30;
 const TTS_AUDIO_TAIL_RMS_THRESHOLD: f64 = 0.015;
@@ -5569,7 +5569,7 @@ fn tts_audio_post_processing_metadata() -> Value {
         "filters": {
             "rnnoiseMix": TTS_RNNOISE_MIX,
             "declickWindow": TTS_AUDIO_DECLICK_WINDOW,
-            "declickOverlap": TTS_AUDIO_DECLICK_OVERLAP,
+            "declickOverlapPercent": TTS_AUDIO_DECLICK_OVERLAP_PERCENT,
             "lowpassHz": TTS_AUDIO_LOWPASS_HZ,
             "tailRmsWindowMs": TTS_AUDIO_TAIL_RMS_WINDOW_MS,
             "tailRmsThreshold": TTS_AUDIO_TAIL_RMS_THRESHOLD,
@@ -5846,7 +5846,7 @@ fn run_tts_denoise_filter(
 ) -> Result<(), String> {
     let model_path = escape_ffmpeg_filter_path(model_path);
     let filter = format!(
-        "arnndn=m='{model_path}':mix={TTS_RNNOISE_MIX:.2},adeclick=window={TTS_AUDIO_DECLICK_WINDOW:.1}:overlap={TTS_AUDIO_DECLICK_OVERLAP:.2},lowpass=f={TTS_AUDIO_LOWPASS_HZ}"
+        "arnndn=m='{model_path}':mix={TTS_RNNOISE_MIX:.2},adeclick=window={TTS_AUDIO_DECLICK_WINDOW:.1}:overlap={TTS_AUDIO_DECLICK_OVERLAP_PERCENT},lowpass=f={TTS_AUDIO_LOWPASS_HZ}"
     );
 
     run_ffmpeg_command(
