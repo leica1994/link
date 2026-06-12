@@ -8,7 +8,8 @@ import Settings from '../views/Settings.vue'
 export default createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: '/', component: Home },
+    { path: '/', name: 'Home', component: Home },
+    { path: '/tasks/:taskId', name: 'HomeTaskDetail', component: Home },
     { path: '/translate', name: 'Translate', component: Translate, meta: { keepAlive: true } },
     { path: '/dubbing', name: 'Dubbing', component: Dubbing, meta: { keepAlive: true } },
     { path: '/youtube-monitor', name: 'YoutubeMonitor', component: YoutubeMonitor },

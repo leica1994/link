@@ -301,6 +301,11 @@
                 <span>{{ videosError }}</span>
               </div>
 
+              <div v-if="taskAddError" class="translate-alert" role="alert">
+                <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+                <span>{{ taskAddError }}</span>
+              </div>
+
               <div v-if="isLoadingVideos && videos.length === 0" class="youtube-monitor-empty">
                 <LoaderCircle class="youtube-monitor-empty-icon spinning" :stroke-width="2.1" aria-hidden="true" />
                 <span class="translate-empty-title">正在读取视频</span>
@@ -324,6 +329,23 @@
                     <Clock :stroke-width="2.1" aria-hidden="true" />
                     {{ formatDuration(video.duration) }}
                   </span>
+                  <button
+                    class="youtube-video-task-button"
+                    type="button"
+                    :disabled="isVideoQueued(video) || isAddingVideoTask(video)"
+                    :aria-label="isVideoQueued(video) ? '已加入主页待办' : '加入主页待办'"
+                    @click="addVideoTask(video)"
+                  >
+                    <LoaderCircle
+                      v-if="isAddingVideoTask(video)"
+                      class="spinning"
+                      :stroke-width="2.1"
+                      aria-hidden="true"
+                    />
+                    <Check v-else-if="isVideoQueued(video)" :stroke-width="2.1" aria-hidden="true" />
+                    <ListPlus v-else :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ isVideoQueued(video) ? '已加入' : '加入待办' }}</span>
+                  </button>
                   <a class="youtube-video-open" :href="video.url" target="_blank" rel="noreferrer" aria-label="打开视频">
                     <ExternalLink :stroke-width="2.1" aria-hidden="true" />
                   </a>
@@ -423,11 +445,13 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowLeft,
+  Check,
   CheckCheck,
   ChevronRight,
   CircleAlert,
   Clock,
   ExternalLink,
+  ListPlus,
   ListVideo,
   LoaderCircle,
   Plus,
@@ -486,6 +510,14 @@ type YoutubeVideo = {
   metadata: Record<string, unknown>
 }
 
+type HomeVideoTask = {
+  id: string
+  url: string
+  sourceChannelId: string
+  sourceVideoId: string
+  title: string
+}
+
 type YoutubeVideoPage = {
   items: YoutubeVideo[]
   total: number
@@ -532,10 +564,13 @@ const addError = ref('')
 const deleteError = ref('')
 const channelError = ref('')
 const videosError = ref('')
+const taskAddError = ref('')
 const isAddingChannel = ref(false)
 const isDeletingChannel = ref(false)
 const activeRefreshRun = ref<YoutubeRefreshRun | null>(null)
 const refreshingChannelIds = ref(new Set<string>())
+const queuedVideoUrls = ref(new Set<string>())
+const addingVideoIds = ref(new Set<string>())
 let unlistenRefresh: UnlistenFn | undefined
 
 const channelFilterOptions: { value: ChannelStatusFilter; label: string }[] = [
@@ -622,7 +657,7 @@ watch([videoQuery, unreadOnly], () => {
 })
 
 const loadAll = async () => {
-  await Promise.all([loadYtdlpStatus(), loadChannels()])
+  await Promise.all([loadYtdlpStatus(), loadChannels(), loadQueuedVideoUrls()])
   if (activeChannelId.value) {
     resetVideos()
     await loadVideos(true)
@@ -666,6 +701,7 @@ const resetVideos = () => {
   videoTotal.value = 0
   hasMoreVideos.value = false
   videosError.value = ''
+  taskAddError.value = ''
 }
 
 const loadVideos = async (replace = false) => {
@@ -758,6 +794,72 @@ const markChannelSeen = async () => {
   } catch (error) {
     videosError.value = stringifyError(error, '标记已读失败')
   }
+}
+
+const addVideoTask = async (video: YoutubeVideo) => {
+  if (!isTauriRuntime() || isVideoQueued(video) || isAddingVideoTask(video)) {
+    return
+  }
+
+  const next = new Set(addingVideoIds.value)
+  next.add(video.id)
+  addingVideoIds.value = next
+  taskAddError.value = ''
+
+  try {
+    const task = await invoke<HomeVideoTask>('add_home_video_task', {
+      request: {
+        url: video.url,
+        title: video.title,
+        sourceChannelId: video.channelId,
+        sourceVideoId: video.id,
+      },
+    })
+    const queued = new Set(queuedVideoUrls.value)
+    queued.add(task.url)
+    queued.add(video.url)
+    queuedVideoUrls.value = queued
+  } catch (error) {
+    taskAddError.value = stringifyError(error, '加入主页待办失败')
+  } finally {
+    const cleared = new Set(addingVideoIds.value)
+    cleared.delete(video.id)
+    addingVideoIds.value = cleared
+  }
+}
+
+const isVideoQueued = (video: YoutubeVideo) => queuedVideoUrls.value.has(normalizeVideoQueueUrl(video.url))
+
+const isAddingVideoTask = (video: YoutubeVideo) => addingVideoIds.value.has(video.id)
+
+const normalizeVideoQueueUrl = (url: string) => {
+  const videoId = youtubeVideoIdFromUrl(url)
+  return videoId ? `https://www.youtube.com/watch?v=${videoId}` : url
+}
+
+const youtubeVideoIdFromUrl = (url: string) => {
+  const trimmed = url.trim()
+  const lower = trimmed.toLowerCase()
+  const directMarkers = ['youtu.be/', 'youtube.com/shorts/', 'youtube.com/embed/']
+  for (const marker of directMarkers) {
+    const index = lower.indexOf(marker)
+    if (index >= 0) {
+      return cleanVideoId(trimmed.slice(index + marker.length))
+    }
+  }
+
+  const queryIndex = trimmed.indexOf('?')
+  if (queryIndex < 0 || !lower.includes('youtube.com/watch')) {
+    return ''
+  }
+
+  const params = new URLSearchParams(trimmed.slice(queryIndex + 1))
+  return cleanVideoId(params.get('v') ?? '')
+}
+
+const cleanVideoId = (value: string) => {
+  const id = value.split(/[/?&#]/)[0]?.trim() ?? ''
+  return id && !id.includes('.') ? id : ''
 }
 
 const addChannel = async () => {
@@ -932,6 +1034,20 @@ const formatDuration = (duration?: number | null) => {
   }
 
   return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
+const loadQueuedVideoUrls = async () => {
+  if (!isTauriRuntime()) {
+    queuedVideoUrls.value = new Set()
+    return
+  }
+
+  try {
+    const tasks = await invoke<HomeVideoTask[]>('list_home_video_tasks')
+    queuedVideoUrls.value = new Set(tasks.map((task) => task.url))
+  } catch {
+    queuedVideoUrls.value = new Set()
+  }
 }
 
 const handleKeydown = (event: KeyboardEvent) => {

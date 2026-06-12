@@ -486,6 +486,47 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(channel_id) REFERENCES youtube_channels(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS home_video_tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                url TEXT NOT NULL UNIQUE,
+                source_channel_id TEXT NOT NULL DEFAULT '',
+                source_video_id TEXT NOT NULL DEFAULT '',
+                external_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                channel_title TEXT NOT NULL DEFAULT '',
+                channel_url TEXT NOT NULL DEFAULT '',
+                thumbnail_url TEXT NOT NULL DEFAULT '',
+                duration REAL,
+                webpage_url TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                view_count INTEGER,
+                like_count INTEGER,
+                comment_count INTEGER,
+                upload_date TEXT NOT NULL DEFAULT '',
+                detail_status TEXT NOT NULL DEFAULT 'pending',
+                subtitle_options TEXT NOT NULL DEFAULT '[]',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                detail_checked_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS home_video_task_subtitles (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL,
+                language TEXT NOT NULL,
+                language_name TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'manual',
+                format TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, language, source_kind),
+                FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_youtube_channels_updated_at
                 ON youtube_channels(updated_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_seen
@@ -494,6 +535,12 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON youtube_videos(channel_id, published_rank);
             CREATE INDEX IF NOT EXISTS idx_youtube_refresh_runs_channel_started
                 ON youtube_refresh_runs(channel_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_home_video_tasks_updated_at
+                ON home_video_tasks(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_video_tasks_status
+                ON home_video_tasks(detail_status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_video_task_subtitles_task
+                ON home_video_task_subtitles(task_id, updated_at);
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;

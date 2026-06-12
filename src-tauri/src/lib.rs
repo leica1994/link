@@ -4,6 +4,7 @@ mod app_paths;
 mod dubbing;
 mod dubbing_alignment;
 mod dubbing_compose;
+mod home_tasks;
 mod htdemucs;
 mod settings;
 mod subtitle_ai;
@@ -17,6 +18,10 @@ use dubbing::{
     add_dubbing_model, delete_dubbing_model, list_dubbing_models, list_dubbing_voices,
     load_dubbing_reference_audio, prepare_dubbing_material, preview_dubbing_voice,
     set_dubbing_model_enabled, start_dubbing_task, DubbingTtsScheduler,
+};
+use home_tasks::{
+    add_home_video_task, delete_home_video_task, download_home_video_task_subtitle,
+    get_home_video_task, list_home_video_tasks, refresh_home_video_task_detail,
 };
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{
@@ -109,6 +114,12 @@ pub fn run() {
             load_dubbing_reference_audio,
             prepare_dubbing_material,
             start_dubbing_task,
+            list_home_video_tasks,
+            add_home_video_task,
+            get_home_video_task,
+            delete_home_video_task,
+            refresh_home_video_task_detail,
+            download_home_video_task_subtitle,
             get_ytdlp_status,
             list_youtube_channels,
             add_youtube_channel,

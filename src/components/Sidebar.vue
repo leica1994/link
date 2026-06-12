@@ -1,6 +1,6 @@
 <template>
   <nav class="sidebar">
-    <RouterLink to="/" class="nav-item" :class="{ active: route.path === '/' }">
+    <RouterLink to="/" class="nav-item" :class="{ active: route.path === '/' || route.path.startsWith('/tasks') }">
       <House class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
       <span>主页</span>
     </RouterLink>

@@ -10,6 +10,7 @@ const MODELS_DIR_NAME: &str = "models";
 const RNNOISE_DIR_NAME: &str = "arnndn";
 const TEMP_DIR_NAME: &str = "temp";
 const WEBVIEW_DIR_NAME: &str = "webview";
+const YOUTUBE_TASKS_DIR_NAME: &str = "youtube_tasks";
 
 pub fn app_data_dir() -> Result<PathBuf, String> {
     let install_dir = env::current_exe()
@@ -72,4 +73,12 @@ pub fn webview_data_dir() -> Result<PathBuf, String> {
     fs::create_dir_all(&webview_dir)
         .map_err(|error| format!("无法创建 WebView 缓存目录: {error}"))?;
     Ok(webview_dir)
+}
+
+pub fn youtube_task_dir(task_id: &str) -> Result<PathBuf, String> {
+    let tasks_dir = ensure_app_data_dir()?.join(YOUTUBE_TASKS_DIR_NAME);
+    fs::create_dir_all(&tasks_dir).map_err(|error| format!("无法创建视频任务目录: {error}"))?;
+    let task_dir = tasks_dir.join(task_id);
+    fs::create_dir_all(&task_dir).map_err(|error| format!("无法创建视频任务目录: {error}"))?;
+    Ok(task_dir)
 }
