@@ -285,7 +285,10 @@
                   <span class="home-video-download-meta">
                     {{ videoDownloadMeta }}
                   </span>
-                  <span v-if="isDownloadingVideo && videoDownloadProgressMessage" class="home-download-progress-message">
+                  <span
+                    v-if="isActiveTaskDownloadingVideo && videoDownloadProgressMessage"
+                    class="home-download-progress-message"
+                  >
                     {{ videoDownloadProgressMessage }}
                   </span>
                 </span>
@@ -293,11 +296,11 @@
                 <button
                   class="settings-action youtube-monitor-action home-video-download-button"
                   type="button"
-                  :disabled="isDownloadingVideo || !ytdlpStatus.isAvailable"
+                  :disabled="isActiveTaskDownloadingVideo || !ytdlpStatus.isAvailable"
                   @click="downloadVideo"
                 >
                   <LoaderCircle
-                    v-if="isDownloadingVideo"
+                    v-if="isActiveTaskDownloadingVideo"
                     class="spinning"
                     :stroke-width="2.1"
                     aria-hidden="true"
@@ -309,7 +312,7 @@
               </div>
 
               <div
-                v-if="isDownloadingVideo"
+                v-if="isActiveTaskDownloadingVideo"
                 class="home-download-progress"
                 role="progressbar"
                 aria-label="视频下载进度"
@@ -518,7 +521,7 @@ import {
   Trash2,
   Video,
 } from 'lucide-vue-next'
-import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 defineOptions({ name: 'Home' })
@@ -632,14 +635,14 @@ const isLoadingTasks = ref(false)
 const isAddingTask = ref(false)
 const isDeletingTask = ref(false)
 const isRefreshingDetail = ref(false)
-const isDownloadingVideo = ref(false)
+const downloadingVideoTaskIds = ref(new Set<string>())
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
 const pageError = ref('')
 const addError = ref('')
 const deleteError = ref('')
-const subtitleError = ref('')
-const videoError = ref('')
+const subtitleErrorsByTaskId = ref(new Map<string, string>())
+const videoErrorsByTaskId = ref(new Map<string, string>())
 const downloadingSubtitleKeys = ref(new Set<string>())
 const downloadProgressByKey = ref(new Map<string, HomeVideoDownloadProgress>())
 const videoSideRef = ref<HTMLElement | null>(null)
@@ -783,8 +786,13 @@ const partialVideoDownload = computed(() => {
 
 const hasPartialVideoDownload = computed(() => Boolean(partialVideoDownload.value))
 
+const isActiveTaskDownloadingVideo = computed(() => {
+  const taskId = activeTask.value?.id
+  return Boolean(taskId && isVideoTaskDownloading(taskId))
+})
+
 const videoActionLabel = computed(() => {
-  if (isDownloadingVideo.value) {
+  if (isActiveTaskDownloadingVideo.value) {
     return '下载中'
   }
   if (hasPartialVideoDownload.value) {
@@ -804,12 +812,15 @@ const videoDownloadProgress = computed(() => {
 })
 
 const videoDownloadProgressValue = computed(() => {
-  return clampProgress(videoDownloadProgress.value?.progress ?? (isDownloadingVideo.value ? 2 : 0))
+  return clampProgress(videoDownloadProgress.value?.progress ?? (isActiveTaskDownloadingVideo.value ? 2 : 0))
 })
 
 const videoDownloadProgressMessage = computed(() => {
-  return videoDownloadProgress.value?.message || (isDownloadingVideo.value ? '视频下载中' : '')
+  return videoDownloadProgress.value?.message || (isActiveTaskDownloadingVideo.value ? '视频下载中' : '')
 })
+
+const subtitleError = computed(() => activeTaskScopedError(subtitleErrorsByTaskId))
+const videoError = computed(() => activeTaskScopedError(videoErrorsByTaskId))
 
 const videoDescriptionStyle = computed(() => ({
   maxHeight: `${videoDescriptionMaxHeight.value}px`,
@@ -825,8 +836,6 @@ const deleteTargetLabel = computed(() => {
 })
 
 watch(activeTaskId, async () => {
-  subtitleError.value = ''
-  videoError.value = ''
   if (!activeTaskId.value) {
     return
   }
@@ -1008,9 +1017,17 @@ const reloadActiveTask = async () => {
     return
   }
 
+  await reloadTask(activeTaskId.value)
+}
+
+const reloadTask = async (taskId: string) => {
+  if (!taskId || !isTauriRuntime()) {
+    return
+  }
+
   try {
     const task = await invoke<HomeVideoTask>('get_home_video_task', {
-      request: { taskId: activeTaskId.value },
+      request: { taskId },
     })
     upsertTask(task)
   } catch {
@@ -1105,20 +1122,22 @@ const readRowGap = (element: HTMLElement | null, fallback: number) => {
 }
 
 const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
-  if (!activeTask.value || !isTauriRuntime()) {
+  const task = activeTask.value
+  if (!task || !isTauriRuntime()) {
     return
   }
 
   const key = subtitleKey(option)
-  if (downloadingSubtitleKeys.value.has(key)) {
+  const scopedKey = downloadProgressKey(task.id, 'subtitle', key)
+  if (downloadingSubtitleKeys.value.has(scopedKey)) {
     return
   }
 
   const next = new Set(downloadingSubtitleKeys.value)
-  next.add(key)
+  next.add(scopedKey)
   downloadingSubtitleKeys.value = next
   setDownloadProgress({
-    taskId: activeTask.value.id,
+    taskId: task.id,
     kind: 'subtitle',
     key,
     progress: 2,
@@ -1127,55 +1146,77 @@ const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
     language: option.language,
     sourceKind: option.sourceKind,
   })
-  subtitleError.value = ''
+  clearTaskError(subtitleErrorsByTaskId, task.id)
 
   try {
-    const task = await invoke<HomeVideoTask>('download_home_video_task_subtitle', {
+    const updatedTask = await invoke<HomeVideoTask>('download_home_video_task_subtitle', {
       request: {
-        taskId: activeTask.value.id,
+        taskId: task.id,
         language: option.language,
         sourceKind: option.sourceKind,
       },
     })
-    upsertTask(task)
+    upsertTask(updatedTask)
   } catch (error) {
-    subtitleError.value = stringifyError(error, '下载字幕失败')
+    const message = stringifyError(error, '下载字幕失败')
+    setTaskError(subtitleErrorsByTaskId, task.id, message)
+    setDownloadProgress({
+      taskId: task.id,
+      kind: 'subtitle',
+      key,
+      progress: 100,
+      status: 'failed',
+      message,
+      language: option.language,
+      sourceKind: option.sourceKind,
+    })
   } finally {
     const cleared = new Set(downloadingSubtitleKeys.value)
-    cleared.delete(key)
+    cleared.delete(scopedKey)
     downloadingSubtitleKeys.value = cleared
   }
 }
 
 const downloadVideo = async () => {
-  if (!activeTask.value || isDownloadingVideo.value || !isTauriRuntime()) {
+  const task = activeTask.value
+  if (!task || isVideoTaskDownloading(task.id) || !isTauriRuntime()) {
     return
   }
 
   const isContinuing = hasPartialVideoDownload.value
-  isDownloadingVideo.value = true
+  const taskId = task.id
+  setVideoTaskDownloading(taskId, true)
   setDownloadProgress({
-    taskId: activeTask.value.id,
+    taskId,
     kind: 'video',
     key: 'video',
     progress: 2,
     status: 'active',
     message: isContinuing ? '准备继续下载视频' : '准备下载视频',
   })
-  videoError.value = ''
+  clearTaskError(videoErrorsByTaskId, taskId)
 
   try {
-    const task = await invoke<HomeVideoTask>('download_home_video_task_video', {
+    const updatedTask = await invoke<HomeVideoTask>('download_home_video_task_video', {
       request: {
-        taskId: activeTask.value.id,
+        taskId,
       },
     })
-    upsertTask(task)
+    upsertTask(updatedTask)
   } catch (error) {
-    videoError.value = stringifyError(error, '下载视频失败')
-    await reloadActiveTask()
+    const message = stringifyError(error, '下载视频失败')
+    setTaskError(videoErrorsByTaskId, taskId, message)
+    setDownloadProgress({
+      taskId,
+      kind: 'video',
+      key: 'video',
+      progress: 100,
+      status: 'failed',
+      message,
+    })
+    await reloadTask(taskId)
   } finally {
-    isDownloadingVideo.value = false
+    setVideoTaskDownloading(taskId, false)
   }
 }
 
@@ -1240,6 +1281,7 @@ const removeTask = (taskId: string) => {
   const refreshed = new Set(autoRefreshedTaskIds.value)
   refreshed.delete(taskId)
   autoRefreshedTaskIds.value = refreshed
+  clearTaskDownloadState(taskId)
 }
 
 const hasTask = (taskId: string) => {
@@ -1311,8 +1353,31 @@ const subtitleKey = (option: HomeVideoSubtitleOption) => `${option.sourceKind}:$
 
 const downloadProgressKey = (taskId: string, kind: DownloadProgressKind, key: string) => `${taskId}:${kind}:${key}`
 
+const isVideoTaskDownloading = (taskId: string) => {
+  const progress = downloadProgressByKey.value.get(downloadProgressKey(taskId, 'video', 'video'))
+  return downloadingVideoTaskIds.value.has(taskId) || progress?.status === 'active'
+}
+
+const setVideoTaskDownloading = (taskId: string, downloading: boolean) => {
+  const next = new Set(downloadingVideoTaskIds.value)
+  if (downloading) {
+    next.add(taskId)
+  } else {
+    next.delete(taskId)
+  }
+  downloadingVideoTaskIds.value = next
+}
+
 const isSubtitleDownloading = (option: HomeVideoSubtitleOption) => {
-  return downloadingSubtitleKeys.value.has(subtitleKey(option))
+  const taskId = activeTask.value?.id
+  if (!taskId) {
+    return false
+  }
+
+  const key = subtitleKey(option)
+  const scopedKey = downloadProgressKey(taskId, 'subtitle', key)
+  const progress = downloadProgressByKey.value.get(scopedKey)
+  return downloadingSubtitleKeys.value.has(scopedKey) || progress?.status === 'active'
 }
 
 const subtitleDownloadProgress = (option: HomeVideoSubtitleOption) => {
@@ -1352,6 +1417,39 @@ const subtitleActionLabel = (option: HomeVideoSubtitleOption) => {
 }
 
 const subtitleSourceLabel = (sourceKind: string) => (sourceKind === 'automatic' ? '自动字幕' : '手动字幕')
+
+const activeTaskScopedError = (errors: Ref<Map<string, string>>) => {
+  const taskId = activeTask.value?.id
+  return taskId ? (errors.value.get(taskId) ?? '') : ''
+}
+
+const setTaskError = (errors: Ref<Map<string, string>>, taskId: string, message: string) => {
+  const next = new Map(errors.value)
+  if (message) {
+    next.set(taskId, message)
+  } else {
+    next.delete(taskId)
+  }
+  errors.value = next
+}
+
+const clearTaskError = (errors: Ref<Map<string, string>>, taskId: string) => {
+  setTaskError(errors, taskId, '')
+}
+
+const clearTaskDownloadState = (taskId: string) => {
+  setVideoTaskDownloading(taskId, false)
+
+  const scopedPrefix = `${taskId}:`
+  downloadingSubtitleKeys.value = new Set(
+    [...downloadingSubtitleKeys.value].filter((key) => !key.startsWith(scopedPrefix)),
+  )
+  downloadProgressByKey.value = new Map(
+    [...downloadProgressByKey.value].filter(([key]) => !key.startsWith(scopedPrefix)),
+  )
+  clearTaskError(subtitleErrorsByTaskId, taskId)
+  clearTaskError(videoErrorsByTaskId, taskId)
+}
 
 const displayThumbnailUrl = (task: HomeVideoTask) => {
   return isInlineThumbnailUrl(task.thumbnailUrl) ? task.thumbnailUrl : ''
