@@ -2485,6 +2485,36 @@ html[data-theme='dark'] .home-video-download-strip.downloaded .home-video-downlo
   flex: 0 0 auto;
 }
 
+.home-video-download-panel .home-video-download-strip {
+  margin-top: 0;
+  padding: 16px;
+  border: 0;
+}
+
+.home-download-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px 16px;
+}
+
+.home-download-progress-message,
+.home-download-progress-copy {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-download-alert {
+  margin: 0 16px 16px;
+}
+
 .home-video-description {
   max-height: 276px;
   overflow: auto;
@@ -2492,6 +2522,7 @@ html[data-theme='dark'] .home-video-download-strip.downloaded .home-video-downlo
   font-size: 13px;
   font-weight: 650;
   line-height: 1.55;
+  margin: 0;
   scrollbar-width: none;
   white-space: pre-wrap;
 }
@@ -2622,6 +2653,12 @@ html[data-theme='dark'] .home-info-strip.error {
 
 .home-subtitle-row {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.home-subtitle-progress {
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr) 42px;
+  padding: 0;
 }
 
 .home-subtitle-row.downloaded {
@@ -3627,6 +3664,15 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
   }
 
   .home-video-download-meta {
+    white-space: normal;
+  }
+
+  .home-subtitle-progress {
+    grid-template-columns: minmax(0, 1fr) 42px;
+  }
+
+  .home-subtitle-progress .home-download-progress-copy {
+    grid-column: 1 / -1;
     white-space: normal;
   }
 

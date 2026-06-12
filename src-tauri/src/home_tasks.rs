@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 use crate::app_paths;
@@ -28,6 +31,17 @@ const YTDLP_YOUTUBE_LANGUAGE_ARGS: &str = "youtube:lang=zh-CN";
 const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 const THUMBNAIL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+const HOME_VIDEO_DOWNLOAD_PROGRESS_EVENT: &str = "home-video-download-progress";
+const DOWNLOAD_KIND_VIDEO: &str = "video";
+const DOWNLOAD_KIND_SUBTITLE: &str = "subtitle";
+const DOWNLOAD_PROGRESS_ACTIVE: &str = "active";
+const DOWNLOAD_PROGRESS_DONE: &str = "done";
+const DOWNLOAD_PROGRESS_FAILED: &str = "failed";
+const YTDLP_PROGRESS_PREFIX: &str = "LINK_YTDLP_PROGRESS";
+const YTDLP_DOWNLOAD_PROGRESS_TEMPLATE: &str =
+    "download:LINK_YTDLP_PROGRESS\tdownload\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress._percent_str)s";
+const YTDLP_POSTPROCESS_PROGRESS_TEMPLATE: &str =
+    "postprocess:LINK_YTDLP_PROGRESS\tpostprocess\t%(progress.status)s\tNA\tNA\tNA\t%(progress._percent_str)s";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +162,122 @@ struct VideoDownloadOutput {
     file_name: String,
     format: String,
     file_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HomeVideoDownloadProgress {
+    task_id: String,
+    kind: String,
+    key: String,
+    progress: u8,
+    status: String,
+    message: String,
+    downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    language: Option<String>,
+    source_kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadProgressEmitter {
+    app: AppHandle,
+    task_id: String,
+    kind: String,
+    key: String,
+    language: Option<String>,
+    source_kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct YtdlpProgressLine {
+    phase: String,
+    status: String,
+    progress: Option<u8>,
+    downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+impl DownloadProgressEmitter {
+    fn video(app: AppHandle, task_id: &str) -> Self {
+        Self {
+            app,
+            task_id: task_id.to_string(),
+            kind: DOWNLOAD_KIND_VIDEO.to_string(),
+            key: DOWNLOAD_KIND_VIDEO.to_string(),
+            language: None,
+            source_kind: None,
+        }
+    }
+
+    fn subtitle(app: AppHandle, task_id: &str, option: &HomeVideoSubtitleOption) -> Self {
+        Self {
+            app,
+            task_id: task_id.to_string(),
+            kind: DOWNLOAD_KIND_SUBTITLE.to_string(),
+            key: subtitle_key(option),
+            language: Some(option.language.clone()),
+            source_kind: Some(option.source_kind.clone()),
+        }
+    }
+
+    fn emit(
+        &self,
+        progress: u8,
+        status: &str,
+        message: &str,
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    ) {
+        let _ = self.app.emit(
+            HOME_VIDEO_DOWNLOAD_PROGRESS_EVENT,
+            HomeVideoDownloadProgress {
+                task_id: self.task_id.clone(),
+                kind: self.kind.clone(),
+                key: self.key.clone(),
+                progress: progress.min(100),
+                status: status.to_string(),
+                message: message.to_string(),
+                downloaded_bytes,
+                total_bytes,
+                language: self.language.clone(),
+                source_kind: self.source_kind.clone(),
+            },
+        );
+    }
+
+    fn emit_active(&self, progress: u8, message: &str) {
+        self.emit(progress, DOWNLOAD_PROGRESS_ACTIVE, message, None, None);
+    }
+
+    fn emit_done(&self, message: &str) {
+        self.emit(100, DOWNLOAD_PROGRESS_DONE, message, None, None);
+    }
+
+    fn emit_failed(&self, message: &str) {
+        self.emit(100, DOWNLOAD_PROGRESS_FAILED, message, None, None);
+    }
+
+    fn emit_ytdlp_progress(&self, progress: &YtdlpProgressLine) {
+        let value = match progress.phase.as_str() {
+            "postprocess" => {
+                if progress.status == "finished" {
+                    98
+                } else {
+                    96
+                }
+            }
+            _ => progress.progress.unwrap_or(0).clamp(2, 94),
+        };
+        let message = download_progress_message(&self.kind, &progress.phase, &progress.status);
+        self.emit(
+            value,
+            DOWNLOAD_PROGRESS_ACTIVE,
+            &message,
+            progress.downloaded_bytes,
+            progress.total_bytes,
+        );
+    }
 }
 
 #[tauri::command]
@@ -446,13 +576,29 @@ fn download_home_video_task_subtitle_blocking(
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
     let subtitles_dir = task_dir.join("subtitles");
     fs::create_dir_all(&subtitles_dir).map_err(|error| format!("无法创建字幕目录: {error}"))?;
+    let progress = DownloadProgressEmitter::subtitle(app.clone(), &task.id, &option);
 
-    let output = download_subtitle_file(&task, &option, &proxy, &subtitles_dir)?;
+    progress.emit_active(2, "准备下载字幕");
+    let output = match download_subtitle_file(&task, &option, &proxy, &subtitles_dir, &progress) {
+        Ok(output) => output,
+        Err(error) => {
+            progress.emit_failed(&error);
+            return Err(error);
+        }
+    };
     let now = Utc::now().to_rfc3339();
-    store.with_connection(|connection| {
+    let updated_task = match store.with_connection(|connection| {
         upsert_home_video_subtitle(connection, &task.id, &option, output, &now)?;
         read_home_video_task_by_id(connection, &task.id)
-    })
+    }) {
+        Ok(task) => task,
+        Err(error) => {
+            progress.emit_failed(&error);
+            return Err(error);
+        }
+    };
+    progress.emit_done("字幕下载完成");
+    Ok(updated_task)
 }
 
 fn download_home_video_task_video_blocking(
@@ -466,13 +612,29 @@ fn download_home_video_task_video_blocking(
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
     let videos_dir = task_dir.join("videos");
     fs::create_dir_all(&videos_dir).map_err(|error| format!("无法创建视频目录: {error}"))?;
+    let progress = DownloadProgressEmitter::video(app.clone(), &task.id);
 
-    let output = download_video_file(&task, &proxy, &videos_dir)?;
+    progress.emit_active(2, "准备下载视频");
+    let output = match download_video_file(&task, &proxy, &videos_dir, &progress) {
+        Ok(output) => output,
+        Err(error) => {
+            progress.emit_failed(&error);
+            return Err(error);
+        }
+    };
     let now = Utc::now().to_rfc3339();
-    store.with_connection(|connection| {
+    let updated_task = match store.with_connection(|connection| {
         upsert_home_video_download(connection, &task.id, output, &now)?;
         read_home_video_task_by_id(connection, &task.id)
-    })
+    }) {
+        Ok(task) => task,
+        Err(error) => {
+            progress.emit_failed(&error);
+            return Err(error);
+        }
+    };
+    progress.emit_done("视频下载完成");
+    Ok(updated_task)
 }
 
 fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVideoTask>, String> {
@@ -858,6 +1020,7 @@ fn download_subtitle_file(
     option: &HomeVideoSubtitleOption,
     proxy: &str,
     subtitles_dir: &Path,
+    progress: &DownloadProgressEmitter,
 ) -> Result<SubtitleDownloadOutput, String> {
     let prefix = format!(
         "{}.{}.{}",
@@ -874,7 +1037,6 @@ fn download_subtitle_file(
         "--skip-download",
         "--no-playlist",
         "--no-warnings",
-        "--no-progress",
         "--extractor-args",
         YTDLP_YOUTUBE_LANGUAGE_ARGS,
         "--add-headers",
@@ -882,6 +1044,7 @@ fn download_subtitle_file(
         "--socket-timeout",
         YTDLP_SOCKET_TIMEOUT_SECONDS,
     ]);
+    add_ytdlp_progress_args(&mut command);
     if option.source_kind == SUBTITLE_SOURCE_AUTOMATIC {
         command.arg("--write-auto-subs");
     } else {
@@ -896,13 +1059,9 @@ fn download_subtitle_file(
         &output_template,
         &task.url,
     ]);
-    let output = command
-        .output()
-        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
-
-    if !output.status.success() {
-        return Err(stderr_or_default(&output.stderr, "yt-dlp 下载字幕失败"));
-    }
+    progress.emit_active(10, "字幕下载中");
+    run_ytdlp_download_command(&mut command, progress, "yt-dlp 下载字幕失败")?;
+    progress.emit_active(92, "字幕写入完成");
 
     let path = find_subtitle_output(subtitles_dir, &prefix)?;
     let metadata = fs::metadata(&path).map_err(|error| format!("无法读取字幕文件: {error}"))?;
@@ -923,6 +1082,7 @@ fn download_video_file(
     task: &HomeVideoTask,
     proxy: &str,
     videos_dir: &Path,
+    progress: &DownloadProgressEmitter,
 ) -> Result<VideoDownloadOutput, String> {
     let prefix = format!("{}.video", sanitize_file_segment(&task.id));
     let output_template = videos_dir.join(format!("{prefix}.%(ext)s"));
@@ -931,7 +1091,6 @@ fn download_video_file(
     command.args([
         "--no-playlist",
         "--no-warnings",
-        "--no-progress",
         "--force-overwrites",
         "--extractor-args",
         YTDLP_YOUTUBE_LANGUAGE_ARGS,
@@ -945,15 +1104,12 @@ fn download_video_file(
         "mp4",
         "-o",
         &output_template,
-        &task.url,
     ]);
-    let output = command
-        .output()
-        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
-
-    if !output.status.success() {
-        return Err(stderr_or_default(&output.stderr, "yt-dlp 下载视频失败"));
-    }
+    add_ytdlp_progress_args(&mut command);
+    command.arg(&task.url);
+    progress.emit_active(8, "视频下载中");
+    run_ytdlp_download_command(&mut command, progress, "yt-dlp 下载视频失败")?;
+    progress.emit_active(98, "视频文件处理中");
 
     let path = find_video_output(videos_dir, &prefix)?;
     remove_other_matching_outputs(videos_dir, &prefix, &path)?;
@@ -975,6 +1131,168 @@ fn download_video_file(
         format,
         file_size: metadata.len().min(i64::MAX as u64) as i64,
     })
+}
+
+fn add_ytdlp_progress_args(command: &mut Command) {
+    command.args([
+        "--newline",
+        "--progress",
+        "--progress-delta",
+        "0.2",
+        "--progress-template",
+        YTDLP_DOWNLOAD_PROGRESS_TEMPLATE,
+        "--progress-template",
+        YTDLP_POSTPROCESS_PROGRESS_TEMPLATE,
+    ]);
+}
+
+fn run_ytdlp_download_command(
+    command: &mut Command,
+    progress: &DownloadProgressEmitter,
+    failure_message: &str,
+) -> Result<(), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 yt-dlp 输出".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取 yt-dlp 错误输出".to_string())?;
+    let (sender, receiver) = mpsc::channel::<String>();
+    let stdout_reader = spawn_output_reader(stdout, sender.clone());
+    let stderr_reader = spawn_output_reader(stderr, sender);
+    let mut output_lines = Vec::new();
+    let status = loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => handle_ytdlp_output_line(&line, progress, &mut output_lines),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+
+        match child
+            .try_wait()
+            .map_err(|error| format!("无法等待 yt-dlp 任务: {error}"))?
+        {
+            Some(status) => break status,
+            None => continue,
+        }
+    };
+
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    for line in receiver.try_iter() {
+        handle_ytdlp_output_line(&line, progress, &mut output_lines);
+    }
+
+    if !status.success() {
+        return Err(lines_or_default(&output_lines, failure_message));
+    }
+
+    Ok(())
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    reader: R,
+    sender: mpsc::Sender<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            let _ = sender.send(line);
+        }
+    })
+}
+
+fn handle_ytdlp_output_line(
+    line: &str,
+    progress: &DownloadProgressEmitter,
+    output_lines: &mut Vec<String>,
+) {
+    if let Some(parsed) = parse_ytdlp_progress_line(line) {
+        progress.emit_ytdlp_progress(&parsed);
+        return;
+    }
+
+    let line = line.trim();
+    if !line.is_empty() {
+        output_lines.push(line.to_string());
+    }
+}
+
+fn parse_ytdlp_progress_line(line: &str) -> Option<YtdlpProgressLine> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(YTDLP_PROGRESS_PREFIX) {
+        return None;
+    }
+
+    let parts = trimmed.split('\t').collect::<Vec<_>>();
+    if parts.len() < 7 {
+        return None;
+    }
+
+    let downloaded_bytes = parse_optional_u64(parts[3]);
+    let total_bytes = parse_optional_u64(parts[4]).or_else(|| parse_optional_u64(parts[5]));
+    let progress = parse_percent(parts[6]).or_else(|| {
+        downloaded_bytes.and_then(|downloaded| {
+            total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| ((downloaded as f64 / total as f64) * 100.0).round() as u8)
+        })
+    });
+
+    Some(YtdlpProgressLine {
+        phase: parts[1].trim().to_string(),
+        status: parts[2].trim().to_string(),
+        progress,
+        downloaded_bytes,
+        total_bytes,
+    })
+}
+
+fn parse_optional_u64(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("NA") || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+
+    value.parse::<u64>().ok()
+}
+
+fn parse_percent(value: &str) -> Option<u8> {
+    let numeric = value
+        .chars()
+        .filter(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+    let value = numeric.parse::<f64>().ok()?;
+    Some(value.round().clamp(0.0, 100.0) as u8)
+}
+
+fn download_progress_message(kind: &str, phase: &str, status: &str) -> String {
+    if phase == "postprocess" {
+        return if kind == DOWNLOAD_KIND_VIDEO {
+            "视频封装中".to_string()
+        } else {
+            "字幕写入中".to_string()
+        };
+    }
+
+    if status == "finished" {
+        return if kind == DOWNLOAD_KIND_VIDEO {
+            "视频下载完成，正在处理文件".to_string()
+        } else {
+            "字幕下载完成，正在写入文件".to_string()
+        };
+    }
+
+    if kind == DOWNLOAD_KIND_VIDEO {
+        "视频下载中".to_string()
+    } else {
+        "字幕下载中".to_string()
+    }
 }
 
 fn download_thumbnail_data_url(url: &str, proxy: &str) -> Result<String, String> {
@@ -1199,6 +1517,10 @@ fn normalize_subtitle_source_kind(value: &str) -> String {
     }
 }
 
+fn subtitle_key(option: &HomeVideoSubtitleOption) -> String {
+    format!("{}:{}", option.source_kind, option.language)
+}
+
 fn remove_matching_outputs(dir: &Path, prefix: &str) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -1373,6 +1695,21 @@ fn first_non_empty(values: &[String]) -> String {
 
 fn stderr_or_default(stderr: &[u8], fallback: &str) -> String {
     let message = String::from_utf8_lossy(stderr).trim().to_string();
+    if message.is_empty() {
+        fallback.to_string()
+    } else {
+        compact_error(&message)
+    }
+}
+
+fn lines_or_default(lines: &[String], fallback: &str) -> String {
+    let message = lines
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     if message.is_empty() {
         fallback.to_string()
     } else {

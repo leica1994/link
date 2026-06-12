@@ -210,7 +210,7 @@
 
             <div class="settings-panel home-detail-panel">
               <div class="home-video-overview">
-                <div class="home-video-side">
+                <div ref="videoSideRef" class="home-video-side">
                   <div class="home-video-cover">
                     <img v-if="displayThumbnailUrl(activeTask)" :src="displayThumbnailUrl(activeTask)" alt="" />
                     <Video v-else :stroke-width="2.1" aria-hidden="true" />
@@ -236,14 +236,15 @@
                   </div>
                 </div>
 
-                <div class="home-video-copy">
-                  <div class="home-video-title-line">
+                <div ref="videoCopyRef" class="home-video-copy">
+                  <div ref="videoTitleLineRef" class="home-video-title-line">
                     <h2>{{ activeTask.title || '待读取视频详情' }}</h2>
                     <span class="youtube-video-status" :class="taskStatusClass(activeTask)">
                       {{ taskStatusLabel(activeTask) }}
                     </span>
                   </div>
                   <a
+                    ref="videoUrlRef"
                     class="youtube-channel-detail-url"
                     :href="activeTask.webpageUrl || activeTask.url"
                     target="_blank"
@@ -251,40 +252,7 @@
                   >
                     {{ activeTask.webpageUrl || activeTask.url }}
                   </a>
-                  <div class="home-video-download-strip" :class="{ downloaded: Boolean(activeTask.downloadedVideo) }">
-                    <span class="home-video-download-copy">
-                      <span class="home-video-download-title">
-                        <Video :stroke-width="2.1" aria-hidden="true" />
-                        <span>视频文件</span>
-                        <span v-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
-                      </span>
-                      <span class="home-video-download-meta">
-                        {{ videoDownloadMeta }}
-                      </span>
-                    </span>
-
-                    <button
-                      class="settings-action youtube-monitor-action home-video-download-button"
-                      type="button"
-                      :disabled="isDownloadingVideo || !ytdlpStatus.isAvailable"
-                      @click="downloadVideo"
-                    >
-                      <LoaderCircle
-                        v-if="isDownloadingVideo"
-                        class="spinning"
-                        :stroke-width="2.1"
-                        aria-hidden="true"
-                      />
-                      <CheckCircle2 v-else-if="activeTask.downloadedVideo" :stroke-width="2.1" aria-hidden="true" />
-                      <Download v-else :stroke-width="2.1" aria-hidden="true" />
-                      <span>{{ videoActionLabel }}</span>
-                    </button>
-                  </div>
-                  <div v-if="videoError" class="translate-alert compact" role="alert">
-                    <CircleAlert :stroke-width="2.1" aria-hidden="true" />
-                    <span>{{ videoError }}</span>
-                  </div>
-                  <p v-if="activeTask.description" class="home-video-description">
+                  <p v-if="activeTask.description" class="home-video-description" :style="videoDescriptionStyle">
                     {{ activeTask.description }}
                   </p>
                 </div>
@@ -293,10 +261,72 @@
             </div>
           </section>
 
+          <section class="settings-section" aria-labelledby="home-video-download-title">
+            <div id="home-video-download-title" class="section-heading">
+              <Video aria-hidden="true" />
+              <span>视频文件</span>
+            </div>
+
+            <div class="settings-panel youtube-monitor-panel home-video-download-panel">
+              <div class="home-video-download-strip" :class="{ downloaded: Boolean(activeTask.downloadedVideo) }">
+                <span class="home-video-download-copy">
+                  <span class="home-video-download-title">
+                    <Video :stroke-width="2.1" aria-hidden="true" />
+                    <span>视频文件</span>
+                    <span v-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
+                  </span>
+                  <span class="home-video-download-meta">
+                    {{ videoDownloadMeta }}
+                  </span>
+                  <span v-if="isDownloadingVideo && videoDownloadProgressMessage" class="home-download-progress-message">
+                    {{ videoDownloadProgressMessage }}
+                  </span>
+                </span>
+
+                <button
+                  class="settings-action youtube-monitor-action home-video-download-button"
+                  type="button"
+                  :disabled="isDownloadingVideo || !ytdlpStatus.isAvailable"
+                  @click="downloadVideo"
+                >
+                  <LoaderCircle
+                    v-if="isDownloadingVideo"
+                    class="spinning"
+                    :stroke-width="2.1"
+                    aria-hidden="true"
+                  />
+                  <CheckCircle2 v-else-if="activeTask.downloadedVideo" :stroke-width="2.1" aria-hidden="true" />
+                  <Download v-else :stroke-width="2.1" aria-hidden="true" />
+                  <span>{{ videoActionLabel }}</span>
+                </button>
+              </div>
+
+              <div
+                v-if="isDownloadingVideo"
+                class="home-download-progress"
+                role="progressbar"
+                aria-label="视频下载进度"
+                :aria-valuenow="videoDownloadProgressValue"
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                <div class="translate-progress-track">
+                  <span class="translate-progress-bar" :style="{ width: `${videoDownloadProgressValue}%` }" />
+                </div>
+                <span class="translate-progress-value">{{ videoDownloadProgressValue }}%</span>
+              </div>
+
+              <div v-if="videoError" class="translate-alert compact home-download-alert" role="alert">
+                <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+                <span>{{ videoError }}</span>
+              </div>
+            </div>
+          </section>
+
           <section class="settings-section" aria-labelledby="home-subtitle-options-title">
             <div id="home-subtitle-options-title" class="section-heading">
               <Captions aria-hidden="true" />
-              <span>可下载字幕</span>
+              <span>字幕文件</span>
             </div>
 
             <div class="settings-panel youtube-monitor-panel">
@@ -341,6 +371,27 @@
                     <Download v-else :stroke-width="2.1" aria-hidden="true" />
                     <span>{{ subtitleActionLabel(option) }}</span>
                   </button>
+
+                  <div
+                    v-if="isSubtitleDownloading(option)"
+                    class="home-download-progress home-subtitle-progress"
+                    role="progressbar"
+                    :aria-label="`${option.name || option.language} 字幕下载进度`"
+                    :aria-valuenow="subtitleDownloadProgressValue(option)"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                  >
+                    <div class="home-download-progress-copy">
+                      <span>{{ subtitleDownloadProgressMessage(option) }}</span>
+                    </div>
+                    <div class="translate-progress-track">
+                      <span
+                        class="translate-progress-bar"
+                        :style="{ width: `${subtitleDownloadProgressValue(option)}%` }"
+                      />
+                    </div>
+                    <span class="translate-progress-value">{{ subtitleDownloadProgressValue(option) }}%</span>
+                  </div>
                 </article>
               </div>
 
@@ -440,6 +491,7 @@
 
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import {
   ArrowLeft,
   BadgeInfo,
@@ -459,12 +511,17 @@ import {
   Trash2,
   Video,
 } from 'lucide-vue-next'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 defineOptions({ name: 'Home' })
 
 type TaskStatusFilter = 'all' | 'pending' | 'ready' | 'failed'
+type DownloadProgressStatus = 'active' | 'done' | 'failed'
+type DownloadProgressKind = 'video' | 'subtitle'
+
+const VIDEO_DESCRIPTION_FALLBACK_HEIGHT = 276
+const HOME_DETAIL_NARROW_QUERY = '(max-width: 860px)'
 
 type YtdlpStatus = {
   isAvailable: boolean
@@ -502,6 +559,19 @@ type HomeVideoDownload = {
   fileSize: number
   createdAt: string
   updatedAt: string
+}
+
+type HomeVideoDownloadProgress = {
+  taskId: string
+  kind: DownloadProgressKind
+  key: string
+  progress: number
+  status: DownloadProgressStatus
+  message: string
+  downloadedBytes?: number | null
+  totalBytes?: number | null
+  language?: string | null
+  sourceKind?: string | null
 }
 
 type HomeVideoTask = {
@@ -557,8 +627,17 @@ const deleteError = ref('')
 const subtitleError = ref('')
 const videoError = ref('')
 const downloadingSubtitleKeys = ref(new Set<string>())
+const downloadProgressByKey = ref(new Map<string, HomeVideoDownloadProgress>())
+const videoSideRef = ref<HTMLElement | null>(null)
+const videoCopyRef = ref<HTMLElement | null>(null)
+const videoTitleLineRef = ref<HTMLElement | null>(null)
+const videoUrlRef = ref<HTMLElement | null>(null)
+const videoDescriptionMaxHeight = ref(VIDEO_DESCRIPTION_FALLBACK_HEIGHT)
 const autoRefreshedTaskIds = ref(new Set<string>())
 const taskPendingDelete = ref<HomeVideoTask | null>(null)
+let unlistenHomeDownloadProgress: UnlistenFn | undefined
+let videoLayoutObserver: ResizeObserver | undefined
+let videoLayoutFrame = 0
 
 const taskFilterOptions: { value: TaskStatusFilter; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -679,6 +758,25 @@ const videoActionLabel = computed(() => {
   return '下载视频'
 })
 
+const videoDownloadProgress = computed(() => {
+  if (!activeTask.value) {
+    return null
+  }
+  return downloadProgressByKey.value.get(downloadProgressKey(activeTask.value.id, 'video', 'video')) ?? null
+})
+
+const videoDownloadProgressValue = computed(() => {
+  return clampProgress(videoDownloadProgress.value?.progress ?? (isDownloadingVideo.value ? 2 : 0))
+})
+
+const videoDownloadProgressMessage = computed(() => {
+  return videoDownloadProgress.value?.message || (isDownloadingVideo.value ? '视频下载中' : '')
+})
+
+const videoDescriptionStyle = computed(() => ({
+  maxHeight: `${videoDescriptionMaxHeight.value}px`,
+}))
+
 const deleteTargetLabel = computed(() => {
   const task = taskPendingDelete.value
   if (!task) {
@@ -695,17 +793,37 @@ watch(activeTaskId, async () => {
     return
   }
   await ensureActiveTaskLoaded()
+  await nextTick()
+  refreshVideoDescriptionObserver()
+  scheduleVideoDescriptionMeasure()
   maybeAutoRefreshActiveTask()
+})
+
+watch(activeTask, async () => {
+  await nextTick()
+  refreshVideoDescriptionObserver()
+  scheduleVideoDescriptionMeasure()
 })
 
 onMounted(async () => {
   window.addEventListener('keydown', handleKeydown)
+  window.addEventListener('resize', scheduleVideoDescriptionMeasure)
+  void registerHomeDownloadProgressListener()
   await loadAll()
+  await nextTick()
+  refreshVideoDescriptionObserver()
+  scheduleVideoDescriptionMeasure()
   maybeAutoRefreshActiveTask()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+  window.removeEventListener('resize', scheduleVideoDescriptionMeasure)
+  unlistenHomeDownloadProgress?.()
+  videoLayoutObserver?.disconnect()
+  if (videoLayoutFrame) {
+    window.cancelAnimationFrame(videoLayoutFrame)
+  }
 })
 
 const loadAll = async () => {
@@ -847,6 +965,92 @@ const reloadActiveTask = async () => {
   }
 }
 
+const registerHomeDownloadProgressListener = async () => {
+  if (!isTauriRuntime() || unlistenHomeDownloadProgress) {
+    return
+  }
+
+  unlistenHomeDownloadProgress = await listen<HomeVideoDownloadProgress>('home-video-download-progress', (event) => {
+    const payload = event.payload
+    if (!payload.taskId || !payload.key || !['video', 'subtitle'].includes(payload.kind)) {
+      return
+    }
+
+    setDownloadProgress(payload)
+  })
+}
+
+const setDownloadProgress = (payload: HomeVideoDownloadProgress) => {
+  const next = new Map(downloadProgressByKey.value)
+  next.set(downloadProgressKey(payload.taskId, payload.kind, payload.key), {
+    ...payload,
+    progress: clampProgress(payload.progress),
+  })
+  downloadProgressByKey.value = next
+}
+
+const refreshVideoDescriptionObserver = () => {
+  videoLayoutObserver?.disconnect()
+  videoLayoutObserver = undefined
+
+  if (typeof ResizeObserver === 'undefined') {
+    return
+  }
+
+  const targets = [videoSideRef.value, videoCopyRef.value, videoTitleLineRef.value, videoUrlRef.value].filter(
+    (element): element is HTMLElement => Boolean(element),
+  )
+  if (targets.length === 0) {
+    return
+  }
+
+  videoLayoutObserver = new ResizeObserver(scheduleVideoDescriptionMeasure)
+  targets.forEach((element) => videoLayoutObserver?.observe(element))
+}
+
+const scheduleVideoDescriptionMeasure = () => {
+  if (videoLayoutFrame) {
+    window.cancelAnimationFrame(videoLayoutFrame)
+  }
+
+  videoLayoutFrame = window.requestAnimationFrame(() => {
+    videoLayoutFrame = 0
+    measureVideoDescriptionHeight()
+  })
+}
+
+const measureVideoDescriptionHeight = () => {
+  if (!activeTask.value || isHomeDetailNarrow()) {
+    videoDescriptionMaxHeight.value = VIDEO_DESCRIPTION_FALLBACK_HEIGHT
+    return
+  }
+
+  const sideHeight = videoSideRef.value?.offsetHeight ?? 0
+  const titleHeight = videoTitleLineRef.value?.offsetHeight ?? 0
+  const urlHeight = videoUrlRef.value?.offsetHeight ?? 0
+  if (!sideHeight || !titleHeight || !urlHeight) {
+    videoDescriptionMaxHeight.value = VIDEO_DESCRIPTION_FALLBACK_HEIGHT
+    return
+  }
+
+  const gap = readRowGap(videoCopyRef.value, 10)
+  const availableHeight = Math.floor(sideHeight - titleHeight - urlHeight - gap * 2)
+  videoDescriptionMaxHeight.value = Math.max(96, availableHeight)
+}
+
+const isHomeDetailNarrow = () => {
+  return window.matchMedia(HOME_DETAIL_NARROW_QUERY).matches
+}
+
+const readRowGap = (element: HTMLElement | null, fallback: number) => {
+  if (!element) {
+    return fallback
+  }
+
+  const value = Number.parseFloat(window.getComputedStyle(element).rowGap)
+  return Number.isFinite(value) ? value : fallback
+}
+
 const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
   if (!activeTask.value || !isTauriRuntime()) {
     return
@@ -860,6 +1064,16 @@ const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
   const next = new Set(downloadingSubtitleKeys.value)
   next.add(key)
   downloadingSubtitleKeys.value = next
+  setDownloadProgress({
+    taskId: activeTask.value.id,
+    kind: 'subtitle',
+    key,
+    progress: 2,
+    status: 'active',
+    message: '准备下载字幕',
+    language: option.language,
+    sourceKind: option.sourceKind,
+  })
   subtitleError.value = ''
 
   try {
@@ -886,6 +1100,14 @@ const downloadVideo = async () => {
   }
 
   isDownloadingVideo.value = true
+  setDownloadProgress({
+    taskId: activeTask.value.id,
+    kind: 'video',
+    key: 'video',
+    progress: 2,
+    status: 'active',
+    message: '准备下载视频',
+  })
   videoError.value = ''
 
   try {
@@ -1015,8 +1237,30 @@ const taskStatusClass = (task: HomeVideoTask) => ({
 
 const subtitleKey = (option: HomeVideoSubtitleOption) => `${option.sourceKind}:${option.language}`
 
+const downloadProgressKey = (taskId: string, kind: DownloadProgressKind, key: string) => `${taskId}:${kind}:${key}`
+
 const isSubtitleDownloading = (option: HomeVideoSubtitleOption) => {
   return downloadingSubtitleKeys.value.has(subtitleKey(option))
+}
+
+const subtitleDownloadProgress = (option: HomeVideoSubtitleOption) => {
+  if (!activeTask.value) {
+    return null
+  }
+
+  return (
+    downloadProgressByKey.value.get(
+      downloadProgressKey(activeTask.value.id, 'subtitle', subtitleKey(option)),
+    ) ?? null
+  )
+}
+
+const subtitleDownloadProgressValue = (option: HomeVideoSubtitleOption) => {
+  return clampProgress(subtitleDownloadProgress(option)?.progress ?? (isSubtitleDownloading(option) ? 2 : 0))
+}
+
+const subtitleDownloadProgressMessage = (option: HomeVideoSubtitleOption) => {
+  return subtitleDownloadProgress(option)?.message || '字幕下载中'
 }
 
 const downloadedSubtitleForOption = (option: HomeVideoSubtitleOption) => {
@@ -1047,6 +1291,14 @@ const hasRemoteThumbnail = (task: HomeVideoTask) => {
 
 const isInlineThumbnailUrl = (value: string) => {
   return value.startsWith('data:image/')
+}
+
+const clampProgress = (value: number) => {
+  if (!Number.isFinite(value)) {
+    return 0
+  }
+
+  return Math.min(100, Math.max(0, Math.round(value)))
 }
 
 const formatDuration = (duration?: number | null) => {
