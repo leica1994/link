@@ -20,13 +20,18 @@
         </div>
       </div>
 
-      <div class="translate-actions youtube-monitor-header-actions">
-        <button class="settings-action youtube-monitor-action" type="button" @click="loadAll">
-          <RefreshCw :stroke-width="2.1" aria-hidden="true" />
-          <span>刷新页面</span>
+      <div v-if="!isDetailView" class="translate-actions youtube-monitor-header-actions">
+        <button
+          class="settings-action youtube-monitor-action"
+          type="button"
+          :disabled="isPageRefreshing"
+          @click="refreshPage"
+        >
+          <LoaderCircle v-if="isPageRefreshing" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+          <RefreshCw v-else :stroke-width="2.1" aria-hidden="true" />
+          <span>{{ isPageRefreshing ? '检查中' : '刷新页面' }}</span>
         </button>
         <button
-          v-if="!isDetailView"
           class="settings-action youtube-monitor-action primary"
           type="button"
           @click="openAddDialog"
@@ -557,6 +562,7 @@ const videoQuery = ref('')
 const unreadOnly = ref(false)
 const isLoadingChannels = ref(false)
 const isLoadingVideos = ref(false)
+const isPageRefreshing = ref(false)
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
 const draftChannelUrl = ref('')
@@ -571,6 +577,7 @@ const activeRefreshRun = ref<YoutubeRefreshRun | null>(null)
 const refreshingChannelIds = ref(new Set<string>())
 const queuedVideoUrls = ref(new Set<string>())
 const addingVideoIds = ref(new Set<string>())
+const refreshWaiters = new Map<string, Array<(run: YoutubeRefreshRun) => void>>()
 let unlistenRefresh: UnlistenFn | undefined
 
 const channelFilterOptions: { value: ChannelStatusFilter; label: string }[] = [
@@ -664,6 +671,46 @@ const loadAll = async () => {
   }
 }
 
+const refreshPage = async () => {
+  if (!isTauriRuntime() || isPageRefreshing.value) {
+    return
+  }
+
+  isPageRefreshing.value = true
+  channelError.value = ''
+  videosError.value = ''
+  let failedCount = 0
+
+  try {
+    await loadYtdlpStatus()
+    if (!ytdlpStatus.value.isAvailable) {
+      return
+    }
+
+    const channelIds = channels.value.map((channel) => channel.id)
+    for (const channelId of channelIds) {
+      if (isChannelRefreshing(channelId)) {
+        continue
+      }
+
+      try {
+        const run = await refreshChannelAndWait(channelId, false)
+        if (run.status === 'failed') {
+          failedCount += 1
+        }
+      } catch {
+        failedCount += 1
+      }
+    }
+  } finally {
+    await loadAll()
+    if (failedCount > 0) {
+      channelError.value = '部分博主检查失败，请查看异常状态'
+    }
+    isPageRefreshing.value = false
+  }
+}
+
 const loadYtdlpStatus = async () => {
   if (!isTauriRuntime()) {
     ytdlpStatus.value = {
@@ -747,6 +794,17 @@ const refreshChannel = async (channelId: string) => {
     return
   }
 
+  videosError.value = ''
+
+  try {
+    await refreshChannelAndWait(channelId, true)
+  } catch (error) {
+    videosError.value = stringifyError(error, '检查更新失败')
+    setChannelRefreshing(channelId, false)
+  }
+}
+
+const refreshChannelAndWait = async (channelId: string, reloadAfterDone: boolean) => {
   setChannelRefreshing(channelId, true)
   activeRefreshRun.value = {
     id: '',
@@ -762,21 +820,67 @@ const refreshChannel = async (channelId: string) => {
   }
 
   try {
+    const finishedRun = waitForChannelRefresh(channelId)
     const run = await invoke<YoutubeRefreshRun>('refresh_youtube_channel', {
       request: { channelId },
     })
     activeRefreshRun.value = run
     if (run.status === 'done' || run.status === 'failed') {
       setChannelRefreshing(channelId, false)
-      await loadChannels()
-      if (activeChannelId.value === channelId) {
-        resetVideos()
-        await loadVideos(true)
+      resolveRefreshWaiters(run)
+      if (reloadAfterDone) {
+        await reloadAfterChannelRefresh(channelId)
       }
+      return run
     }
+
+    const completedRun = await finishedRun
+    if (reloadAfterDone) {
+      await reloadAfterChannelRefresh(channelId)
+    }
+    return completedRun
   } catch (error) {
-    videosError.value = stringifyError(error, '检查更新失败')
     setChannelRefreshing(channelId, false)
+    resolveRefreshWaiters({
+      id: '',
+      channelId,
+      status: 'failed',
+      processedCount: 0,
+      insertedCount: 0,
+      updatedCount: 0,
+      message: '检查失败',
+      errorMessage: stringifyError(error, '检查更新失败'),
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+    })
+    throw error
+  }
+}
+
+const waitForChannelRefresh = (channelId: string) => {
+  return new Promise<YoutubeRefreshRun>((resolve) => {
+    const waiters = refreshWaiters.get(channelId) ?? []
+    waiters.push(resolve)
+    refreshWaiters.set(channelId, waiters)
+  })
+}
+
+const resolveRefreshWaiters = (run: YoutubeRefreshRun) => {
+  const waiters = refreshWaiters.get(run.channelId)
+  if (!waiters) {
+    return false
+  }
+
+  refreshWaiters.delete(run.channelId)
+  waiters.forEach((resolve) => resolve(run))
+  return true
+}
+
+const reloadAfterChannelRefresh = async (channelId: string) => {
+  await loadChannels()
+  if (activeChannelId.value === channelId) {
+    resetVideos()
+    await loadVideos(true)
   }
 }
 
@@ -917,11 +1021,10 @@ const registerRefreshListener = async () => {
     activeRefreshRun.value = run
 
     if (run.status === 'done' || run.status === 'failed') {
+      const hadWaiters = resolveRefreshWaiters(run)
       setChannelRefreshing(run.channelId, false)
-      await loadChannels()
-      if (activeChannelId.value === run.channelId) {
-        resetVideos()
-        await loadVideos(true)
+      if (!hadWaiters && !isPageRefreshing.value) {
+        await reloadAfterChannelRefresh(run.channelId)
       }
     } else {
       setChannelRefreshing(run.channelId, true)
