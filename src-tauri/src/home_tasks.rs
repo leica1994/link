@@ -27,7 +27,7 @@ const DETAIL_STATUS_FAILED: &str = "failed";
 const SUBTITLE_SOURCE_MANUAL: &str = "manual";
 const SUBTITLE_SOURCE_AUTOMATIC: &str = "automatic";
 const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
-const YTDLP_YOUTUBE_LANGUAGE_ARGS: &str = "youtube:lang=zh-CN";
+const YTDLP_YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=default,-android_vr";
 const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 const THUMBNAIL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
@@ -1024,7 +1024,7 @@ fn fetch_video_detail(url: &str, proxy: &str) -> Result<VideoDetail, String> {
         "--no-warnings",
         "--no-progress",
         "--extractor-args",
-        YTDLP_YOUTUBE_LANGUAGE_ARGS,
+        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
@@ -1111,7 +1111,7 @@ fn download_subtitle_file(
         "--no-playlist",
         "--no-warnings",
         "--extractor-args",
-        YTDLP_YOUTUBE_LANGUAGE_ARGS,
+        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
@@ -1165,7 +1165,7 @@ fn download_video_file(
         "--no-playlist",
         "--no-warnings",
         "--extractor-args",
-        YTDLP_YOUTUBE_LANGUAGE_ARGS,
+        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
@@ -1869,10 +1869,18 @@ fn lines_or_default(lines: &[String], fallback: &str) -> String {
 }
 
 fn compact_error(error: &str) -> String {
-    let compact = error
+    let lines = error
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let selected = lines
+        .iter()
+        .copied()
+        .filter(|line| is_relevant_error_line(line))
+        .collect::<Vec<_>>();
+    let compact = if selected.is_empty() { lines } else { selected }
+        .into_iter()
         .take(3)
         .collect::<Vec<_>>()
         .join("；");
@@ -1882,6 +1890,15 @@ fn compact_error(error: &str) -> String {
     } else {
         compact
     }
+}
+
+fn is_relevant_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("unable")
+        || lower.contains("timed out")
+        || lower.contains("http error")
 }
 
 #[cfg(test)]
@@ -1930,5 +1947,20 @@ mod tests {
         assert_eq!(partial.file_count, 2);
         assert_eq!(partial.file_size, 15);
         assert!(partial.updated_at.is_some());
+    }
+
+    #[test]
+    fn compact_error_prefers_relevant_yt_dlp_errors() {
+        let error = "[youtube] Extracting URL: https://www.youtube.com/watch?v=abc\n\
+            [youtube] abc: Downloading webpage\n\
+            [youtube] abc: Downloading android vr player API JSON\n\
+            ERROR: [youtube] abc: Sign in to confirm you are not a bot";
+
+        let compact = compact_error(error);
+
+        assert_eq!(
+            compact,
+            "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+        );
     }
 }

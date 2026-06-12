@@ -411,7 +411,7 @@
             <Globe class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
             <div class="setting-copy">
               <div class="setting-title">yt-dlp 代理</div>
-              <div class="setting-subtitle">留空直连；填写后监控检查会通过该代理访问 YouTube</div>
+              <div class="setting-subtitle">留空直连；填写后监控、详情、字幕和视频下载会通过该代理访问 YouTube</div>
             </div>
             <input
               v-model="youtubeMonitorProxy"

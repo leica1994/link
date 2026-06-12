@@ -23,7 +23,7 @@ const RUN_STATUS_FAILED: &str = "failed";
 const DEFAULT_VIDEO_PAGE_SIZE: u32 = 100;
 const MAX_VIDEO_PAGE_SIZE: u32 = 200;
 const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
-const YTDLP_YOUTUBE_LANGUAGE_ARGS: &str = "youtube:lang=zh-CN";
+const YTDLP_YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=default,-android_vr";
 const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 
 pub struct YoutubeMonitorService {
@@ -385,7 +385,7 @@ fn run_ytdlp_refresh(
         "--no-warnings",
         "--no-progress",
         "--extractor-args",
-        YTDLP_YOUTUBE_LANGUAGE_ARGS,
+        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
@@ -1411,10 +1411,18 @@ fn stderr_or_default(stderr: &[u8], fallback: &str) -> String {
 }
 
 fn compact_error(error: &str) -> String {
-    let compact = error
+    let lines = error
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let selected = lines
+        .iter()
+        .copied()
+        .filter(|line| is_relevant_error_line(line))
+        .collect::<Vec<_>>();
+    let compact = if selected.is_empty() { lines } else { selected }
+        .into_iter()
         .take(3)
         .collect::<Vec<_>>()
         .join("；");
@@ -1426,7 +1434,15 @@ fn compact_error(error: &str) -> String {
     }
 }
 
+fn is_relevant_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("unable")
+        || lower.contains("timed out")
+        || lower.contains("http error")
+}
+
 fn emit_refresh(app: &AppHandle, run: &YoutubeRefreshRun) {
     let _ = app.emit(REFRESH_EVENT, run);
 }
-
