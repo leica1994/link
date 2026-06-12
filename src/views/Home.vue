@@ -511,7 +511,7 @@ import {
   Trash2,
   Video,
 } from 'lucide-vue-next'
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 defineOptions({ name: 'Home' })
@@ -638,6 +638,7 @@ const taskPendingDelete = ref<HomeVideoTask | null>(null)
 let unlistenHomeDownloadProgress: UnlistenFn | undefined
 let videoLayoutObserver: ResizeObserver | undefined
 let videoLayoutFrame = 0
+let hasCompletedInitialLoad = false
 
 const taskFilterOptions: { value: TaskStatusFilter; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -809,11 +810,17 @@ onMounted(async () => {
   window.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', scheduleVideoDescriptionMeasure)
   void registerHomeDownloadProgressListener()
-  await loadAll()
-  await nextTick()
-  refreshVideoDescriptionObserver()
-  scheduleVideoDescriptionMeasure()
-  maybeAutoRefreshActiveTask()
+  try {
+    await refreshHomeView()
+  } finally {
+    hasCompletedInitialLoad = true
+  }
+})
+
+onActivated(() => {
+  if (hasCompletedInitialLoad) {
+    void refreshHomeView()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -828,6 +835,14 @@ onBeforeUnmount(() => {
 
 const loadAll = async () => {
   await Promise.all([loadYtdlpStatus(), loadTasks()])
+}
+
+const refreshHomeView = async () => {
+  await loadAll()
+  await nextTick()
+  refreshVideoDescriptionObserver()
+  scheduleVideoDescriptionMeasure()
+  maybeAutoRefreshActiveTask()
 }
 
 const loadYtdlpStatus = async () => {
