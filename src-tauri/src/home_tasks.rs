@@ -647,7 +647,7 @@ fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVi
                    detail_status, subtitle_options, metadata, error_message,
                    created_at, updated_at, detail_checked_at
             FROM home_video_tasks
-            ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+            ORDER BY created_at DESC, id DESC
             ",
         )
         .map_err(|error| format!("无法读取待办任务: {error}"))?;

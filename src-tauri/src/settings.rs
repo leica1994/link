@@ -549,6 +549,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON youtube_refresh_runs(channel_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_tasks_updated_at
                 ON home_video_tasks(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_video_tasks_created_at
+                ON home_video_tasks(created_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_tasks_status
                 ON home_video_tasks(detail_status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_task_subtitles_task

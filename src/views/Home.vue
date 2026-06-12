@@ -869,7 +869,8 @@ const loadTasks = async () => {
 
   isLoadingTasks.value = true
   try {
-    tasks.value = await invoke<HomeVideoTask[]>('list_home_video_tasks')
+    const loadedTasks = await invoke<HomeVideoTask[]>('list_home_video_tasks')
+    tasks.value = sortTasksByCreatedAtDesc(loadedTasks)
   } catch (error) {
     pageError.value = stringifyError(error, '读取待办队列失败')
   } finally {
@@ -1171,11 +1172,28 @@ const upsertTask = (task: HomeVideoTask) => {
   if (index >= 0) {
     const next = [...tasks.value]
     next[index] = task
-    tasks.value = next
+    tasks.value = sortTasksByCreatedAtDesc(next)
     return
   }
 
-  tasks.value = [task, ...tasks.value]
+  tasks.value = sortTasksByCreatedAtDesc([task, ...tasks.value])
+}
+
+const sortTasksByCreatedAtDesc = (items: HomeVideoTask[]) => {
+  return [...items].sort((left, right) => {
+    const timeDiff = taskCreatedTime(right) - taskCreatedTime(left)
+    if (timeDiff !== 0) {
+      return timeDiff
+    }
+
+    const createdAtDiff = right.createdAt.localeCompare(left.createdAt)
+    return createdAtDiff !== 0 ? createdAtDiff : right.id.localeCompare(left.id)
+  })
+}
+
+const taskCreatedTime = (task: HomeVideoTask) => {
+  const timestamp = Date.parse(task.createdAt)
+  return Number.isFinite(timestamp) ? timestamp : 0
 }
 
 const removeTask = (taskId: string) => {
