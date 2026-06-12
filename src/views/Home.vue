@@ -268,12 +268,19 @@
             </div>
 
             <div class="settings-panel youtube-monitor-panel home-video-download-panel">
-              <div class="home-video-download-strip" :class="{ downloaded: Boolean(activeTask.downloadedVideo) }">
+              <div
+                class="home-video-download-strip"
+                :class="{
+                  downloaded: Boolean(activeTask.downloadedVideo),
+                  partial: hasPartialVideoDownload,
+                }"
+              >
                 <span class="home-video-download-copy">
                   <span class="home-video-download-title">
                     <Video :stroke-width="2.1" aria-hidden="true" />
                     <span>视频文件</span>
                     <span v-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
+                    <span v-else-if="hasPartialVideoDownload" class="youtube-video-status checking">未完成</span>
                   </span>
                   <span class="home-video-download-meta">
                     {{ videoDownloadMeta }}
@@ -561,6 +568,12 @@ type HomeVideoDownload = {
   updatedAt: string
 }
 
+type HomePartialVideoDownload = {
+  fileCount: number
+  fileSize: number
+  updatedAt?: string | null
+}
+
 type HomeVideoDownloadProgress = {
   taskId: string
   kind: DownloadProgressKind
@@ -600,6 +613,7 @@ type HomeVideoTask = {
   detailCheckedAt?: string | null
   downloadedSubtitles: HomeVideoSubtitle[]
   downloadedVideo?: HomeVideoDownload | null
+  partialVideoDownload?: HomePartialVideoDownload | null
 }
 
 const route = useRoute()
@@ -738,6 +752,16 @@ const subtitleEmptyText = computed(() => {
 const videoDownloadMeta = computed(() => {
   const video = activeTask.value?.downloadedVideo
   if (!video) {
+    const partial = partialVideoDownload.value
+    if (partial) {
+      const pieces = [
+        '未完成',
+        `已保留 ${formatFileSize(partial.fileSize)}`,
+        partial.updatedAt ? formatDateTime(partial.updatedAt) : '',
+      ].filter(Boolean)
+      return pieces.join(' · ')
+    }
+
     return '尚未下载'
   }
 
@@ -749,9 +773,22 @@ const videoDownloadMeta = computed(() => {
   return pieces.join(' · ')
 })
 
+const partialVideoDownload = computed(() => {
+  if (activeTask.value?.downloadedVideo) {
+    return null
+  }
+
+  return activeTask.value?.partialVideoDownload ?? null
+})
+
+const hasPartialVideoDownload = computed(() => Boolean(partialVideoDownload.value))
+
 const videoActionLabel = computed(() => {
   if (isDownloadingVideo.value) {
     return '下载中'
+  }
+  if (hasPartialVideoDownload.value) {
+    return '继续下载'
   }
   if (activeTask.value?.downloadedVideo) {
     return '重新下载'
@@ -1115,6 +1152,7 @@ const downloadVideo = async () => {
     return
   }
 
+  const isContinuing = hasPartialVideoDownload.value
   isDownloadingVideo.value = true
   setDownloadProgress({
     taskId: activeTask.value.id,
@@ -1122,7 +1160,7 @@ const downloadVideo = async () => {
     key: 'video',
     progress: 2,
     status: 'active',
-    message: '准备下载视频',
+    message: isContinuing ? '准备继续下载视频' : '准备下载视频',
   })
   videoError.value = ''
 
@@ -1135,6 +1173,7 @@ const downloadVideo = async () => {
     upsertTask(task)
   } catch (error) {
     videoError.value = stringifyError(error, '下载视频失败')
+    await reloadActiveTask()
   } finally {
     isDownloadingVideo.value = false
   }
