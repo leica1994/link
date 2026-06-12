@@ -527,6 +527,18 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS home_video_task_videos (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL UNIQUE,
+                format TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL DEFAULT '',
+                file_size INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_youtube_channels_updated_at
                 ON youtube_channels(updated_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_seen
@@ -541,6 +553,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON home_video_tasks(detail_status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_task_subtitles_task
                 ON home_video_task_subtitles(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_video_task_videos_task
+                ON home_video_task_videos(task_id, updated_at);
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;

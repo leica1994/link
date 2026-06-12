@@ -21,7 +21,8 @@ use dubbing::{
 };
 use home_tasks::{
     add_home_video_task, delete_home_video_task, download_home_video_task_subtitle,
-    get_home_video_task, list_home_video_tasks, refresh_home_video_task_detail,
+    download_home_video_task_video, get_home_video_task, list_home_video_tasks,
+    refresh_home_video_task_detail,
 };
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{
@@ -120,6 +121,7 @@ pub fn run() {
             delete_home_video_task,
             refresh_home_video_task_detail,
             download_home_video_task_subtitle,
+            download_home_video_task_video,
             get_ytdlp_status,
             list_youtube_channels,
             add_youtube_channel,

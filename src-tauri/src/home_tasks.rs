@@ -56,6 +56,7 @@ pub struct HomeVideoTask {
     pub updated_at: String,
     pub detail_checked_at: Option<String>,
     pub downloaded_subtitles: Vec<HomeVideoSubtitle>,
+    pub downloaded_video: Option<HomeVideoDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +79,19 @@ pub struct HomeVideoSubtitle {
     pub source_kind: String,
     pub format: String,
     pub file_path: String,
+    pub file_size: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeVideoDownload {
+    pub id: String,
+    pub task_id: String,
+    pub format: String,
+    pub file_path: String,
+    pub file_name: String,
     pub file_size: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -125,6 +139,13 @@ struct VideoDetail {
 
 struct SubtitleDownloadOutput {
     path: PathBuf,
+    format: String,
+    file_size: i64,
+}
+
+struct VideoDownloadOutput {
+    path: PathBuf,
+    file_name: String,
     format: String,
     file_size: i64,
 }
@@ -280,6 +301,21 @@ pub async fn download_home_video_task_subtitle(
     }
 }
 
+#[tauri::command]
+pub async fn download_home_video_task_video(
+    app: AppHandle,
+    request: HomeVideoTaskRequest,
+) -> Result<HomeVideoTask, String> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        download_home_video_task_video_blocking(app, request)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("视频下载任务执行失败: {error}")),
+    }
+}
+
 fn refresh_home_video_task_detail_blocking(
     app: AppHandle,
     request: HomeVideoTaskRequest,
@@ -419,6 +455,26 @@ fn download_home_video_task_subtitle_blocking(
     })
 }
 
+fn download_home_video_task_video_blocking(
+    app: AppHandle,
+    request: HomeVideoTaskRequest,
+) -> Result<HomeVideoTask, String> {
+    let store = app.state::<SettingsStore>();
+    let task = store
+        .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
+    let proxy = store.load()?.youtube_monitor_proxy;
+    let task_dir = app_paths::youtube_task_dir(&task.id)?;
+    let videos_dir = task_dir.join("videos");
+    fs::create_dir_all(&videos_dir).map_err(|error| format!("无法创建视频目录: {error}"))?;
+
+    let output = download_video_file(&task, &proxy, &videos_dir)?;
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        upsert_home_video_download(connection, &task.id, output, &now)?;
+        read_home_video_task_by_id(connection, &task.id)
+    })
+}
+
 fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVideoTask>, String> {
     let mut statement = connection
         .prepare(
@@ -440,6 +496,7 @@ fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVi
     for row in rows {
         let mut task = row.map_err(|error| format!("无法解析待办任务: {error}"))?;
         task.downloaded_subtitles = read_home_video_subtitles(connection, &task.id)?;
+        task.downloaded_video = read_home_video_download(connection, &task.id)?;
         tasks.push(task);
     }
 
@@ -468,6 +525,7 @@ fn read_home_video_task_by_id(
         .map_err(|error| format!("无法读取待办任务: {error}"))?
         .ok_or_else(|| "未找到待办任务".to_string())?;
     task.downloaded_subtitles = read_home_video_subtitles(connection, &task.id)?;
+    task.downloaded_video = read_home_video_download(connection, &task.id)?;
     Ok(task)
 }
 
@@ -504,6 +562,7 @@ fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {
         updated_at: row.get(21)?,
         detail_checked_at: row.get(22)?,
         downloaded_subtitles: Vec::new(),
+        downloaded_video: None,
     })
 }
 
@@ -544,6 +603,36 @@ fn read_home_video_subtitles(
     }
 
     Ok(subtitles)
+}
+
+fn read_home_video_download(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Option<HomeVideoDownload>, String> {
+    connection
+        .query_row(
+            "
+            SELECT id, task_id, format, file_path, file_name, file_size, created_at, updated_at
+            FROM home_video_task_videos
+            WHERE task_id = ?1
+            LIMIT 1
+            ",
+            params![task_id],
+            |row| {
+                Ok(HomeVideoDownload {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    format: row.get(2)?,
+                    file_path: row.get(3)?,
+                    file_name: row.get(4)?,
+                    file_size: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("无法读取视频下载记录: {error}"))
 }
 
 fn upsert_home_video_subtitle(
@@ -618,6 +707,76 @@ fn upsert_home_video_subtitle(
         )
         .map(|_| ())
         .map_err(|error| format!("无法保存字幕记录: {error}"))
+}
+
+fn upsert_home_video_download(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    output: VideoDownloadOutput,
+    now: &str,
+) -> Result<(), String> {
+    let file_path = output.path.to_string_lossy().to_string();
+    let existing_id = connection
+        .query_row(
+            "
+            SELECT id
+            FROM home_video_task_videos
+            WHERE task_id = ?1
+            LIMIT 1
+            ",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法检查视频下载记录: {error}"))?;
+
+    if let Some(existing_id) = existing_id {
+        connection
+            .execute(
+                "
+                UPDATE home_video_task_videos
+                SET format = ?1,
+                    file_path = ?2,
+                    file_name = ?3,
+                    file_size = ?4,
+                    updated_at = ?5
+                WHERE id = ?6
+                ",
+                params![
+                    output.format,
+                    file_path,
+                    output.file_name,
+                    output.file_size,
+                    now,
+                    existing_id,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("无法更新视频下载记录: {error}"))?;
+        return Ok(());
+    }
+
+    connection
+        .execute(
+            "
+            INSERT INTO home_video_task_videos (
+                id, task_id, format, file_path, file_name, file_size, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                task_id,
+                output.format,
+                file_path,
+                output.file_name,
+                output.file_size,
+                now,
+                now,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法保存视频下载记录: {error}"))
 }
 
 fn fetch_video_detail(url: &str, proxy: &str) -> Result<VideoDetail, String> {
@@ -755,6 +914,64 @@ fn download_subtitle_file(
 
     Ok(SubtitleDownloadOutput {
         path,
+        format,
+        file_size: metadata.len().min(i64::MAX as u64) as i64,
+    })
+}
+
+fn download_video_file(
+    task: &HomeVideoTask,
+    proxy: &str,
+    videos_dir: &Path,
+) -> Result<VideoDownloadOutput, String> {
+    let prefix = format!("{}.video", sanitize_file_segment(&task.id));
+    let output_template = videos_dir.join(format!("{prefix}.%(ext)s"));
+    let output_template = output_template.to_string_lossy().to_string();
+    let mut command = ytdlp_command(proxy);
+    command.args([
+        "--no-playlist",
+        "--no-warnings",
+        "--no-progress",
+        "--force-overwrites",
+        "--extractor-args",
+        YTDLP_YOUTUBE_LANGUAGE_ARGS,
+        "--add-headers",
+        YOUTUBE_ACCEPT_LANGUAGE,
+        "--socket-timeout",
+        YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "-f",
+        "bv*+ba/best",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        &output_template,
+        &task.url,
+    ]);
+    let output = command
+        .output()
+        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
+
+    if !output.status.success() {
+        return Err(stderr_or_default(&output.stderr, "yt-dlp 下载视频失败"));
+    }
+
+    let path = find_video_output(videos_dir, &prefix)?;
+    remove_other_matching_outputs(videos_dir, &prefix, &path)?;
+    let metadata = fs::metadata(&path).map_err(|error| format!("无法读取视频文件: {error}"))?;
+    let format = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("视频文件")
+        .to_string();
+
+    Ok(VideoDownloadOutput {
+        path,
+        file_name,
         format,
         file_size: metadata.len().min(i64::MAX as u64) as i64,
     })
@@ -1021,6 +1238,62 @@ fn find_subtitle_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     matches
         .pop()
         .ok_or_else(|| "yt-dlp 未生成字幕文件".to_string())
+}
+
+fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| format!("无法读取视频目录: {error}"))? {
+        let entry = entry.map_err(|error| format!("无法读取视频文件: {error}"))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with(prefix) && path.is_file() && is_video_output_path(&path) {
+            matches.push(path);
+        }
+    }
+    if let Some(final_path) = matches
+        .iter()
+        .find(|path| path.file_stem().and_then(|value| value.to_str()) == Some(prefix))
+    {
+        return Ok(final_path.clone());
+    }
+    matches.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    matches
+        .pop()
+        .ok_or_else(|| "yt-dlp 未生成视频文件".to_string())
+}
+
+fn remove_other_matching_outputs(dir: &Path, prefix: &str, keep_path: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir).map_err(|error| format!("无法读取输出目录: {error}"))? {
+        let entry = entry.map_err(|error| format!("无法读取输出文件: {error}"))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with(prefix) && path.is_file() && path != keep_path {
+            fs::remove_file(&path).map_err(|error| format!("无法清理旧输出文件: {error}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_video_output_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "mp4" | "mkv" | "webm" | "mov" | "m4v")
 }
 
 fn sanitize_file_segment(value: &str) -> String {

@@ -251,6 +251,39 @@
                   >
                     {{ activeTask.webpageUrl || activeTask.url }}
                   </a>
+                  <div class="home-video-download-strip" :class="{ downloaded: Boolean(activeTask.downloadedVideo) }">
+                    <span class="home-video-download-copy">
+                      <span class="home-video-download-title">
+                        <Video :stroke-width="2.1" aria-hidden="true" />
+                        <span>视频文件</span>
+                        <span v-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
+                      </span>
+                      <span class="home-video-download-meta">
+                        {{ videoDownloadMeta }}
+                      </span>
+                    </span>
+
+                    <button
+                      class="settings-action youtube-monitor-action home-video-download-button"
+                      type="button"
+                      :disabled="isDownloadingVideo || !ytdlpStatus.isAvailable"
+                      @click="downloadVideo"
+                    >
+                      <LoaderCircle
+                        v-if="isDownloadingVideo"
+                        class="spinning"
+                        :stroke-width="2.1"
+                        aria-hidden="true"
+                      />
+                      <CheckCircle2 v-else-if="activeTask.downloadedVideo" :stroke-width="2.1" aria-hidden="true" />
+                      <Download v-else :stroke-width="2.1" aria-hidden="true" />
+                      <span>{{ videoActionLabel }}</span>
+                    </button>
+                  </div>
+                  <div v-if="videoError" class="translate-alert compact" role="alert">
+                    <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ videoError }}</span>
+                  </div>
                   <p v-if="activeTask.description" class="home-video-description">
                     {{ activeTask.description }}
                   </p>
@@ -460,6 +493,17 @@ type HomeVideoSubtitle = {
   updatedAt: string
 }
 
+type HomeVideoDownload = {
+  id: string
+  taskId: string
+  format: string
+  filePath: string
+  fileName: string
+  fileSize: number
+  createdAt: string
+  updatedAt: string
+}
+
 type HomeVideoTask = {
   id: string
   url: string
@@ -485,6 +529,7 @@ type HomeVideoTask = {
   updatedAt: string
   detailCheckedAt?: string | null
   downloadedSubtitles: HomeVideoSubtitle[]
+  downloadedVideo?: HomeVideoDownload | null
 }
 
 const route = useRoute()
@@ -503,12 +548,14 @@ const isLoadingTasks = ref(false)
 const isAddingTask = ref(false)
 const isDeletingTask = ref(false)
 const isRefreshingDetail = ref(false)
+const isDownloadingVideo = ref(false)
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
 const pageError = ref('')
 const addError = ref('')
 const deleteError = ref('')
 const subtitleError = ref('')
+const videoError = ref('')
 const downloadingSubtitleKeys = ref(new Set<string>())
 const autoRefreshedTaskIds = ref(new Set<string>())
 const taskPendingDelete = ref<HomeVideoTask | null>(null)
@@ -608,6 +655,30 @@ const subtitleEmptyText = computed(() => {
   return '读取视频详情后会显示可下载字幕'
 })
 
+const videoDownloadMeta = computed(() => {
+  const video = activeTask.value?.downloadedVideo
+  if (!video) {
+    return '尚未下载'
+  }
+
+  const pieces = [
+    video.format ? video.format.toUpperCase() : '视频',
+    formatFileSize(video.fileSize),
+    video.updatedAt ? formatDateTime(video.updatedAt) : '',
+  ].filter(Boolean)
+  return pieces.join(' · ')
+})
+
+const videoActionLabel = computed(() => {
+  if (isDownloadingVideo.value) {
+    return '下载中'
+  }
+  if (activeTask.value?.downloadedVideo) {
+    return '重新下载'
+  }
+  return '下载视频'
+})
+
 const deleteTargetLabel = computed(() => {
   const task = taskPendingDelete.value
   if (!task) {
@@ -619,6 +690,7 @@ const deleteTargetLabel = computed(() => {
 
 watch(activeTaskId, async () => {
   subtitleError.value = ''
+  videoError.value = ''
   if (!activeTaskId.value) {
     return
   }
@@ -805,6 +877,28 @@ const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
     const cleared = new Set(downloadingSubtitleKeys.value)
     cleared.delete(key)
     downloadingSubtitleKeys.value = cleared
+  }
+}
+
+const downloadVideo = async () => {
+  if (!activeTask.value || isDownloadingVideo.value || !isTauriRuntime()) {
+    return
+  }
+
+  isDownloadingVideo.value = true
+  videoError.value = ''
+
+  try {
+    const task = await invoke<HomeVideoTask>('download_home_video_task_video', {
+      request: {
+        taskId: activeTask.value.id,
+      },
+    })
+    upsertTask(task)
+  } catch (error) {
+    videoError.value = stringifyError(error, '下载视频失败')
+  } finally {
+    isDownloadingVideo.value = false
   }
 }
 

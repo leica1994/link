@@ -1092,6 +1092,11 @@ html[data-theme='dark'] .translate-alert-warning {
   flex-shrink: 0;
 }
 
+.translate-alert.compact {
+  min-height: 34px;
+  margin-top: 0;
+}
+
 .translate-preview {
   flex: 1;
   min-height: 0;
@@ -2420,6 +2425,66 @@ html[data-theme='dark'] .home-video-cover {
   line-height: 1.25;
 }
 
+.home-video-download-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 2px;
+  padding: 12px 0 14px;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.home-video-download-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.home-video-download-title {
+  min-width: 0;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 850;
+  line-height: 1.2;
+}
+
+.home-video-download-title svg {
+  width: 16px;
+  height: 16px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.home-video-download-strip.downloaded .home-video-download-title svg {
+  color: #2f8a55;
+}
+
+html[data-theme='dark'] .home-video-download-strip.downloaded .home-video-download-title svg {
+  color: #8ed0a8;
+}
+
+.home-video-download-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-video-download-button {
+  min-width: 124px;
+  flex: 0 0 auto;
+}
+
 .home-video-description {
   max-height: 276px;
   overflow: auto;
@@ -3550,6 +3615,19 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
 
   .home-video-title-line {
     flex-direction: column;
+  }
+
+  .home-video-download-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .home-video-download-button {
+    width: 100%;
+  }
+
+  .home-video-download-meta {
+    white-space: normal;
   }
 
   .home-detail-stats {
