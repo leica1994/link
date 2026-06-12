@@ -20,13 +20,8 @@
         </div>
       </div>
 
-      <div class="translate-actions home-header-actions">
-        <button class="settings-action youtube-monitor-action" type="button" @click="loadAll">
-          <RefreshCw :stroke-width="2.1" aria-hidden="true" />
-          <span>刷新页面</span>
-        </button>
+      <div v-if="isDetailView && activeTask" class="translate-actions home-header-actions">
         <button
-          v-if="isDetailView && activeTask"
           class="settings-action youtube-monitor-action primary"
           type="button"
           :disabled="isRefreshingDetail || !ytdlpStatus.isAvailable"
@@ -35,6 +30,16 @@
           <LoaderCircle v-if="isRefreshingDetail" class="spinning" :stroke-width="2.1" aria-hidden="true" />
           <RefreshCw v-else :stroke-width="2.1" aria-hidden="true" />
           <span>{{ isRefreshingDetail ? '读取中' : '读取详情' }}</span>
+        </button>
+        <button
+          class="settings-action youtube-monitor-action danger"
+          type="button"
+          :disabled="isDeletingTask"
+          @click="openDeleteDialog(activeTask)"
+        >
+          <LoaderCircle v-if="isDeletingTask" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+          <Trash2 v-else :stroke-width="2.1" aria-hidden="true" />
+          <span>{{ isDeletingTask ? '移除中' : '移除待办' }}</span>
         </button>
       </div>
     </header>
@@ -134,6 +139,7 @@
                 :key="task.id"
                 class="home-task-row"
                 :to="{ name: 'HomeTaskDetail', params: { taskId: task.id } }"
+                :aria-label="`查看待办任务：${task.title || task.url}`"
                 role="row"
               >
                 <span class="home-task-thumb" role="cell">
@@ -363,6 +369,38 @@
           </div>
         </section>
       </div>
+
+      <div v-if="isDeleteDialogOpen" class="dialog-backdrop" role="presentation" @click.self="closeDeleteDialog">
+        <section
+          class="settings-dialog youtube-monitor-dialog home-delete-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="home-delete-dialog-title"
+        >
+          <h2 id="home-delete-dialog-title" class="dialog-title">移除待办任务</h2>
+          <p class="youtube-dialog-copy">移除后会从待办队列删除该任务，并清理已下载的字幕文件。</p>
+          <p class="home-delete-target">{{ deleteTargetLabel }}</p>
+
+          <div v-if="deleteError" class="translate-alert" role="alert">
+            <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+            <span>{{ deleteError }}</span>
+          </div>
+
+          <div class="youtube-dialog-actions">
+            <button class="settings-action youtube-monitor-action" type="button" @click="closeDeleteDialog">取消</button>
+            <button
+              class="settings-action youtube-monitor-action danger"
+              type="button"
+              :disabled="isDeletingTask"
+              @click="deleteTask"
+            >
+              <LoaderCircle v-if="isDeletingTask" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+              <Trash2 v-else :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ isDeletingTask ? '移除中' : '移除' }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
     </Teleport>
   </div>
 </template>
@@ -385,6 +423,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Trash2,
   Video,
 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -462,13 +501,17 @@ const taskQuery = ref('')
 const taskFilter = ref<TaskStatusFilter>('all')
 const isLoadingTasks = ref(false)
 const isAddingTask = ref(false)
+const isDeletingTask = ref(false)
 const isRefreshingDetail = ref(false)
 const isAddDialogOpen = ref(false)
+const isDeleteDialogOpen = ref(false)
 const pageError = ref('')
 const addError = ref('')
+const deleteError = ref('')
 const subtitleError = ref('')
 const downloadingSubtitleKeys = ref(new Set<string>())
 const autoRefreshedTaskIds = ref(new Set<string>())
+const taskPendingDelete = ref<HomeVideoTask | null>(null)
 
 const taskFilterOptions: { value: TaskStatusFilter; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -563,6 +606,15 @@ const subtitleEmptyText = computed(() => {
     return '该视频没有可下载字幕'
   }
   return '读取视频详情后会显示可下载字幕'
+})
+
+const deleteTargetLabel = computed(() => {
+  const task = taskPendingDelete.value
+  if (!task) {
+    return '该待办任务'
+  }
+
+  return task.title || task.webpageUrl || task.url
 })
 
 watch(activeTaskId, async () => {
@@ -685,15 +737,22 @@ const refreshActiveTaskDetail = async () => {
     return
   }
 
+  const refreshingTaskId = activeTask.value.id
   isRefreshingDetail.value = true
   pageError.value = ''
 
   try {
     const task = await invoke<HomeVideoTask>('refresh_home_video_task_detail', {
-      request: { taskId: activeTask.value.id },
+      request: { taskId: refreshingTaskId },
     })
+    if (!hasTask(refreshingTaskId)) {
+      return
+    }
     upsertTask(task)
   } catch (error) {
+    if (!hasTask(refreshingTaskId)) {
+      return
+    }
     pageError.value = stringifyError(error, '读取视频详情失败')
     await reloadActiveTask()
   } finally {
@@ -749,6 +808,33 @@ const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
   }
 }
 
+const deleteTask = async () => {
+  const task = taskPendingDelete.value
+  if (!task || isDeletingTask.value || !isTauriRuntime()) {
+    return
+  }
+
+  isDeletingTask.value = true
+  deleteError.value = ''
+
+  try {
+    await invoke('delete_home_video_task', {
+      request: { taskId: task.id },
+    })
+    removeTask(task.id)
+    const shouldReturnToQueue = activeTaskId.value === task.id
+    isDeleteDialogOpen.value = false
+    taskPendingDelete.value = null
+    if (shouldReturnToQueue) {
+      await router.push({ name: 'Home' })
+    }
+  } catch (error) {
+    deleteError.value = stringifyError(error, '移除待办任务失败')
+  } finally {
+    isDeletingTask.value = false
+  }
+}
+
 const upsertTask = (task: HomeVideoTask) => {
   const index = tasks.value.findIndex((item) => item.id === task.id)
   if (index >= 0) {
@@ -759,6 +845,17 @@ const upsertTask = (task: HomeVideoTask) => {
   }
 
   tasks.value = [task, ...tasks.value]
+}
+
+const removeTask = (taskId: string) => {
+  tasks.value = tasks.value.filter((task) => task.id !== taskId)
+  const refreshed = new Set(autoRefreshedTaskIds.value)
+  refreshed.delete(taskId)
+  autoRefreshedTaskIds.value = refreshed
+}
+
+const hasTask = (taskId: string) => {
+  return tasks.value.some((task) => task.id === taskId)
 }
 
 const goBackToQueue = async () => {
@@ -778,9 +875,25 @@ const closeAddDialog = () => {
   isAddDialogOpen.value = false
 }
 
+const openDeleteDialog = (task: HomeVideoTask) => {
+  taskPendingDelete.value = task
+  deleteError.value = ''
+  isDeleteDialogOpen.value = true
+}
+
+const closeDeleteDialog = () => {
+  if (isDeletingTask.value) {
+    return
+  }
+  isDeleteDialogOpen.value = false
+  taskPendingDelete.value = null
+  deleteError.value = ''
+}
+
 const handleKeydown = (event: KeyboardEvent) => {
   if (event.key === 'Escape') {
     closeAddDialog()
+    closeDeleteDialog()
   }
 }
 

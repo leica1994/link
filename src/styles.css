@@ -290,7 +290,7 @@ html[data-theme='dark'] .setting-subtitle-error {
   height: 38px;
   border: 1px solid var(--hairline);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.36);
+  background: color-mix(in srgb, var(--bg-surface-hover) 58%, var(--bg) 42%);
   color: var(--text);
   font-size: 14px;
   font-weight: 600;
@@ -300,7 +300,8 @@ html[data-theme='dark'] .setting-subtitle-error {
 
 html[data-theme='dark'] .settings-input,
 html[data-theme='dark'] .settings-action {
-  background: rgba(0, 0, 0, 0.16);
+  border-color: color-mix(in srgb, var(--text-muted) 28%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface-hover) 64%, var(--bg) 36%);
 }
 
 .settings-input {
@@ -318,12 +319,13 @@ input[type='password']::-ms-reveal {
 
 .settings-input:hover,
 .settings-action:not(:disabled):hover {
-  background: rgba(255, 255, 255, 0.52);
+  background: color-mix(in srgb, var(--bg-surface-hover) 76%, var(--bg) 24%);
 }
 
 html[data-theme='dark'] .settings-input:hover,
 html[data-theme='dark'] .settings-action:not(:disabled):hover {
-  background: rgba(0, 0, 0, 0.26);
+  border-color: color-mix(in srgb, var(--text-muted) 38%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface-hover) 82%, var(--bg) 18%);
 }
 
 .settings-input:focus-visible,
@@ -341,7 +343,15 @@ html[data-theme='dark'] .settings-action:not(:disabled):hover {
 
 .settings-action:disabled {
   cursor: not-allowed;
-  opacity: 0.55;
+  border-color: color-mix(in srgb, var(--text-muted) 18%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface) 76%, var(--bg) 24%);
+  color: color-mix(in srgb, var(--text-muted) 64%, var(--bg));
+}
+
+html[data-theme='dark'] .settings-action:disabled {
+  border-color: color-mix(in srgb, var(--text-muted) 22%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface) 68%, var(--bg) 32%);
+  color: var(--text-muted);
 }
 
 .api-key-field {
@@ -2318,6 +2328,31 @@ html[data-theme='dark'] .youtube-video-status.failed {
   color: #f0a2a2;
 }
 
+.home-delete-dialog {
+  width: min(440px, calc(100vw - 56px));
+}
+
+.home-delete-target {
+  max-height: 44px;
+  overflow: hidden;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.22);
+  color: var(--text);
+  display: -webkit-box;
+  margin-top: -4px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+html[data-theme='dark'] .home-delete-target {
+  background: rgba(0, 0, 0, 0.12);
+}
+
 .home-detail-panel {
   padding: 20px;
 }
@@ -2693,16 +2728,34 @@ html[data-theme='dark'] .youtube-monitor-status-line.error {
 }
 
 html[data-theme='dark'] .youtube-monitor-action.primary {
-  color: #18140f;
+  color: var(--text);
 }
 
 .youtube-monitor-action.primary:not(:disabled):hover {
   background: color-mix(in srgb, var(--accent) 88%, #fff);
 }
 
+html[data-theme='dark'] .youtube-monitor-action.primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 58%, var(--bg-surface-hover) 42%);
+  color: var(--text);
+}
+
+.youtube-monitor-action.primary:disabled {
+  border-color: color-mix(in srgb, var(--accent) 26%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-soft) 54%, var(--bg-surface) 46%);
+  color: color-mix(in srgb, var(--accent) 58%, var(--text-muted));
+}
+
+html[data-theme='dark'] .settings-action.youtube-monitor-action.primary:disabled {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-soft) 42%, var(--bg-surface) 58%);
+  color: var(--text-muted);
+}
+
 .youtube-monitor-action.danger {
   border-color: rgba(184, 59, 59, 0.28);
   color: #9f3030;
+  background: rgba(184, 59, 59, 0.06);
 }
 
 .youtube-monitor-action.danger:not(:disabled):hover {
@@ -2710,7 +2763,21 @@ html[data-theme='dark'] .youtube-monitor-action.primary {
 }
 
 html[data-theme='dark'] .youtube-monitor-action.danger {
+  border-color: rgba(240, 162, 162, 0.26);
+  background: rgba(184, 59, 59, 0.12);
   color: #f0a2a2;
+}
+
+.youtube-monitor-action.danger:disabled {
+  border-color: rgba(184, 59, 59, 0.18);
+  background: rgba(184, 59, 59, 0.07);
+  color: color-mix(in srgb, #9f3030 58%, var(--text-muted));
+}
+
+html[data-theme='dark'] .youtube-monitor-action.danger:disabled {
+  border-color: rgba(240, 162, 162, 0.18);
+  background: rgba(184, 59, 59, 0.08);
+  color: color-mix(in srgb, #f0a2a2 62%, var(--text-muted));
 }
 
 .youtube-monitor-workspace {
@@ -3205,7 +3272,15 @@ html[data-theme='dark'] .youtube-video-task-button {
 
 .youtube-video-task-button:disabled {
   cursor: not-allowed;
-  opacity: 0.68;
+  border-color: color-mix(in srgb, var(--text-muted) 20%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface) 76%, var(--bg) 24%);
+  color: color-mix(in srgb, var(--text-muted) 70%, var(--text));
+}
+
+html[data-theme='dark'] .youtube-video-task-button:disabled {
+  border-color: color-mix(in srgb, var(--text-muted) 24%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface) 70%, var(--bg) 30%);
+  color: var(--text-muted);
 }
 
 .youtube-video-task-button:disabled:not(:has(.spinning)) {
