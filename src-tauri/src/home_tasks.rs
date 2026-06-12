@@ -694,9 +694,10 @@ fn read_home_video_task_by_id(
 fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {
     let subtitle_options_text: String = row.get(17)?;
     let metadata_text: String = row.get(18)?;
-    let subtitle_options =
+    let mut subtitle_options =
         serde_json::from_str::<Vec<HomeVideoSubtitleOption>>(&subtitle_options_text)
             .unwrap_or_default();
+    normalize_stored_subtitle_options(&mut subtitle_options);
     let metadata = serde_json::from_str::<Value>(&metadata_text).unwrap_or_else(|_| json!({}));
 
     Ok(HomeVideoTask {
@@ -1406,6 +1407,12 @@ fn collect_subtitle_options(
         }
 
         let format_items = formats_value.as_array().cloned().unwrap_or_default();
+        if source_kind == SUBTITLE_SOURCE_AUTOMATIC
+            && should_skip_automatic_caption(language, &format_items, object)
+        {
+            continue;
+        }
+
         let name = format_items
             .iter()
             .find_map(|item| string_field(item, "name"))
@@ -1428,6 +1435,61 @@ fn collect_subtitle_options(
             is_auto,
         });
     }
+}
+
+fn should_skip_automatic_caption(
+    language: &str,
+    format_items: &[Value],
+    captions: &serde_json::Map<String, Value>,
+) -> bool {
+    if subtitle_formats_have_query_param(format_items, "tlang") {
+        return true;
+    }
+
+    if language.ends_with("-orig") {
+        return false;
+    }
+
+    let original_language = format!("{language}-orig");
+    captions
+        .get(&original_language)
+        .and_then(Value::as_array)
+        .is_some_and(|items| !subtitle_formats_have_query_param(items, "tlang"))
+}
+
+fn subtitle_formats_have_query_param(format_items: &[Value], param_name: &str) -> bool {
+    format_items
+        .iter()
+        .filter_map(|item| string_field(item, "url"))
+        .any(|url| url_has_query_param(&url, param_name))
+}
+
+fn url_has_query_param(url: &str, param_name: &str) -> bool {
+    let query = url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default()
+        .split('#')
+        .next()
+        .unwrap_or_default();
+
+    query.split('&').any(|part| {
+        let name = part.split_once('=').map(|(name, _)| name).unwrap_or(part);
+        name == param_name
+    })
+}
+
+fn normalize_stored_subtitle_options(options: &mut Vec<HomeVideoSubtitleOption>) {
+    let has_original_auto_caption = options.iter().any(|option| {
+        option.source_kind == SUBTITLE_SOURCE_AUTOMATIC && option.language.ends_with("-orig")
+    });
+    if !has_original_auto_caption {
+        return;
+    }
+
+    options.retain(|option| {
+        option.source_kind != SUBTITLE_SOURCE_AUTOMATIC || option.language.ends_with("-orig")
+    });
 }
 
 fn normalize_youtube_video_url(input: &str) -> Result<String, String> {
