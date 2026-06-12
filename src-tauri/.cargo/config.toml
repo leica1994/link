@@ -1,4 +1,6 @@
 [env]
-# Keep LibTorch inference on CUDA without requiring a Python/PyTorch environment.
-# torch-sys uses this only when LIBTORCH is not already set.
+# Keep LibTorch outside target so Cargo does not accumulate downloaded copies.
+# Override this with a process-level LIBTORCH value to use another local cache.
+LIBTORCH = { value = ".libtorch/libtorch", relative = true, force = false }
+# Kept for developers who temporarily re-enable torch-sys downloads.
 TORCH_CUDA_VERSION = { value = "cu128", force = false }

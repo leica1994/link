@@ -36,7 +36,6 @@ fn copy_libtorch_dlls() {
         }
     };
 
-    let mut copied = 0_u32;
     for entry in entries.flatten() {
         let source = entry.path();
         if source.extension().and_then(|value| value.to_str()) != Some("dll") {
@@ -49,21 +48,14 @@ fn copy_libtorch_dlls() {
         if same_size_file(&source, &destination) {
             continue;
         }
-        match fs::copy(&source, &destination) {
-            Ok(_) => copied += 1,
+        match sync_libtorch_dll(&source, &destination) {
+            Ok(()) => {}
             Err(error) => println!(
                 "cargo:warning=无法同步 LibTorch DLL {} -> {}: {error}",
                 source.display(),
                 destination.display()
             ),
         }
-    }
-
-    if copied > 0 {
-        println!(
-            "cargo:warning=已同步 {copied} 个 LibTorch DLL 到 {}",
-            profile_dir.display()
-        );
     }
 }
 
@@ -85,6 +77,11 @@ fn libtorch_lib_dir(profile_dir: &std::path::Path) -> Option<std::path::PathBuf>
     env::var_os("DEP_TCH_LIBTORCH_LIB")
         .map(PathBuf::from)
         .filter(|path| path.join("torch_cuda.dll").is_file())
+        .or_else(|| {
+            env::var_os("LIBTORCH_LIB")
+                .map(PathBuf::from)
+                .filter(|path| path.join("torch_cuda.dll").is_file())
+        })
         .or_else(|| {
             env::var_os("LIBTORCH")
                 .map(PathBuf::from)
@@ -115,6 +112,21 @@ fn libtorch_lib_dir(profile_dir: &std::path::Path) -> Option<std::path::PathBuf>
             candidates.sort_by_key(|(modified, _)| *modified);
             candidates.pop().map(|(_, path)| path)
         })
+}
+
+#[cfg(target_os = "windows")]
+fn sync_libtorch_dll(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    if destination.exists() {
+        let _ = std::fs::remove_file(destination);
+    }
+
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::copy(source, destination).map(|_| ()),
+    }
 }
 
 #[cfg(target_os = "windows")]
