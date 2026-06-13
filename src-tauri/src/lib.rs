@@ -1,6 +1,7 @@
 mod ai;
 mod app_log;
 mod app_paths;
+mod command_utils;
 mod dubbing;
 mod dubbing_alignment;
 mod dubbing_compose;

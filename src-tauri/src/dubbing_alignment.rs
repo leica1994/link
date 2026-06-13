@@ -1,3 +1,4 @@
+use crate::command_utils::create_command;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -674,7 +675,7 @@ fn create_video_clip(input_path: &Path, step: &mut AlignmentStep) -> Result<(), 
         return Err("视频片段时长为 0，无法生成对齐视频".to_string());
     }
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -733,7 +734,7 @@ fn extend_video_tail(path: &Path, duration_ms: u64) -> Result<(), String> {
             .and_then(|value| value.to_str())
             .unwrap_or("clip")
     ));
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -778,7 +779,7 @@ fn create_audio_clip(
 }
 
 fn create_silent_audio(duration_ms: u64, output_path: &Path) -> Result<(), String> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -822,7 +823,7 @@ fn create_tts_audio_block(
         "[0:a]{tts_filter};[1:a][tts]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95,atrim=0:{:.3},asetpts=N/SR/TB[aout]",
         duration_ms as f64 / 1000.0
     );
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -869,7 +870,7 @@ fn create_background_clip(
     filters.push(format!("atrim=0:{:.3}", target_duration_ms as f64 / 1000.0));
     filters.push("asetpts=N/SR/TB".to_string());
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -976,7 +977,7 @@ fn concat_media_files(files: &[PathBuf], output_path: &Path, video: bool) -> Res
     ));
     write_concat_file(files, &concat_path)?;
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -1037,7 +1038,7 @@ fn harmonize_audio_to_video(audio_path: &Path, video_path: &Path) -> Result<(), 
             .and_then(|value| value.to_str())
             .unwrap_or("audio")
     ));
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -1130,7 +1131,7 @@ fn write_concat_file(files: &[PathBuf], concat_path: &Path) -> Result<(), String
 }
 
 fn probe_media_duration_ms(path: &Path) -> Result<u64, String> {
-    let mut command = Command::new("ffprobe");
+    let mut command = create_command("ffprobe");
     command
         .arg("-v")
         .arg("error")

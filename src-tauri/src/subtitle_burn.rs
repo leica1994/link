@@ -1,3 +1,4 @@
+use crate::command_utils::create_command;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -181,7 +182,7 @@ fn run_ffmpeg_burn(
     let subtitle_filter = format!("subtitles='{subtitle_filter_path}'");
     let output_path_string = path_to_string(output_path);
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -269,7 +270,7 @@ fn run_ffmpeg_burn(
 }
 
 fn probe_duration_ms(path: &Path) -> Result<u64, String> {
-    let mut command = Command::new("ffprobe");
+    let mut command = create_command("ffprobe");
     command
         .arg("-v")
         .arg("error")

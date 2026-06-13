@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::app_log::AppLogger;
 use crate::app_paths;
+use crate::command_utils::create_command;
 use crate::dubbing_alignment::{
     run_dubbing_alignment, DubbingAlignmentInput, DubbingAlignmentProgress,
     DubbingAlignmentSegmentInput, DubbingAlignmentSegmentResult,
@@ -5777,7 +5778,7 @@ fn audio_extension(audio: &[u8]) -> &'static str {
 
 fn convert_tts_audio_to_wav(input_path: &Path, output_path: &Path) -> Result<(), String> {
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -5966,7 +5967,7 @@ fn run_tts_denoise_filter(
     );
 
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -5998,7 +5999,7 @@ fn apply_tts_tail_fade(path: &Path) -> Result<bool, String> {
     let output_path = tts_audio_temp_path(path, "tail-fade");
     let filter = format!("afade=t=out:st={start_s:.3}:d={fade_s:.3}");
     let result = run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -6532,7 +6533,7 @@ fn reference_audio_duration_ms(sample_count: usize, spec: hound::WavSpec) -> u64
 fn apply_reference_audio_loudnorm(path: &Path) -> Result<(), String> {
     let output_path = reference_audio_temp_path(path, "loudnorm");
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -6562,7 +6563,7 @@ fn apply_reference_audio_loudnorm(path: &Path) -> Result<(), String> {
 }
 
 fn probe_audio_duration_ms(path: &Path) -> Result<u64, String> {
-    let mut command = Command::new("ffprobe");
+    let mut command = create_command("ffprobe");
     command
         .arg("-v")
         .arg("error")
@@ -6582,7 +6583,7 @@ fn probe_audio_duration_ms(path: &Path) -> Result<u64, String> {
 }
 
 fn probe_audio_volume_db(path: &Path) -> Result<(Option<f64>, Option<f64>), String> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -6642,7 +6643,7 @@ fn export_reference_audio_clip(
     let duration_seconds = format!("{:.3}", end_ms.saturating_sub(start_ms) as f64 / 1000.0);
 
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -6682,7 +6683,7 @@ fn source_video_path(snapshot: &DubbingTaskSnapshot) -> Result<PathBuf, String> 
 
 fn export_video_without_audio(input_path: &Path, output_path: &Path) -> Result<(), String> {
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -6702,7 +6703,7 @@ fn export_video_without_audio(input_path: &Path, output_path: &Path) -> Result<(
 
 fn extract_source_audio(input_path: &Path, output_path: &Path) -> Result<(), String> {
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")
@@ -6851,7 +6852,7 @@ fn mix_background_music_stems(
     output_path: &Path,
 ) -> Result<(), String> {
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-nostats")

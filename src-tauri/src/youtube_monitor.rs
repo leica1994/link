@@ -4,12 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+use crate::command_utils::create_command;
 use crate::settings::SettingsStore;
 
 const YTDLP_COMMAND: &str = "yt-dlp";
@@ -185,7 +186,9 @@ struct VideoEntry {
 
 #[tauri::command]
 pub fn get_ytdlp_status() -> YtdlpStatus {
-    match Command::new(YTDLP_COMMAND).arg("--version").output() {
+    let mut cmd = create_command(YTDLP_COMMAND);
+
+    match cmd.arg("--version").output() {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
             YtdlpStatus {
@@ -574,8 +577,9 @@ fn fail_refresh_run(
     })
 }
 
-fn ytdlp_command(proxy: &str) -> Command {
-    let mut command = Command::new(YTDLP_COMMAND);
+fn ytdlp_command(proxy: &str) -> std::process::Command {
+    let mut command = create_command(YTDLP_COMMAND);
+
     let proxy = proxy.trim();
     if !proxy.is_empty() {
         command.args(["--proxy", proxy]);

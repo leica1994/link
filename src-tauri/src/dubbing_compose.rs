@@ -1,3 +1,4 @@
+use crate::command_utils::create_command;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -283,7 +284,7 @@ fn compose_video(
     output_path: &Path,
     background_music_volume: f64,
 ) -> Result<(), String> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -374,7 +375,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn probe_media_duration_ms(path: &Path) -> Result<u64, String> {
-    let mut command = Command::new("ffprobe");
+    let mut command = create_command("ffprobe");
     command
         .arg("-v")
         .arg("error")
@@ -394,7 +395,7 @@ fn probe_video_info(path: &Path) -> Result<VideoInfo, String> {
         ..VideoInfo::default()
     };
 
-    let mut video_command = Command::new("ffprobe");
+    let mut video_command = create_command("ffprobe");
     video_command
         .arg("-v")
         .arg("error")
@@ -416,7 +417,7 @@ fn probe_video_info(path: &Path) -> Result<VideoInfo, String> {
         }
     }
 
-    let mut audio_command = Command::new("ffprobe");
+    let mut audio_command = create_command("ffprobe");
     audio_command
         .arg("-v")
         .arg("error")

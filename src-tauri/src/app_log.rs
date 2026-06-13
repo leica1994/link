@@ -3,12 +3,12 @@ use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
 
 use crate::app_paths;
+use crate::command_utils::create_command;
 
 #[derive(Clone)]
 pub struct AppLogger {
@@ -178,21 +178,21 @@ fn timestamp_millis() -> u128 {
 fn open_path(path: &PathBuf) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("explorer");
+        let mut command = create_command("explorer");
         command.arg(path);
         command
     };
 
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut command = Command::new("open");
+        let mut command = create_command("open");
         command.arg(path);
         command
     };
 
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = {
-        let mut command = Command::new("xdg-open");
+        let mut command = create_command("xdg-open");
         command.arg(path);
         command
     };

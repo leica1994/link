@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 use crate::app_paths;
+use crate::command_utils::create_command;
 use crate::settings::SettingsStore;
 
 const YTDLP_COMMAND: &str = "yt-dlp";
@@ -1660,8 +1661,9 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
-fn ytdlp_command(proxy: &str) -> Command {
-    let mut command = Command::new(YTDLP_COMMAND);
+fn ytdlp_command(proxy: &str) -> std::process::Command {
+    let mut command = create_command(YTDLP_COMMAND);
+
     let proxy = proxy.trim();
     if !proxy.is_empty() {
         command.args(["--proxy", proxy]);

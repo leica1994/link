@@ -1,6 +1,7 @@
 use crate::ai::AiService;
 use crate::app_log::{AppLogger, LogSession};
 use crate::app_paths;
+use crate::command_utils::create_command;
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::{correct_subtitles, smart_segment_subtitles};
 use crate::subtitle_export::serialize_styled_ass;
@@ -1351,7 +1352,7 @@ fn mark_segments_status(segments: &mut [TranscriptionSegment], status: &str) {
 
 fn convert_media_to_audio(input_path: &Path, output_path: &Path) -> Result<(), String> {
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-i")
             .arg(input_path)
             .arg("-map")
@@ -1380,7 +1381,7 @@ fn export_audio_clip(input_path: &Path, start_ms: u64, end_ms: u64) -> Result<Te
     let duration_seconds = format!("{:.3}", end_ms.saturating_sub(start_ms) as f64 / 1000.0);
 
     run_ffmpeg_command(
-        Command::new("ffmpeg")
+        create_command("ffmpeg")
             .arg("-ss")
             .arg(start_seconds)
             .arg("-t")
@@ -1423,7 +1424,7 @@ fn run_ffmpeg_command(command: &mut Command, failure_message: &str) -> Result<()
 }
 
 fn probe_duration_ms(path: &Path) -> Result<u64, String> {
-    let mut command = Command::new("ffprobe");
+    let mut command = create_command("ffprobe");
     command
         .arg("-v")
         .arg("error")
@@ -1501,7 +1502,7 @@ fn find_smart_split_point(audio_path: &Path, duration_ms: u64, target_ms: u64) -
             })
             .unwrap_or(-35.0);
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostats")
@@ -1554,7 +1555,7 @@ fn find_smart_split_point(audio_path: &Path, duration_ms: u64, target_ms: u64) -
 }
 
 fn probe_mean_volume_db(audio_path: &Path, start_ms: u64, duration_ms: u64) -> Option<f64> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = create_command("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-nostats")
