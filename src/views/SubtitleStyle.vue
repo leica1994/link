@@ -120,13 +120,13 @@
       </div>
 
       <div class="subtitle-style-controls">
-        <section class="settings-section" aria-labelledby="preview-settings-title">
+        <section class="settings-section subtitle-control-preview" aria-labelledby="preview-settings-title">
           <div id="preview-settings-title" class="section-heading">
             <SlidersHorizontal aria-hidden="true" />
             <span>预览设置</span>
           </div>
 
-          <div class="settings-panel">
+          <div class="settings-panel subtitle-preview-settings-panel">
             <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('renderMode')">
               <span class="setting-copy">
                 <span class="setting-title">渲染模式</span>
@@ -180,22 +180,23 @@
               </span>
             </button>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">字号</span>
                 <span class="setting-subtitle">主字幕大小</span>
               </span>
-              <span class="subtitle-number-field">
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.primaryFontSize) }}</span>
                 <input
                   v-model.number="draftStyle.primaryFontSize"
-                  class="settings-input subtitle-number-input"
-                  type="number"
+                  class="setting-range"
+                  type="range"
                   min="8"
                   max="200"
+                  step="1"
                   aria-label="主字幕字号"
                   @change="saveCurrentStyle"
                 />
-                <span class="subtitle-number-unit">px</span>
               </span>
             </label>
 
@@ -305,22 +306,23 @@
               </span>
             </button>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">字号</span>
                 <span class="setting-subtitle">副字幕大小</span>
               </span>
-              <span class="subtitle-number-field">
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.secondaryFontSize) }}</span>
                 <input
                   v-model.number="draftStyle.secondaryFontSize"
-                  class="settings-input subtitle-number-input"
-                  type="number"
+                  class="setting-range"
+                  type="range"
                   min="8"
                   max="200"
+                  step="1"
                   aria-label="副字幕字号"
                   @change="saveCurrentStyle"
                 />
-                <span class="subtitle-number-unit">px</span>
               </span>
             </label>
 
@@ -430,22 +432,23 @@
               </span>
             </button>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">字号</span>
                 <span class="setting-subtitle">圆角字幕大小</span>
               </span>
-              <span class="subtitle-number-field">
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedFontSize) }}</span>
                 <input
                   v-model.number="draftStyle.roundedFontSize"
-                  class="settings-input subtitle-number-input"
-                  type="number"
+                  class="setting-range"
+                  type="range"
                   min="12"
                   max="120"
+                  step="1"
                   aria-label="圆角字幕字号"
                   @change="saveCurrentStyle"
                 />
-                <span class="subtitle-number-unit">px</span>
               </span>
             </label>
 
@@ -1701,80 +1704,123 @@ html[data-theme='dark'] .subtitle-preview-badge {
 
 .subtitle-style-controls {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 24px;
   align-items: start;
 }
 
-.subtitle-number-input {
-  justify-self: end;
-  width: 92px;
-  text-align: center;
+.subtitle-control-preview {
+  grid-column: 1 / -1;
 }
 
-.subtitle-number-input::-webkit-outer-spin-button,
-.subtitle-number-input::-webkit-inner-spin-button {
+.subtitle-preview-settings-panel {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.subtitle-preview-settings-panel .setting-row {
+  min-height: 66px;
+}
+
+.subtitle-preview-settings-panel .setting-row + .setting-row {
+  border-left: 1px solid var(--hairline);
+}
+
+.subtitle-preview-settings-panel .setting-row.compact + .setting-row-button.compact .setting-copy,
+.subtitle-preview-settings-panel .setting-row-button.compact + .setting-row-button.compact .setting-copy {
+  border-top: 0;
+}
+
+.subtitle-style-controls .setting-row.compact {
+  grid-template-columns: minmax(118px, 0.44fr) minmax(0, 0.56fr);
+  gap: 12px;
+  padding: 0 14px;
+}
+
+.subtitle-style-controls .setting-row.compact.range {
+  grid-template-columns: minmax(118px, 0.44fr) minmax(0, 0.56fr);
+}
+
+.subtitle-style-controls .setting-row.compact .subtitle-range-control {
+  justify-self: end;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.subtitle-style-controls .setting-row.compact .subtitle-alpha-range {
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: 50px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.subtitle-style-controls .setting-range-value {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 850;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.subtitle-style-controls .setting-range {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
   appearance: none;
-  margin: 0;
+  background: transparent;
+  cursor: pointer;
 }
 
-.subtitle-number-input {
-  appearance: textfield;
+.subtitle-style-controls .setting-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
-.subtitle-number-field {
-  justify-self: end;
-  width: 104px;
-  height: 36px;
-  border: 1px solid var(--hairline);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--bg-surface-hover) 58%, var(--bg) 42%);
-  display: inline-grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  overflow: hidden;
-  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+.subtitle-style-controls .setting-range:focus-visible {
+  outline: 3px solid var(--accent-soft);
+  outline-offset: 2px;
+  border-radius: 999px;
 }
 
-html[data-theme='dark'] .subtitle-number-field {
-  border-color: color-mix(in srgb, var(--text-muted) 28%, var(--hairline));
+.subtitle-style-controls .setting-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 24%, transparent);
+  border-radius: 999px;
   background: color-mix(in srgb, var(--bg-surface-hover) 64%, var(--bg) 36%);
 }
 
-.subtitle-number-field:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+.subtitle-style-controls .setting-range::-webkit-slider-thumb {
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+  appearance: none;
+  border: 2px solid var(--bg-surface);
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 1px 4px rgba(20, 17, 13, 0.2);
 }
 
-.subtitle-number-field .subtitle-number-input {
-  width: 100%;
-  height: 100%;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  padding: 0 4px 0 10px;
-  text-align: right;
-  box-shadow: none;
+.subtitle-style-controls .setting-range:hover::-webkit-slider-thumb {
+  background: var(--accent-strong);
 }
 
-.subtitle-number-field .subtitle-number-input:hover,
-.subtitle-number-field .subtitle-number-input:focus-visible {
-  background: transparent;
-  box-shadow: none;
+.subtitle-style-controls .setting-range::-moz-range-track {
+  height: 6px;
+  border: 1px solid color-mix(in srgb, var(--text-muted) 24%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-surface-hover) 64%, var(--bg) 36%);
 }
 
-.subtitle-number-unit {
-  padding-right: 10px;
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 850;
-  line-height: 1;
-}
-
-.subtitle-range-control {
-  justify-self: end;
-  width: min(100%, 300px);
-  grid-template-columns: 62px minmax(150px, 1fr);
+.subtitle-style-controls .setting-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--bg-surface);
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 1px 4px rgba(20, 17, 13, 0.2);
 }
 
 .subtitle-color-input {
@@ -1795,16 +1841,16 @@ html[data-theme='dark'] .subtitle-number-field {
 
 .subtitle-color-alpha-control {
   justify-self: end;
-  width: min(100%, 330px);
+  width: 100%;
   display: grid;
-  grid-template-columns: 58px minmax(180px, 1fr);
+  grid-template-columns: 58px minmax(0, 1fr);
   align-items: center;
   gap: 12px;
 }
 
 .subtitle-alpha-range {
   width: 100%;
-  grid-template-columns: 52px minmax(120px, 1fr);
+  grid-template-columns: 48px minmax(70px, 1fr);
 }
 
 .subtitle-font-option {
@@ -1859,6 +1905,23 @@ html[data-theme='dark'] .subtitle-number-field {
   .subtitle-style-controls {
     grid-template-columns: 1fr 1fr;
   }
+
+  .subtitle-control-preview {
+    grid-column: 1 / -1;
+  }
+
+  .subtitle-preview-settings-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .subtitle-preview-settings-panel .setting-row + .setting-row {
+    border-left: 0;
+  }
+
+  .subtitle-preview-settings-panel .setting-row.compact + .setting-row-button.compact .setting-copy,
+  .subtitle-preview-settings-panel .setting-row-button.compact + .setting-row-button.compact .setting-copy {
+    border-top: 1px solid var(--hairline);
+  }
 }
 
 @media (max-width: 860px) {
@@ -1875,7 +1938,11 @@ html[data-theme='dark'] .subtitle-number-field {
     flex-direction: column;
   }
 
-  .subtitle-number-field,
+  .subtitle-style-controls .setting-row.compact,
+  .subtitle-style-controls .setting-row.compact.range {
+    grid-template-columns: 1fr;
+  }
+
   .subtitle-color-input,
   .subtitle-range-control,
   .subtitle-color-alpha-control {
