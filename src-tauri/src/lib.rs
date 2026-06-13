@@ -9,6 +9,7 @@ mod home_workbench;
 mod htdemucs;
 mod settings;
 mod subtitle_ai;
+mod subtitle_export;
 mod subtitle_style;
 mod subtitle_translation;
 mod transcription;
@@ -34,7 +35,7 @@ use home_workbench::{
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_style::{
     create_subtitle_style, delete_subtitle_style, get_subtitle_style, list_subtitle_styles,
-    update_subtitle_style,
+    select_subtitle_style, update_subtitle_style,
 };
 use subtitle_translation::{
     load_subtitle_preview, save_subtitle_translation_file, start_subtitle_translation,
@@ -122,6 +123,7 @@ pub fn run() {
             create_subtitle_style,
             update_subtitle_style,
             delete_subtitle_style,
+            select_subtitle_style,
             list_dubbing_models,
             list_dubbing_voices,
             add_dubbing_model,

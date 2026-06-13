@@ -849,6 +849,7 @@ async fn prepare_subtitle(
         app,
         ai_service,
         app_logger,
+        Some(store),
         TranscriptionRequest {
             file_path: video.file_path.clone(),
             model: options.transcription_model.clone(),
@@ -910,6 +911,7 @@ async fn translate_subtitle(
         app,
         ai_service,
         app_logger,
+        Some(store),
         SubtitleTranslationRequest {
             file_path: subtitle_path.to_string_lossy().to_string(),
         },
@@ -1660,7 +1662,7 @@ fn normalize_options(
         options.source_language = settings.source_language.clone();
     }
     options.transcription_format = normalize_extension(&options.transcription_format, "srt");
-    options.translation_format = normalize_extension(&options.translation_format, "srt");
+    options.translation_format = normalize_extension(&options.translation_format, "ass");
     if options.translation_service.trim().is_empty() {
         options.translation_service = settings.translation_service.clone();
     }
@@ -1946,7 +1948,7 @@ fn default_workbench_options_from_empty() -> HomeWorkbenchOptions {
         transcription_format: "srt".to_string(),
         is_smart_segmentation_enabled: true,
         is_subtitle_correction_enabled: true,
-        translation_format: "srt".to_string(),
+        translation_format: "ass".to_string(),
         translation_service: "llm".to_string(),
         needs_reflection_translation: true,
         translation_batch_size: 30,

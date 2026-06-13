@@ -28,6 +28,8 @@ pub struct AppSettings {
     pub source_language: String,
     pub transcription_format: String,
     pub translation_format: String,
+    #[serde(default = "default_subtitle_style_id")]
+    pub selected_subtitle_style_id: String,
     pub is_smart_segmentation_enabled: bool,
     pub selected_llm_service: String,
     pub llm_configs: HashMap<String, LlmConfig>,
@@ -90,7 +92,12 @@ impl SettingsStore {
                 "transcription_format",
                 "srt",
             ),
-            translation_format: read_string_setting(&setting_values, "translation_format", "srt"),
+            translation_format: read_string_setting(&setting_values, "translation_format", "ass"),
+            selected_subtitle_style_id: read_string_setting(
+                &setting_values,
+                "selected_subtitle_style_id",
+                "default",
+            ),
             is_smart_segmentation_enabled: read_bool_setting(
                 &setting_values,
                 "is_smart_segmentation_enabled",
@@ -119,7 +126,7 @@ impl SettingsStore {
                 "video_content_type",
                 "general",
             ),
-            output_mode: read_string_setting(&setting_values, "output_mode", "ass"),
+            output_mode: read_string_setting(&setting_values, "output_mode", "bilingual"),
             is_subtitle_correction_enabled: read_bool_setting(
                 &setting_values,
                 "is_subtitle_correction_enabled",
@@ -194,6 +201,25 @@ impl SettingsStore {
             .map_err(|error| format!("设置数据库锁定失败: {error}"))?;
 
         operation(&connection)
+    }
+
+    pub(crate) fn set_selected_subtitle_style_id(&self, style_id: &str) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|error| format!("设置数据库锁定失败: {error}"))?;
+
+        connection
+            .execute(
+                "
+                INSERT INTO app_settings (key, value)
+                VALUES ('selected_subtitle_style_id', ?1)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                ",
+                params![style_id],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("无法保存当前字幕样式: {error}"))
     }
 
     pub(crate) fn save(&self, settings: &AppSettings) -> Result<(), String> {
@@ -1206,6 +1232,10 @@ fn bool_to_text(value: bool) -> &'static str {
     } else {
         "false"
     }
+}
+
+fn default_subtitle_style_id() -> String {
+    "default".to_string()
 }
 
 fn upsert_setting(

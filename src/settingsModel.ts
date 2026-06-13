@@ -68,6 +68,7 @@ export type AppSettings = {
   sourceLanguage: string
   transcriptionFormat: SubtitleFormat
   translationFormat: SubtitleFormat
+  selectedSubtitleStyleId: string
   isSmartSegmentationEnabled: boolean
   selectedLlmService: LlmService
   llmConfigs: LlmConfigs
@@ -476,7 +477,11 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
       ? settings.sourceLanguage
       : 'auto',
   transcriptionFormat: readOptionValue(settings.transcriptionFormat, subtitleFormatOptions, SubtitleFormat.Srt),
-  translationFormat: readOptionValue(settings.translationFormat, subtitleFormatOptions, SubtitleFormat.Srt),
+  translationFormat: readOptionValue(settings.translationFormat, subtitleFormatOptions, SubtitleFormat.Ass),
+  selectedSubtitleStyleId:
+    typeof settings.selectedSubtitleStyleId === 'string' && settings.selectedSubtitleStyleId.trim()
+      ? settings.selectedSubtitleStyleId
+      : 'default',
   isSmartSegmentationEnabled:
     typeof settings.isSmartSegmentationEnabled === 'boolean' ? settings.isSmartSegmentationEnabled : true,
   selectedLlmService: readOptionValue(settings.selectedLlmService, llmServiceOptions, LlmService.OpenAI),

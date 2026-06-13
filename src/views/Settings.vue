@@ -933,6 +933,7 @@ type AppSettings = {
   sourceLanguage: string
   transcriptionFormat: SubtitleFormat
   translationFormat: SubtitleFormat
+  selectedSubtitleStyleId: string
   isSmartSegmentationEnabled: boolean
   selectedLlmService: LlmService
   llmConfigs: LlmConfigs
@@ -1333,7 +1334,11 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
   ),
   sourceLanguage: typeof settings.sourceLanguage === 'string' ? settings.sourceLanguage : 'auto',
   transcriptionFormat: readOptionValue(settings.transcriptionFormat, subtitleFormatOptions, SubtitleFormat.Srt),
-  translationFormat: readOptionValue(settings.translationFormat, subtitleFormatOptions, SubtitleFormat.Srt),
+  translationFormat: readOptionValue(settings.translationFormat, subtitleFormatOptions, SubtitleFormat.Ass),
+  selectedSubtitleStyleId:
+    typeof settings.selectedSubtitleStyleId === 'string' && settings.selectedSubtitleStyleId.trim()
+      ? settings.selectedSubtitleStyleId
+      : 'default',
   isSmartSegmentationEnabled:
     typeof settings.isSmartSegmentationEnabled === 'boolean' ? settings.isSmartSegmentationEnabled : true,
   selectedLlmService: readOptionValue(settings.selectedLlmService, llmServiceOptions, LlmService.OpenAI),
@@ -1385,7 +1390,8 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
 const selectedSourceLanguage = ref('auto')
 const selectedTranscriptionFormat = ref<SubtitleFormat>(SubtitleFormat.Srt)
-const selectedTranslationFormat = ref<SubtitleFormat>(SubtitleFormat.Srt)
+const selectedTranslationFormat = ref<SubtitleFormat>(SubtitleFormat.Ass)
+const selectedSubtitleStyleId = ref('default')
 const isSmartSegmentationEnabled = ref(true)
 const isTranscriptionModelDialogOpen = ref(false)
 const selectedLlmService = ref<LlmService>(LlmService.OpenAI)
@@ -1543,6 +1549,7 @@ const createSettingsSnapshot = (): AppSettings => ({
   sourceLanguage: selectedSourceLanguage.value,
   transcriptionFormat: selectedTranscriptionFormat.value,
   translationFormat: selectedTranslationFormat.value,
+  selectedSubtitleStyleId: selectedSubtitleStyleId.value,
   isSmartSegmentationEnabled: isSmartSegmentationEnabled.value,
   selectedLlmService: selectedLlmService.value,
   llmConfigs: llmConfigs.value,
@@ -1575,6 +1582,7 @@ const applySettings = (settings: AppSettings) => {
   selectedSourceLanguage.value = settings.sourceLanguage
   selectedTranscriptionFormat.value = settings.transcriptionFormat
   selectedTranslationFormat.value = settings.translationFormat
+  selectedSubtitleStyleId.value = settings.selectedSubtitleStyleId
   isSmartSegmentationEnabled.value = settings.isSmartSegmentationEnabled
   selectedLlmService.value = settings.selectedLlmService
   llmConfigs.value = settings.llmConfigs

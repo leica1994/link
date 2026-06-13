@@ -1486,7 +1486,7 @@ const workbenchOptions = ref<HomeWorkbenchOptions>({
   transcriptionFormat: SubtitleFormat.Srt,
   isSmartSegmentationEnabled: true,
   isSubtitleCorrectionEnabled: true,
-  translationFormat: SubtitleFormat.Srt,
+  translationFormat: SubtitleFormat.Ass,
   translationService: TranslationService.Llm,
   needsReflectionTranslation: true,
   translationBatchSize: 30,
@@ -3011,7 +3011,7 @@ const normalizeWorkbenchOptions = (options: HomeWorkbenchOptions): HomeWorkbench
     next.sourceLanguage = 'auto'
   }
   next.transcriptionFormat = readOptionValue(next.transcriptionFormat, subtitleFormatOptions, SubtitleFormat.Srt)
-  next.translationFormat = readOptionValue(next.translationFormat, subtitleFormatOptions, SubtitleFormat.Srt)
+  next.translationFormat = readOptionValue(next.translationFormat, subtitleFormatOptions, SubtitleFormat.Ass)
   next.translationService = readOptionValue(next.translationService, translationServiceOptions, TranslationService.Llm)
   next.videoContentType = readOptionValue(next.videoContentType, videoContentTypeOptions, VideoContentType.General)
   next.outputMode = readOptionValue(next.outputMode, outputModeOptions, OutputMode.Bilingual)

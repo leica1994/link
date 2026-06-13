@@ -3,6 +3,8 @@ use crate::app_log::{AppLogger, LogSession};
 use crate::app_paths;
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::{correct_subtitles, smart_segment_subtitles};
+use crate::subtitle_export::serialize_styled_ass;
+use crate::subtitle_style::get_selected_subtitle_style;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -631,23 +633,42 @@ pub async fn start_transcription(
     request: TranscriptionRequest,
 ) -> Result<TranscriptionResult, String> {
     let settings = settings_store.load()?;
-    run_transcription_workflow(app, &ai_service, &app_logger, request, settings).await
+    run_transcription_workflow(
+        app,
+        &ai_service,
+        &app_logger,
+        Some(&settings_store),
+        request,
+        settings,
+    )
+    .await
 }
 
 pub(crate) async fn run_transcription_workflow(
     app: AppHandle,
     ai_service: &AiService,
     app_logger: &AppLogger,
+    settings_store: Option<&SettingsStore>,
     request: TranscriptionRequest,
     settings: AppSettings,
 ) -> Result<TranscriptionResult, String> {
-    run_transcription_workflow_with_sink(app, ai_service, app_logger, request, settings, None).await
+    run_transcription_workflow_with_sink(
+        app,
+        ai_service,
+        app_logger,
+        settings_store,
+        request,
+        settings,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn run_transcription_workflow_with_sink(
     app: AppHandle,
     ai_service: &AiService,
     app_logger: &AppLogger,
+    settings_store: Option<&SettingsStore>,
     request: TranscriptionRequest,
     settings: AppSettings,
     progress_sink: Option<TranscriptionProgressSink>,
@@ -728,8 +749,11 @@ pub(crate) async fn run_transcription_workflow_with_sink(
 
     let mut segments = raw_result.segments;
     let mut warnings = Vec::new();
-    let mut emitter =
-        SnapshotEmitter::new(app.clone(), workflow_progress.clone(), progress_sink.clone());
+    let mut emitter = SnapshotEmitter::new(
+        app.clone(),
+        workflow_progress.clone(),
+        progress_sink.clone(),
+    );
 
     assign_segment_metadata(&mut segments, "raw", "raw");
     workflow_progress.set_stage(ProgressStage::Transcription, 100, "语音转录完成", "done");
@@ -872,7 +896,12 @@ pub(crate) async fn run_transcription_workflow_with_sink(
     }
 
     mark_segments_status(&mut segments, "done");
-    let subtitle_text = serialize_subtitle(&segments, raw_result.output_format);
+    let subtitle_text = serialize_segments_for_export(
+        &segments,
+        raw_result.output_format,
+        settings_store,
+        &settings,
+    )?;
     log_session.info(
         "subtitle_ready_for_export",
         "字幕内容已生成，等待手动导出",
@@ -917,6 +946,7 @@ pub fn save_transcription_file(path: String, content: String) -> Result<(), Stri
 
 #[tauri::command]
 pub fn save_subtitle_segments_file(
+    settings_store: tauri::State<'_, SettingsStore>,
     path: String,
     output_format: String,
     segments: Vec<TranscriptionSegment>,
@@ -925,8 +955,27 @@ pub fn save_subtitle_segments_file(
         return Err("没有可导出的字幕内容".to_string());
     }
 
-    let subtitle_text = serialize_subtitle(&segments, normalize_subtitle_format(&output_format));
+    let settings = settings_store.load()?;
+    let output_format = normalize_subtitle_format(&output_format);
+    let subtitle_text =
+        serialize_segments_for_export(&segments, output_format, Some(&settings_store), &settings)?;
     save_transcription_file(path, subtitle_text)
+}
+
+pub(crate) fn serialize_segments_for_export(
+    segments: &[TranscriptionSegment],
+    output_format: SubtitleFormat,
+    settings_store: Option<&SettingsStore>,
+    settings: &AppSettings,
+) -> Result<String, String> {
+    if matches!(output_format, SubtitleFormat::Ass) {
+        if let Some(store) = settings_store {
+            let style = get_selected_subtitle_style(store, &settings.selected_subtitle_style_id)?;
+            return Ok(serialize_styled_ass(segments, &style));
+        }
+    }
+
+    Ok(serialize_subtitle(segments, output_format))
 }
 
 fn log_transcription_settings(log_session: &LogSession, settings: &AppSettings) {

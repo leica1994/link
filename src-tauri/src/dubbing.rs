@@ -29,6 +29,8 @@ use crate::dubbing_alignment::{
 use crate::dubbing_compose::{run_dubbing_compose, DubbingComposeInput, DubbingComposeProgress};
 use crate::htdemucs::{self, HtDemucsProgress};
 use crate::settings::SettingsStore;
+use crate::subtitle_export::serialize_styled_ass;
+use crate::subtitle_style::get_selected_subtitle_style;
 use crate::transcription::{serialize_subtitle, SubtitleFormat, TranscriptionSegment};
 
 const EDGE_TTS_ENGINE: &str = "edge-tts";
@@ -1844,51 +1846,54 @@ fn start_dubbing_task_blocking(
         emit_video_compose_progress(&progress_app, &progress_task_id, progress).map(|_| ())
     }) {
         Ok(compose_result) => {
-            let final_subtitle_result =
-                match generate_final_subtitle(&snapshot, &compose_result.final_video_path) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let now = Utc::now().to_rfc3339();
-                        let failed_snapshot = store.with_connection(|connection| {
-                            let stage_snapshot = stage_snapshot_with_error(
-                                compose_result.stage_snapshot.clone(),
-                                &error,
-                            );
-                            update_dubbing_task_state(
-                                connection,
-                                &request.task_id,
-                                DUBBING_STAGE_VIDEO_COMPOSE,
-                                DUBBING_STATUS_FAILED,
-                                99,
-                                "最终字幕生成失败",
-                                &error,
-                                None,
-                                &now,
-                            )?;
-                            upsert_dubbing_stage(
-                                connection,
-                                &request.task_id,
-                                DUBBING_STAGE_VIDEO_COMPOSE,
-                                99,
-                                "最终字幕生成失败",
-                                "failed",
-                                stage_snapshot,
-                                &now,
-                            )?;
-                            read_dubbing_task_snapshot_by_id(connection, &request.task_id)
-                        })?;
-                        emit_dubbing_progress(&app, &failed_snapshot);
-                        log_session.error(
-                            "final_subtitle_failed",
-                            "最终字幕生成失败",
-                            json!({
-                                "taskId": &request.task_id,
-                                "error": &error,
-                            }),
+            let final_subtitle_result = match generate_final_subtitle(
+                &snapshot,
+                &compose_result.final_video_path,
+                store.inner(),
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let now = Utc::now().to_rfc3339();
+                    let failed_snapshot = store.with_connection(|connection| {
+                        let stage_snapshot = stage_snapshot_with_error(
+                            compose_result.stage_snapshot.clone(),
+                            &error,
                         );
-                        return Err(error);
-                    }
-                };
+                        update_dubbing_task_state(
+                            connection,
+                            &request.task_id,
+                            DUBBING_STAGE_VIDEO_COMPOSE,
+                            DUBBING_STATUS_FAILED,
+                            99,
+                            "最终字幕生成失败",
+                            &error,
+                            None,
+                            &now,
+                        )?;
+                        upsert_dubbing_stage(
+                            connection,
+                            &request.task_id,
+                            DUBBING_STAGE_VIDEO_COMPOSE,
+                            99,
+                            "最终字幕生成失败",
+                            "failed",
+                            stage_snapshot,
+                            &now,
+                        )?;
+                        read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+                    })?;
+                    emit_dubbing_progress(&app, &failed_snapshot);
+                    log_session.error(
+                        "final_subtitle_failed",
+                        "最终字幕生成失败",
+                        json!({
+                            "taskId": &request.task_id,
+                            "error": &error,
+                        }),
+                    );
+                    return Err(error);
+                }
+            };
 
             let now = Utc::now().to_rfc3339();
             let final_subtitle_path = path_to_string(&final_subtitle_result.output_path);
@@ -3720,6 +3725,7 @@ fn final_subtitle_metadata_matches(snapshot: &DubbingTaskSnapshot) -> bool {
 fn generate_final_subtitle(
     snapshot: &DubbingTaskSnapshot,
     final_video_path: &Path,
+    settings_store: &SettingsStore,
 ) -> Result<DubbingFinalSubtitleResult, String> {
     let source_subtitle_path = final_subtitle_source_path(snapshot)?;
     let aligned_subtitle_path = artifact_path(
@@ -3750,7 +3756,7 @@ fn generate_final_subtitle(
     let aligned_segment_count = aligned_segments.len();
     let (segments, synced_segment_count) =
         sync_final_subtitle_segments(source_segments, aligned_segments);
-    let subtitle_text = serialize_dubbing_final_subtitle(&segments, &format);
+    let subtitle_text = serialize_dubbing_final_subtitle(&segments, &format, settings_store)?;
     fs::write(&output_path, subtitle_text).map_err(|error| format!("无法保存最终字幕: {error}"))?;
     ensure_non_empty_file(&output_path, "最终字幕为空")?;
 
@@ -3798,16 +3804,25 @@ fn sync_final_subtitle_segments(
     (segments, synced_count)
 }
 
-fn serialize_dubbing_final_subtitle(segments: &[TranscriptionSegment], format: &str) -> String {
+fn serialize_dubbing_final_subtitle(
+    segments: &[TranscriptionSegment],
+    format: &str,
+    settings_store: &SettingsStore,
+) -> Result<String, String> {
     match format {
-        "vtt" => serialize_subtitle(segments, SubtitleFormat::Vtt),
-        "ass" | "ssa" => serialize_subtitle(segments, SubtitleFormat::Ass),
-        "lrc" => serialize_lrc(segments),
-        "sbv" => serialize_sbv(segments),
-        "smi" | "sami" => serialize_sami(segments),
-        "ttml" | "dfxp" => serialize_ttml(segments),
-        "txt" => serialize_txt(segments),
-        _ => serialize_subtitle(segments, SubtitleFormat::Srt),
+        "vtt" => Ok(serialize_subtitle(segments, SubtitleFormat::Vtt)),
+        "ass" | "ssa" => {
+            let settings = settings_store.load()?;
+            let style =
+                get_selected_subtitle_style(settings_store, &settings.selected_subtitle_style_id)?;
+            Ok(serialize_styled_ass(segments, &style))
+        }
+        "lrc" => Ok(serialize_lrc(segments)),
+        "sbv" => Ok(serialize_sbv(segments)),
+        "smi" | "sami" => Ok(serialize_sami(segments)),
+        "ttml" | "dfxp" => Ok(serialize_ttml(segments)),
+        "txt" => Ok(serialize_txt(segments)),
+        _ => Ok(serialize_subtitle(segments, SubtitleFormat::Srt)),
     }
 }
 

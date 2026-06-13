@@ -1,7 +1,23 @@
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::SettingsStore;
+
+const SUBTITLE_STYLE_COLUMNS: &str = "
+    id, name, is_default,
+    render_mode, subtitle_layout, preview_text_mode,
+    primary_font_name, primary_font_size, primary_color,
+    primary_outline_color, primary_outline_width, primary_spacing,
+    primary_margin_bottom,
+    secondary_font_name, secondary_font_size, secondary_color,
+    secondary_outline_color, secondary_outline_width, secondary_spacing,
+    vertical_spacing,
+    rounded_font_name, rounded_font_size, rounded_text_color,
+    rounded_background_color, rounded_corner_radius, rounded_padding_x,
+    rounded_padding_y, rounded_margin_bottom, rounded_line_spacing,
+    rounded_letter_spacing,
+    created_at, updated_at
+";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -249,6 +265,61 @@ pub fn get_subtitle_style(
 }
 
 #[tauri::command]
+pub fn select_subtitle_style(
+    store: tauri::State<'_, SettingsStore>,
+    id: String,
+) -> Result<(), String> {
+    let exists = store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM subtitle_styles WHERE id = ?1)",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(|error| format!("无法检查字幕样式: {error}"))
+    })?;
+
+    if !exists {
+        return Err("字幕样式不存在".to_string());
+    }
+
+    store.set_selected_subtitle_style_id(&id)
+}
+
+pub(crate) fn get_selected_subtitle_style(
+    store: &SettingsStore,
+    selected_style_id: &str,
+) -> Result<SubtitleStyle, String> {
+    store.with_connection(|connection| {
+        let selected_id = selected_style_id.trim();
+        if !selected_id.is_empty() {
+            if let Some(style) = connection
+                .query_row(
+                    &format!("SELECT {SUBTITLE_STYLE_COLUMNS} FROM subtitle_styles WHERE id = ?1"),
+                    params![selected_id],
+                    subtitle_style_from_row,
+                )
+                .optional()
+                .map_err(|error| format!("无法获取当前字幕样式: {error}"))?
+            {
+                return Ok(style);
+            }
+        }
+
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {SUBTITLE_STYLE_COLUMNS} FROM subtitle_styles ORDER BY is_default DESC, created_at ASC LIMIT 1"
+                ),
+                [],
+                subtitle_style_from_row,
+            )
+            .map_err(|error| format!("无法获取默认字幕样式: {error}"))
+    })
+}
+
+#[tauri::command]
 pub fn create_subtitle_style(
     store: tauri::State<'_, SettingsStore>,
     request: CreateSubtitleStyleRequest,
@@ -338,7 +409,7 @@ pub fn create_subtitle_style(
                 FROM subtitle_styles
                 WHERE id = ?1
                 ",
-                params![id],
+                params![&id],
                 |row| {
                     Ok(SubtitleStyle {
                         id: row.get(0)?,
@@ -534,7 +605,7 @@ pub fn delete_subtitle_style(
         let is_default: i64 = connection
             .query_row(
                 "SELECT is_default FROM subtitle_styles WHERE id = ?1",
-                params![id],
+                params![&id],
                 |row| row.get(0),
             )
             .map_err(|error| format!("无法查询字幕样式: {error}"))?;
@@ -544,9 +615,53 @@ pub fn delete_subtitle_style(
         }
 
         connection
-            .execute("DELETE FROM subtitle_styles WHERE id = ?1", params![id])
+            .execute("DELETE FROM subtitle_styles WHERE id = ?1", params![&id])
             .map_err(|error| format!("无法删除字幕样式: {error}"))?;
 
         Ok(())
+    })?;
+
+    let settings = store.load()?;
+    if settings.selected_subtitle_style_id == id {
+        store.set_selected_subtitle_style_id("default")?;
+    }
+
+    Ok(())
+}
+
+fn subtitle_style_from_row(row: &Row<'_>) -> rusqlite::Result<SubtitleStyle> {
+    Ok(SubtitleStyle {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        is_default: row.get::<_, i64>(2)? != 0,
+        render_mode: row.get(3)?,
+        subtitle_layout: row.get(4)?,
+        preview_text_mode: row.get(5)?,
+        primary_font_name: row.get(6)?,
+        primary_font_size: row.get(7)?,
+        primary_color: row.get(8)?,
+        primary_outline_color: row.get(9)?,
+        primary_outline_width: row.get(10)?,
+        primary_spacing: row.get(11)?,
+        primary_margin_bottom: row.get(12)?,
+        secondary_font_name: row.get(13)?,
+        secondary_font_size: row.get(14)?,
+        secondary_color: row.get(15)?,
+        secondary_outline_color: row.get(16)?,
+        secondary_outline_width: row.get(17)?,
+        secondary_spacing: row.get(18)?,
+        vertical_spacing: row.get(19)?,
+        rounded_font_name: row.get(20)?,
+        rounded_font_size: row.get(21)?,
+        rounded_text_color: row.get(22)?,
+        rounded_background_color: row.get(23)?,
+        rounded_corner_radius: row.get(24)?,
+        rounded_padding_x: row.get(25)?,
+        rounded_padding_y: row.get(26)?,
+        rounded_margin_bottom: row.get(27)?,
+        rounded_line_spacing: row.get(28)?,
+        rounded_letter_spacing: row.get(29)?,
+        created_at: row.get(30)?,
+        updated_at: row.get(31)?,
     })
 }

@@ -88,6 +88,7 @@
                     <span class="subtitle-style-item-meta">
                       {{ getOptionLabel(renderModeOptions, style.renderMode) }}
                       <span v-if="style.isDefault"> · 默认</span>
+                      <span v-if="exportStyleId === style.id"> · 导出</span>
                     </span>
                   </span>
                 </span>
@@ -746,6 +747,7 @@ import {
   Type,
 } from 'lucide-vue-next'
 import previewBackgroundUrl from '../assets/subtitle-preview-default.jpg'
+import { normalizeSettings, type AppSettings } from '../settingsModel'
 
 defineOptions({ name: 'SubtitleStyle' })
 
@@ -874,6 +876,7 @@ const previewTextSamples: Record<PreviewTextMode, { source: string; target: stri
 
 const styles = ref<SubtitleStyle[]>([])
 const selectedStyleId = ref('')
+const exportStyleId = ref('default')
 const draftStyle = ref<SubtitleStyle>(createDefaultStyle())
 const styleError = ref('')
 const activeChoiceDialog = ref<ChoiceDialog | null>(null)
@@ -1035,22 +1038,43 @@ const roundedLineStyle = computed<CSSProperties>(() => ({
 
 const loadStyles = async () => {
   try {
-    const result = await invoke<SubtitleStyle[]>('list_subtitle_styles')
+    const [result, storedSettings] = await Promise.all([
+      invoke<SubtitleStyle[]>('list_subtitle_styles'),
+      invoke<Partial<AppSettings>>('load_settings'),
+    ])
     styles.value = result.map(normalizeStyle)
+    exportStyleId.value = normalizeSettings(storedSettings).selectedSubtitleStyleId
 
-    const selected = styles.value.find((style) => style.id === selectedStyleId.value) ?? styles.value[0]
+    const selected =
+      styles.value.find((style) => style.id === exportStyleId.value) ??
+      styles.value.find((style) => style.id === selectedStyleId.value) ??
+      styles.value[0]
     if (selected) {
-      selectStyle(selected)
+      selectStyle(selected, false)
     }
   } catch (error) {
     styleError.value = `加载字幕样式失败: ${stringifyError(error)}`
   }
 }
 
-const selectStyle = (style: SubtitleStyle) => {
+const selectStyle = (style: SubtitleStyle, shouldPersist = true) => {
   selectedStyleId.value = style.id
+  exportStyleId.value = style.id
   draftStyle.value = cloneStyle(normalizeStyle(style))
   styleError.value = ''
+
+  if (shouldPersist) {
+    void persistExportStyle(style.id)
+  }
+}
+
+const persistExportStyle = async (id: string) => {
+  try {
+    await invoke('select_subtitle_style', { id })
+    exportStyleId.value = id
+  } catch (error) {
+    styleError.value = `保存导出字幕样式失败: ${stringifyError(error)}`
+  }
 }
 
 const saveCurrentStyle = async () => {
@@ -1168,6 +1192,7 @@ const confirmDeleteStyle = async () => {
       selectStyle(nextStyle)
     } else {
       selectedStyleId.value = ''
+      exportStyleId.value = 'default'
       draftStyle.value = createDefaultStyle()
     }
     closeDeleteDialog()
