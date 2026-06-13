@@ -130,7 +130,7 @@
               <span class="subtitle-preview-badge">{{ previewTextModeLabel }}</span>
             </div>
 
-            <div ref="previewViewportRef" class="subtitle-preview-viewport">
+            <div ref="previewViewportRef" class="subtitle-preview-viewport" :style="previewViewportStyle">
               <div class="subtitle-preview-stage" :style="previewStageStyle">
                 <img class="subtitle-preview-image" :src="previewBackgroundUrl" alt="" draggable="false" />
                 <div
@@ -821,6 +821,10 @@ const previewStageStyle = computed<CSSProperties>(() => ({
   transform: `scale(${previewScale.value})`,
 }))
 
+const previewViewportStyle = computed<CSSProperties>(() => ({
+  height: `${Math.round(previewHeight * previewScale.value)}px`,
+}))
+
 const assOverlayStyle = computed<CSSProperties>(() => ({
   bottom: `${clampNumber(draftStyle.value.primaryMarginBottom, 0, 260)}px`,
   gap: `${clampNumber(draftStyle.value.verticalSpacing, 0, 120)}px`,
@@ -1421,7 +1425,6 @@ html[data-theme='dark'] .subtitle-preview-badge {
 .subtitle-preview-viewport {
   overflow: hidden;
   width: 100%;
-  min-height: min(48vw, 720px);
   border-radius: 14px;
   background: linear-gradient(135deg, #1a1d29 0%, #2d1b2e 50%, #1f2937 100%);
 }
@@ -1573,10 +1576,6 @@ html[data-theme='dark'] .subtitle-preview-badge {
   .subtitle-preview-toolbar {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .subtitle-preview-viewport {
-    min-height: min(58vw, 720px);
   }
 
   .subtitle-text-input,
