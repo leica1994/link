@@ -28,6 +28,7 @@ const SUBTITLE_SOURCE_MANUAL: &str = "manual";
 const SUBTITLE_SOURCE_AUTOMATIC: &str = "automatic";
 const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
 const YTDLP_YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=default,-android_vr";
+const YTDLP_YOUTUBE_DETAIL_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=ios";
 const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 const THUMBNAIL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
@@ -1038,7 +1039,7 @@ fn fetch_video_detail(url: &str, proxy: &str) -> Result<VideoDetail, String> {
         "--no-warnings",
         "--no-progress",
         "--extractor-args",
-        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
+        YTDLP_YOUTUBE_DETAIL_EXTRACTOR_ARGS,
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
@@ -1122,10 +1123,11 @@ fn download_subtitle_file(
     let mut command = ytdlp_command(proxy);
     command.args([
         "--skip-download",
+        "--ignore-no-formats-error",
         "--no-playlist",
         "--no-warnings",
         "--extractor-args",
-        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
+        YTDLP_YOUTUBE_DETAIL_EXTRACTOR_ARGS,
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
