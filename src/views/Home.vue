@@ -2302,11 +2302,17 @@ const registerHomeWorkbenchProgressListener = async () => {
   })
 }
 
-const setDownloadProgress = (payload: HomeVideoDownloadProgress) => {
+const setDownloadProgress = (payload: HomeVideoDownloadProgress, options: { reset?: boolean } = {}) => {
   const next = new Map(downloadProgressByKey.value)
-  next.set(downloadProgressKey(payload.taskId, payload.kind, payload.key), {
+  const key = downloadProgressKey(payload.taskId, payload.kind, payload.key)
+  const previous = options.reset ? null : next.get(key)
+  const incomingProgress = clampProgress(payload.progress)
+  const shouldKeepPreviousProgress =
+    payload.status === 'active' && previous?.status === 'active' && previous.progress > incomingProgress
+
+  next.set(key, {
     ...payload,
-    progress: clampProgress(payload.progress),
+    progress: shouldKeepPreviousProgress ? previous.progress : incomingProgress,
   })
   downloadProgressByKey.value = next
 }
@@ -2397,7 +2403,7 @@ const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
     message: '准备下载字幕',
     language: option.language,
     sourceKind: option.sourceKind,
-  })
+  }, { reset: true })
   clearTaskError(subtitleErrorsByTaskId, task.id)
 
   try {
@@ -2445,7 +2451,7 @@ const downloadVideo = async () => {
     progress: 2,
     status: 'active',
     message: isContinuing ? '准备继续下载视频' : '准备下载视频',
-  })
+  }, { reset: true })
   clearTaskError(videoErrorsByTaskId, taskId)
 
   try {
