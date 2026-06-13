@@ -5,6 +5,7 @@ mod dubbing;
 mod dubbing_alignment;
 mod dubbing_compose;
 mod home_tasks;
+mod home_workbench;
 mod htdemucs;
 mod settings;
 mod subtitle_ai;
@@ -24,6 +25,7 @@ use home_tasks::{
     download_home_video_task_video, get_home_video_task, list_home_video_tasks,
     refresh_home_video_task_detail,
 };
+use home_workbench::{get_home_workbench, save_home_workbench_options, start_home_workbench};
 use settings::{load_settings, save_settings, SettingsStore};
 use subtitle_translation::{
     load_subtitle_preview, save_subtitle_translation_file, start_subtitle_translation,
@@ -122,6 +124,9 @@ pub fn run() {
             refresh_home_video_task_detail,
             download_home_video_task_subtitle,
             download_home_video_task_video,
+            get_home_workbench,
+            save_home_workbench_options,
+            start_home_workbench,
             get_ytdlp_status,
             list_youtube_channels,
             add_youtube_channel,

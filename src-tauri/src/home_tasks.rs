@@ -571,6 +571,13 @@ fn download_home_video_task_subtitle_blocking(
     app: AppHandle,
     request: DownloadHomeVideoTaskSubtitleRequest,
 ) -> Result<HomeVideoTask, String> {
+    download_home_video_task_subtitle_internal(app, request)
+}
+
+pub(crate) fn download_home_video_task_subtitle_internal(
+    app: AppHandle,
+    request: DownloadHomeVideoTaskSubtitleRequest,
+) -> Result<HomeVideoTask, String> {
     let store = app.state::<SettingsStore>();
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
@@ -611,6 +618,13 @@ fn download_home_video_task_subtitle_blocking(
 }
 
 fn download_home_video_task_video_blocking(
+    app: AppHandle,
+    request: HomeVideoTaskRequest,
+) -> Result<HomeVideoTask, String> {
+    download_home_video_task_video_internal(app, request)
+}
+
+pub(crate) fn download_home_video_task_video_internal(
     app: AppHandle,
     request: HomeVideoTaskRequest,
 ) -> Result<HomeVideoTask, String> {
@@ -676,7 +690,7 @@ fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVi
     Ok(tasks)
 }
 
-fn read_home_video_task_by_id(
+pub(crate) fn read_home_video_task_by_id(
     connection: &rusqlite::Connection,
     task_id: &str,
 ) -> Result<HomeVideoTask, String> {

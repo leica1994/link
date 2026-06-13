@@ -10,6 +10,7 @@ const MODELS_DIR_NAME: &str = "models";
 const RNNOISE_DIR_NAME: &str = "arnndn";
 const TEMP_DIR_NAME: &str = "temp";
 const WEBVIEW_DIR_NAME: &str = "webview";
+const EXPORTS_DIR_NAME: &str = "exports";
 const YOUTUBE_TASKS_DIR_NAME: &str = "youtube_tasks";
 
 pub fn app_data_dir() -> Result<PathBuf, String> {
@@ -73,6 +74,12 @@ pub fn webview_data_dir() -> Result<PathBuf, String> {
     fs::create_dir_all(&webview_dir)
         .map_err(|error| format!("无法创建 WebView 缓存目录: {error}"))?;
     Ok(webview_dir)
+}
+
+pub fn exports_dir() -> Result<PathBuf, String> {
+    let exports_dir = ensure_app_data_dir()?.join(EXPORTS_DIR_NAME);
+    fs::create_dir_all(&exports_dir).map_err(|error| format!("无法创建导出目录: {error}"))?;
+    Ok(exports_dir)
 }
 
 pub fn youtube_task_dir(task_id: &str) -> Result<PathBuf, String> {

@@ -620,6 +620,17 @@ pub async fn start_transcription(
     app_logger: tauri::State<'_, AppLogger>,
     request: TranscriptionRequest,
 ) -> Result<TranscriptionResult, String> {
+    let settings = settings_store.load()?;
+    run_transcription_workflow(app, &ai_service, &app_logger, request, settings).await
+}
+
+pub(crate) async fn run_transcription_workflow(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: TranscriptionRequest,
+    settings: AppSettings,
+) -> Result<TranscriptionResult, String> {
     let log_session = app_logger.start_session("transcription")?;
     log_session.info(
         "request_received",
@@ -632,7 +643,6 @@ pub async fn start_transcription(
         }),
     );
 
-    let settings = settings_store.load()?;
     log_transcription_settings(&log_session, &settings);
 
     let workflow_progress = WorkflowProgress::new(app.clone());
@@ -744,7 +754,7 @@ pub async fn start_transcription(
         };
         let segmentation_result = smart_segment_subtitles(
             &settings,
-            &ai_service,
+            ai_service,
             &log_session,
             segments,
             &mut report_snapshot,
@@ -810,7 +820,7 @@ pub async fn start_transcription(
         };
         let correction_result = correct_subtitles(
             &settings,
-            &ai_service,
+            ai_service,
             &log_session,
             segments,
             &mut report_snapshot,

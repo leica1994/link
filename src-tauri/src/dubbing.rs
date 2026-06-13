@@ -78,6 +78,8 @@ const DUBBING_ARTIFACT_AUDIO_VIDEO_ALIGNMENT_MANIFEST: &str = "audio-video-align
 const DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO: &str = "final-dubbed-video";
 const DUBBING_ARTIFACT_FINAL_SUBTITLE: &str = "final-subtitle";
 const DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST: &str = "video-compose-manifest";
+pub(crate) const DUBBING_FINAL_DUBBED_VIDEO_ARTIFACT: &str = DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO;
+pub(crate) const DUBBING_FINAL_SUBTITLE_ARTIFACT: &str = DUBBING_ARTIFACT_FINAL_SUBTITLE;
 const DUBBING_REFERENCE_AUDIO_EXISTING: &str = "existing-dubbing";
 const DUBBING_REFERENCE_AUDIO_CUSTOM: &str = "custom-audio-file";
 const DUBBING_VIDEO_EXTENSIONS: &[&str] =
@@ -596,6 +598,14 @@ pub fn prepare_dubbing_material(
     store: tauri::State<'_, SettingsStore>,
     request: PrepareDubbingMaterialRequest,
 ) -> Result<DubbingTaskSnapshot, String> {
+    prepare_dubbing_material_internal(app, &store, request)
+}
+
+pub(crate) fn prepare_dubbing_material_internal(
+    app: AppHandle,
+    store: &SettingsStore,
+    request: PrepareDubbingMaterialRequest,
+) -> Result<DubbingTaskSnapshot, String> {
     let video_path = canonical_material_path(&request.video_path, "视频文件不存在")?;
     let subtitle_path = canonical_material_path(&request.subtitle_path, "字幕文件不存在")?;
     ensure_supported_extension(&video_path, DUBBING_VIDEO_EXTENSIONS, "不支持的视频格式")?;
@@ -848,6 +858,13 @@ pub fn prepare_dubbing_material(
 
 #[tauri::command]
 pub async fn start_dubbing_task(
+    app: AppHandle,
+    request: StartDubbingTaskRequest,
+) -> Result<DubbingTaskSnapshot, String> {
+    start_dubbing_task_internal(app, request).await
+}
+
+pub(crate) async fn start_dubbing_task_internal(
     app: AppHandle,
     request: StartDubbingTaskRequest,
 ) -> Result<DubbingTaskSnapshot, String> {

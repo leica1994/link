@@ -138,6 +138,17 @@ pub async fn start_subtitle_translation(
     app_logger: tauri::State<'_, AppLogger>,
     request: SubtitleTranslationRequest,
 ) -> Result<SubtitleTranslationResult, String> {
+    let settings = settings_store.load()?;
+    run_subtitle_translation_workflow(app, &ai_service, &app_logger, request, settings).await
+}
+
+pub(crate) async fn run_subtitle_translation_workflow(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: SubtitleTranslationRequest,
+    settings: AppSettings,
+) -> Result<SubtitleTranslationResult, String> {
     let log_session = app_logger.start_session("subtitle_translation")?;
     log_session.info(
         "request_received",
@@ -145,7 +156,6 @@ pub async fn start_subtitle_translation(
         json!({ "filePath": &request.file_path }),
     );
 
-    let settings = settings_store.load()?;
     log_translation_settings(&log_session, &settings);
 
     let input_path = PathBuf::from(&request.file_path);
@@ -210,7 +220,7 @@ pub async fn start_subtitle_translation(
 
         let translation_result = translate_subtitles(
             &settings,
-            &ai_service,
+            ai_service,
             &log_session,
             &source_segments,
             translated_segments,
@@ -259,7 +269,7 @@ pub async fn start_subtitle_translation(
 
             let optimization_result = optimize_translated_subtitles(
                 &settings,
-                &ai_service,
+                ai_service,
                 &log_session,
                 &source_segments,
                 translated_segments,

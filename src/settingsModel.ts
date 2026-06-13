@@ -86,6 +86,9 @@ export type AppSettings = {
   dubbingCustomReferenceAudioPath: string
   dubbingIsBackgroundMusicEnabled: boolean
   dubbingBackgroundMusicVolume: number
+  homeWorkbenchTranslationEnabled: boolean
+  homeWorkbenchDubbingEnabled: boolean
+  homeWorkbenchExportDir: string
   youtubeMonitorProxy: string
 }
 
@@ -511,6 +514,14 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
       ? settings.dubbingIsBackgroundMusicEnabled
       : true,
   dubbingBackgroundMusicVolume: readNumberSetting(settings.dubbingBackgroundMusicVolume, 0.5, 0, 1),
+  homeWorkbenchTranslationEnabled:
+    typeof settings.homeWorkbenchTranslationEnabled === 'boolean' ? settings.homeWorkbenchTranslationEnabled : true,
+  homeWorkbenchDubbingEnabled:
+    typeof settings.homeWorkbenchDubbingEnabled === 'boolean'
+      ? settings.homeWorkbenchDubbingEnabled && (settings.homeWorkbenchTranslationEnabled ?? true)
+      : false,
+  homeWorkbenchExportDir:
+    typeof settings.homeWorkbenchExportDir === 'string' ? settings.homeWorkbenchExportDir : '',
   youtubeMonitorProxy: typeof settings.youtubeMonitorProxy === 'string' ? settings.youtubeMonitorProxy : '',
 })
 

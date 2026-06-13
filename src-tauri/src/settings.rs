@@ -46,6 +46,9 @@ pub struct AppSettings {
     pub dubbing_custom_reference_audio_path: String,
     pub dubbing_is_background_music_enabled: bool,
     pub dubbing_background_music_volume: f64,
+    pub home_workbench_translation_enabled: bool,
+    pub home_workbench_dubbing_enabled: bool,
+    pub home_workbench_export_dir: String,
     pub youtube_monitor_proxy: String,
 }
 
@@ -157,6 +160,21 @@ impl SettingsStore {
                 &setting_values,
                 "dubbing_background_music_volume",
                 0.5,
+            ),
+            home_workbench_translation_enabled: read_bool_setting(
+                &setting_values,
+                "home_workbench_translation_enabled",
+                true,
+            ),
+            home_workbench_dubbing_enabled: read_bool_setting(
+                &setting_values,
+                "home_workbench_dubbing_enabled",
+                false,
+            ),
+            home_workbench_export_dir: read_string_setting(
+                &setting_values,
+                "home_workbench_export_dir",
+                "",
             ),
             youtube_monitor_proxy: read_string_setting(
                 &setting_values,
@@ -280,6 +298,21 @@ impl SettingsStore {
             &transaction,
             "dubbing_background_music_volume",
             &settings.dubbing_background_music_volume.to_string(),
+        )?;
+        upsert_setting(
+            &transaction,
+            "home_workbench_translation_enabled",
+            bool_to_text(settings.home_workbench_translation_enabled),
+        )?;
+        upsert_setting(
+            &transaction,
+            "home_workbench_dubbing_enabled",
+            bool_to_text(settings.home_workbench_dubbing_enabled),
+        )?;
+        upsert_setting(
+            &transaction,
+            "home_workbench_export_dir",
+            &settings.home_workbench_export_dir,
         )?;
         upsert_setting(
             &transaction,
@@ -539,6 +572,35 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS home_workbench_tasks (
+                task_id TEXT PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idle',
+                current_stage TEXT NOT NULL DEFAULT '',
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                stages TEXT NOT NULL DEFAULT '{}',
+                options TEXT NOT NULL DEFAULT '{}',
+                warnings TEXT NOT NULL DEFAULT '[]',
+                error_message TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS home_workbench_artifacts (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, kind),
+                FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_youtube_channels_updated_at
                 ON youtube_channels(updated_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_seen
@@ -557,6 +619,10 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON home_video_task_subtitles(task_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_task_videos_task
                 ON home_video_task_videos(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_workbench_tasks_updated_at
+                ON home_workbench_tasks(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_workbench_artifacts_task
+                ON home_workbench_artifacts(task_id, updated_at);
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;

@@ -428,6 +428,67 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="home-workbench-settings-title">
+        <div id="home-workbench-settings-title" class="section-heading">
+          <Workflow aria-hidden="true" />
+          <span>主页工作台</span>
+        </div>
+
+        <div class="settings-panel">
+          <div class="setting-row">
+            <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">默认翻译与优化</div>
+              <div class="setting-subtitle">开启后主页待办工作台会默认执行字幕翻译与优化</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: homeWorkbenchTranslationEnabled }"
+              type="button"
+              :aria-pressed="homeWorkbenchTranslationEnabled"
+              @click="toggleHomeWorkbenchTranslation"
+            >
+              <span class="setting-toggle-label">{{ homeWorkbenchTranslationEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <MicVocal class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">默认配音</div>
+              <div class="setting-subtitle">开启后主页待办工作台会在翻译后继续生成配音视频</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: homeWorkbenchDubbingEnabled }"
+              type="button"
+              :aria-pressed="homeWorkbenchDubbingEnabled"
+              :disabled="!homeWorkbenchTranslationEnabled"
+              @click="toggleHomeWorkbenchDubbing"
+            >
+              <span class="setting-toggle-label">{{ homeWorkbenchDubbingEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <FolderOpen class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">默认导出目录</div>
+              <div class="setting-subtitle">{{ homeWorkbenchExportDirLabel }}</div>
+            </div>
+            <button class="settings-action" type="button" @click="selectHomeWorkbenchExportDir">
+              选择目录
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="log-settings-title">
         <div id="log-settings-title" class="section-heading">
           <FolderOpen aria-hidden="true" />
@@ -791,6 +852,7 @@ import {
   Timer,
   Volume2,
   WandSparkles,
+  Workflow,
   X,
 } from 'lucide-vue-next'
 import { useTheme } from '../composables/useTheme'
@@ -889,6 +951,9 @@ type AppSettings = {
   dubbingCustomReferenceAudioPath: string
   dubbingIsBackgroundMusicEnabled: boolean
   dubbingBackgroundMusicVolume: number
+  homeWorkbenchTranslationEnabled: boolean
+  homeWorkbenchDubbingEnabled: boolean
+  homeWorkbenchExportDir: string
   youtubeMonitorProxy: string
 }
 
@@ -1306,6 +1371,14 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
       ? settings.dubbingIsBackgroundMusicEnabled
       : true,
   dubbingBackgroundMusicVolume: readNumberSetting(settings.dubbingBackgroundMusicVolume, 0.5, 0, 1),
+  homeWorkbenchTranslationEnabled:
+    typeof settings.homeWorkbenchTranslationEnabled === 'boolean' ? settings.homeWorkbenchTranslationEnabled : true,
+  homeWorkbenchDubbingEnabled:
+    typeof settings.homeWorkbenchDubbingEnabled === 'boolean'
+      ? settings.homeWorkbenchDubbingEnabled && (settings.homeWorkbenchTranslationEnabled ?? true)
+      : false,
+  homeWorkbenchExportDir:
+    typeof settings.homeWorkbenchExportDir === 'string' ? settings.homeWorkbenchExportDir : '',
   youtubeMonitorProxy: typeof settings.youtubeMonitorProxy === 'string' ? settings.youtubeMonitorProxy : '',
 })
 
@@ -1345,6 +1418,9 @@ const draftCustomReferenceAudioPath = ref('')
 const isReferenceAudioDialogOpen = ref(false)
 const dubbingIsBackgroundMusicEnabled = ref(true)
 const dubbingBackgroundMusicVolume = ref(0.5)
+const homeWorkbenchTranslationEnabled = ref(true)
+const homeWorkbenchDubbingEnabled = ref(false)
+const homeWorkbenchExportDir = ref('')
 const youtubeMonitorProxy = ref('')
 const logDirectoryError = ref('')
 const isSettingsLoaded = ref(false)
@@ -1445,6 +1521,10 @@ const draftCustomReferenceAudioFileName = computed(() => {
   return draftCustomReferenceAudioPath.value ? fileNameFromPath(draftCustomReferenceAudioPath.value) : '未选择音频'
 })
 
+const homeWorkbenchExportDirLabel = computed(() => {
+  return homeWorkbenchExportDir.value || '未选择时使用应用默认导出目录'
+})
+
 const filteredTargetLanguageOptions = computed(() => {
   const query = targetLanguageSearch.value.trim().toLowerCase()
 
@@ -1481,6 +1561,9 @@ const createSettingsSnapshot = (): AppSettings => ({
   dubbingCustomReferenceAudioPath: dubbingCustomReferenceAudioPath.value,
   dubbingIsBackgroundMusicEnabled: dubbingIsBackgroundMusicEnabled.value,
   dubbingBackgroundMusicVolume: dubbingBackgroundMusicVolume.value,
+  homeWorkbenchTranslationEnabled: homeWorkbenchTranslationEnabled.value,
+  homeWorkbenchDubbingEnabled: homeWorkbenchDubbingEnabled.value,
+  homeWorkbenchExportDir: homeWorkbenchExportDir.value.trim(),
   youtubeMonitorProxy: youtubeMonitorProxy.value.trim(),
 })
 
@@ -1510,6 +1593,10 @@ const applySettings = (settings: AppSettings) => {
   dubbingCustomReferenceAudioPath.value = settings.dubbingCustomReferenceAudioPath
   dubbingIsBackgroundMusicEnabled.value = settings.dubbingIsBackgroundMusicEnabled
   dubbingBackgroundMusicVolume.value = settings.dubbingBackgroundMusicVolume
+  homeWorkbenchTranslationEnabled.value = settings.homeWorkbenchTranslationEnabled
+  homeWorkbenchDubbingEnabled.value =
+    settings.homeWorkbenchDubbingEnabled && settings.homeWorkbenchTranslationEnabled
+  homeWorkbenchExportDir.value = settings.homeWorkbenchExportDir
   youtubeMonitorProxy.value = settings.youtubeMonitorProxy
   resetLlmConnectionStatus()
 
@@ -1732,6 +1819,36 @@ const selectCustomReferenceAudioFile = async () => {
 
 const clearCustomReferenceAudioFile = () => {
   draftCustomReferenceAudioPath.value = ''
+}
+
+const toggleHomeWorkbenchTranslation = () => {
+  homeWorkbenchTranslationEnabled.value = !homeWorkbenchTranslationEnabled.value
+  if (!homeWorkbenchTranslationEnabled.value) {
+    homeWorkbenchDubbingEnabled.value = false
+  }
+}
+
+const toggleHomeWorkbenchDubbing = () => {
+  if (!homeWorkbenchTranslationEnabled.value) {
+    return
+  }
+  homeWorkbenchDubbingEnabled.value = !homeWorkbenchDubbingEnabled.value
+}
+
+const selectHomeWorkbenchExportDir = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  const selected = await open({
+    title: '选择默认导出目录',
+    directory: true,
+    multiple: false,
+  })
+
+  if (typeof selected === 'string') {
+    homeWorkbenchExportDir.value = selected
+  }
 }
 
 const openTargetLanguageDialog = () => {

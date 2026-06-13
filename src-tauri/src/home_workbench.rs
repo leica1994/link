@@ -1,0 +1,1457 @@
+use crate::ai::AiService;
+use crate::app_log::AppLogger;
+use crate::app_paths;
+use crate::dubbing::{
+    prepare_dubbing_material_internal, start_dubbing_task_internal, DubbingTaskArtifact,
+    DubbingTaskOptions, DubbingTaskSnapshot, PrepareDubbingMaterialRequest,
+    StartDubbingTaskRequest, DUBBING_FINAL_DUBBED_VIDEO_ARTIFACT, DUBBING_FINAL_SUBTITLE_ARTIFACT,
+};
+use crate::home_tasks::{
+    download_home_video_task_video_internal, read_home_video_task_by_id, HomeVideoDownload,
+    HomeVideoSubtitle, HomeVideoTask, HomeVideoTaskRequest,
+};
+use crate::settings::{AppSettings, SettingsStore};
+use crate::subtitle_translation::{
+    run_subtitle_translation_workflow, SubtitleTranslationRequest, SubtitleTranslationResult,
+};
+use crate::transcription::{
+    run_transcription_workflow, save_transcription_file, TranscriptionRequest,
+};
+use chrono::Utc;
+use rusqlite::{params, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter, Manager};
+use uuid::Uuid;
+
+const HOME_WORKBENCH_PROGRESS_EVENT: &str = "home-workbench-progress";
+
+const WORKBENCH_STATUS_IDLE: &str = "idle";
+const WORKBENCH_STATUS_RUNNING: &str = "running";
+const WORKBENCH_STATUS_DONE: &str = "done";
+const WORKBENCH_STATUS_FAILED: &str = "failed";
+
+const STAGE_DOWNLOAD_VIDEO: &str = "download-video";
+const STAGE_PREPARE_SUBTITLE: &str = "prepare-subtitle";
+const STAGE_TRANSLATION: &str = "translation";
+const STAGE_DUBBING: &str = "dubbing";
+const STAGE_EXPORT: &str = "export";
+
+const STAGE_STATUS_PENDING: &str = "pending";
+const STAGE_STATUS_ACTIVE: &str = "active";
+const STAGE_STATUS_DONE: &str = "done";
+const STAGE_STATUS_SKIPPED: &str = "skipped";
+const STAGE_STATUS_FAILED: &str = "failed";
+
+const SUBTITLE_SOURCE_TRANSCRIBE: &str = "transcribe";
+const SUBTITLE_SOURCE_DOWNLOADED: &str = "downloaded";
+
+const ARTIFACT_TRANSCRIPTION_SUBTITLE: &str = "transcription-subtitle";
+const ARTIFACT_SELECTED_SUBTITLE: &str = "selected-subtitle";
+const ARTIFACT_TRANSLATED_SUBTITLE: &str = "translated-subtitle";
+const ARTIFACT_DUBBED_VIDEO: &str = "dubbed-video";
+const ARTIFACT_DUBBED_SUBTITLE: &str = "dubbed-subtitle";
+const ARTIFACT_EXPORTED_VIDEO: &str = "exported-video";
+const ARTIFACT_EXPORTED_SUBTITLE: &str = "exported-subtitle";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeWorkbenchOptions {
+    pub subtitle_source: String,
+    #[serde(default)]
+    pub subtitle_id: String,
+    pub translation_enabled: bool,
+    pub dubbing_enabled: bool,
+    #[serde(default)]
+    pub export_dir: String,
+    pub transcription_model: String,
+    pub source_language: String,
+    pub transcription_format: String,
+    pub is_smart_segmentation_enabled: bool,
+    pub is_subtitle_correction_enabled: bool,
+    pub translation_format: String,
+    pub translation_service: String,
+    pub needs_reflection_translation: bool,
+    pub translation_batch_size: u32,
+    pub translation_thread_count: u32,
+    pub video_content_type: String,
+    pub output_mode: String,
+    pub is_subtitle_translation_enabled: bool,
+    pub is_post_translation_optimization_enabled: bool,
+    pub target_language: String,
+    pub dubbing_tts_interval_ms: u32,
+    pub dubbing_reference_audio_source: String,
+    #[serde(default)]
+    pub dubbing_custom_reference_audio_path: String,
+    pub dubbing_is_background_music_enabled: bool,
+    pub dubbing_background_music_volume: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeWorkbenchStage {
+    pub key: String,
+    pub label: String,
+    pub progress: u8,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeWorkbenchArtifact {
+    pub kind: String,
+    pub path: String,
+    pub file_size: i64,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeWorkbenchSnapshot {
+    pub task_id: String,
+    pub status: String,
+    pub current_stage: String,
+    pub progress: u8,
+    pub message: String,
+    pub stages: Vec<HomeWorkbenchStage>,
+    pub options: HomeWorkbenchOptions,
+    pub artifacts: Vec<HomeWorkbenchArtifact>,
+    pub warnings: Vec<String>,
+    pub error_message: String,
+    pub revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeWorkbenchTaskRequest {
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveHomeWorkbenchOptionsRequest {
+    pub task_id: String,
+    pub options: HomeWorkbenchOptions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartHomeWorkbenchRequest {
+    pub task_id: String,
+    pub options: HomeWorkbenchOptions,
+}
+
+struct ExportedFinalPaths {
+    video_path: PathBuf,
+    subtitle_path: PathBuf,
+}
+
+#[tauri::command]
+pub fn get_home_workbench(
+    store: tauri::State<'_, SettingsStore>,
+    request: HomeWorkbenchTaskRequest,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let settings = store.load()?;
+    store.with_connection(|connection| {
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+    })
+}
+
+#[tauri::command]
+pub fn save_home_workbench_options(
+    store: tauri::State<'_, SettingsStore>,
+    request: SaveHomeWorkbenchOptionsRequest,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let settings = store.load()?;
+    store.with_connection(|connection| {
+        ensure_home_task_exists(connection, &request.task_id)?;
+        let now = Utc::now().to_rfc3339();
+        let existing = read_workbench_record(connection, &request.task_id)?.unwrap_or_else(|| {
+            default_workbench_record(&request.task_id, default_workbench_options(&settings), &now)
+        });
+        let options = normalize_options(request.options, &settings);
+        upsert_workbench_record(
+            connection,
+            &request.task_id,
+            &existing.status,
+            &existing.current_stage,
+            existing.progress,
+            &existing.message,
+            &existing.stages,
+            &options,
+            &existing.warnings,
+            &existing.error_message,
+            existing.revision + 1,
+            existing.created_at.as_str(),
+            &now,
+        )?;
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+    })
+}
+
+#[tauri::command]
+pub async fn start_home_workbench(
+    app: AppHandle,
+    request: StartHomeWorkbenchRequest,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    run_home_workbench(app, request).await
+}
+
+async fn run_home_workbench(
+    app: AppHandle,
+    request: StartHomeWorkbenchRequest,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let ai_service = app.state::<AiService>();
+    let app_logger = app.state::<AppLogger>();
+    let settings = store.load()?;
+    let mut options = normalize_options(request.options, &settings);
+    let task_id = request.task_id;
+    initialize_run(&store, &task_id, &options)?;
+
+    let run_result = run_home_workbench_inner(
+        app.clone(),
+        &store,
+        &ai_service,
+        &app_logger,
+        &settings,
+        &task_id,
+        &mut options,
+    )
+    .await;
+
+    match run_result {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => {
+            let snapshot = mark_workbench_failed(&store, &task_id, &error)?;
+            emit_workbench_progress(&app, &snapshot);
+            Err(error)
+        }
+    }
+}
+
+async fn run_home_workbench_inner(
+    app: AppHandle,
+    store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings: &AppSettings,
+    task_id: &str,
+    options: &mut HomeWorkbenchOptions,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    set_stage_active(
+        store,
+        &app,
+        task_id,
+        STAGE_DOWNLOAD_VIDEO,
+        "准备视频文件",
+        2,
+    )?;
+    let task =
+        store.with_connection(|connection| read_home_video_task_by_id(connection, task_id))?;
+    let video = ensure_video_downloaded(app.clone(), task)?;
+    set_stage_done(store, &app, task_id, STAGE_DOWNLOAD_VIDEO, "视频文件已就绪")?;
+
+    set_stage_active(
+        store,
+        &app,
+        task_id,
+        STAGE_PREPARE_SUBTITLE,
+        "准备字幕文件",
+        2,
+    )?;
+    let subtitle_path = prepare_subtitle(
+        app.clone(),
+        store,
+        ai_service,
+        app_logger,
+        settings,
+        task_id,
+        options,
+        &video,
+    )
+    .await?;
+    set_stage_done(
+        store,
+        &app,
+        task_id,
+        STAGE_PREPARE_SUBTITLE,
+        "字幕文件已就绪",
+    )?;
+
+    let final_subtitle_path = if options.translation_enabled {
+        set_stage_active(store, &app, task_id, STAGE_TRANSLATION, "翻译与优化字幕", 2)?;
+        let translated = translate_subtitle(
+            app.clone(),
+            store,
+            ai_service,
+            app_logger,
+            settings,
+            task_id,
+            options,
+            &subtitle_path,
+        )
+        .await?;
+        set_stage_done(store, &app, task_id, STAGE_TRANSLATION, "翻译与优化完成")?;
+        translated
+    } else {
+        set_stage_skipped(store, &app, task_id, STAGE_TRANSLATION, "已跳过翻译与优化")?;
+        subtitle_path
+    };
+
+    let final_video_path = if options.dubbing_enabled {
+        set_stage_active(store, &app, task_id, STAGE_DUBBING, "配音流程执行中", 2)?;
+        let (dubbed_video, dubbed_subtitle) = run_dubbing(
+            app.clone(),
+            store,
+            task_id,
+            options,
+            &video,
+            &final_subtitle_path,
+        )
+        .await?;
+        upsert_artifact_from_path(
+            store,
+            task_id,
+            ARTIFACT_DUBBED_SUBTITLE,
+            &dubbed_subtitle,
+            json!({ "source": "dubbing" }),
+        )?;
+        set_stage_done(store, &app, task_id, STAGE_DUBBING, "配音完成")?;
+        let _ = final_subtitle_path;
+        (dubbed_video, dubbed_subtitle)
+    } else {
+        set_stage_skipped(store, &app, task_id, STAGE_DUBBING, "已跳过配音")?;
+        (PathBuf::from(&video.file_path), final_subtitle_path)
+    };
+
+    set_stage_active(store, &app, task_id, STAGE_EXPORT, "导出最终产物", 5)?;
+    let exported = export_final_artifacts(
+        store,
+        task_id,
+        options,
+        &final_video_path.0,
+        &final_video_path.1,
+    )?;
+    upsert_artifact_from_path(
+        store,
+        task_id,
+        ARTIFACT_EXPORTED_VIDEO,
+        &exported.video_path,
+        json!({ "scope": "final" }),
+    )?;
+    upsert_artifact_from_path(
+        store,
+        task_id,
+        ARTIFACT_EXPORTED_SUBTITLE,
+        &exported.subtitle_path,
+        json!({ "scope": "final" }),
+    )?;
+    set_stage_done(store, &app, task_id, STAGE_EXPORT, "导出完成")?;
+
+    mark_workbench_done(store, &app, task_id)
+}
+
+fn ensure_video_downloaded(
+    app: AppHandle,
+    task: HomeVideoTask,
+) -> Result<HomeVideoDownload, String> {
+    if let Some(video) = task
+        .downloaded_video
+        .filter(|video| Path::new(&video.file_path).is_file())
+    {
+        return Ok(video);
+    }
+
+    let updated_task = download_home_video_task_video_internal(
+        app,
+        HomeVideoTaskRequest {
+            task_id: task.id.clone(),
+        },
+    )?;
+    updated_task
+        .downloaded_video
+        .filter(|video| Path::new(&video.file_path).is_file())
+        .ok_or_else(|| "视频下载完成但未找到视频文件".to_string())
+}
+
+async fn prepare_subtitle(
+    app: AppHandle,
+    store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings: &AppSettings,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+    video: &HomeVideoDownload,
+) -> Result<PathBuf, String> {
+    if options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED {
+        if let Some(subtitle) =
+            selected_downloaded_subtitle(store, task_id, &options.subtitle_id)?
+        {
+            upsert_artifact_from_path(
+                store,
+                task_id,
+                ARTIFACT_SELECTED_SUBTITLE,
+                Path::new(&subtitle.file_path),
+                json!({
+                    "subtitleId": subtitle.id,
+                    "language": subtitle.language,
+                    "sourceKind": subtitle.source_kind,
+                }),
+            )?;
+            return Ok(PathBuf::from(subtitle.file_path));
+        }
+    }
+
+    let mut run_settings = settings.clone();
+    apply_transcription_options(&mut run_settings, options);
+    let result = run_transcription_workflow(
+        app,
+        ai_service,
+        app_logger,
+        TranscriptionRequest {
+            file_path: video.file_path.clone(),
+            model: options.transcription_model.clone(),
+            source_language: options.source_language.clone(),
+            output_format: options.transcription_format.clone(),
+        },
+        run_settings,
+    )
+    .await?;
+    save_workbench_subtitle(
+        store,
+        task_id,
+        ARTIFACT_TRANSCRIPTION_SUBTITLE,
+        &result.output_path,
+        &result.subtitle_text,
+        json!({
+            "format": result.output_format,
+            "segmentCount": result.segments.len(),
+            "logPath": result.log_path,
+            "warnings": result.warnings,
+        }),
+    )
+}
+
+async fn translate_subtitle(
+    app: AppHandle,
+    store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings: &AppSettings,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+    subtitle_path: &Path,
+) -> Result<PathBuf, String> {
+    let mut run_settings = settings.clone();
+    apply_translation_options(&mut run_settings, options);
+    let result = run_subtitle_translation_workflow(
+        app,
+        ai_service,
+        app_logger,
+        SubtitleTranslationRequest {
+            file_path: subtitle_path.to_string_lossy().to_string(),
+        },
+        run_settings,
+    )
+    .await?;
+    save_translation_result(store, task_id, &result)
+}
+
+async fn run_dubbing(
+    app: AppHandle,
+    store: &SettingsStore,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+    video: &HomeVideoDownload,
+    subtitle_path: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let prepared = prepare_dubbing_material_internal(
+        app.clone(),
+        store,
+        PrepareDubbingMaterialRequest {
+            video_path: video.file_path.clone(),
+            subtitle_path: subtitle_path.to_string_lossy().to_string(),
+        },
+    )?;
+    let snapshot = start_dubbing_task_internal(
+        app,
+        StartDubbingTaskRequest {
+            task_id: prepared.id,
+            options: DubbingTaskOptions {
+                tts_interval_ms: options.dubbing_tts_interval_ms,
+                reference_audio_source: options.dubbing_reference_audio_source.clone(),
+                custom_reference_audio_path: options.dubbing_custom_reference_audio_path.clone(),
+                is_background_music_enabled: options.dubbing_is_background_music_enabled,
+                background_music_volume: options.dubbing_background_music_volume,
+            },
+        },
+    )
+    .await?;
+    let video_path = artifact_path(&snapshot, DUBBING_FINAL_DUBBED_VIDEO_ARTIFACT)
+        .ok_or_else(|| "配音完成但未找到最终视频".to_string())?;
+    let subtitle_path = artifact_path(&snapshot, DUBBING_FINAL_SUBTITLE_ARTIFACT)
+        .ok_or_else(|| "配音完成但未找到最终字幕".to_string())?;
+    upsert_artifact_from_path(
+        store,
+        task_id,
+        ARTIFACT_DUBBED_VIDEO,
+        &video_path,
+        json!({ "dubbingTaskId": snapshot.id }),
+    )?;
+    Ok((video_path, subtitle_path))
+}
+
+fn artifact_path(snapshot: &DubbingTaskSnapshot, kind: &str) -> Option<PathBuf> {
+    snapshot
+        .artifacts
+        .iter()
+        .find(|artifact: &&DubbingTaskArtifact| artifact.kind == kind && !artifact.path.is_empty())
+        .map(|artifact| PathBuf::from(&artifact.path))
+        .filter(|path| path.is_file())
+}
+
+fn save_workbench_subtitle(
+    store: &SettingsStore,
+    task_id: &str,
+    kind: &str,
+    suggested_path: &str,
+    content: &str,
+    metadata: Value,
+) -> Result<PathBuf, String> {
+    let output_path = workbench_subtitle_path(store, task_id, suggested_path)?;
+    save_transcription_file(
+        output_path.to_string_lossy().to_string(),
+        content.to_string(),
+    )?;
+    upsert_artifact_from_path(store, task_id, kind, &output_path, metadata)?;
+    Ok(output_path)
+}
+
+fn save_translation_result(
+    store: &SettingsStore,
+    task_id: &str,
+    result: &SubtitleTranslationResult,
+) -> Result<PathBuf, String> {
+    let path = workbench_file_path(task_id, "translated", &result.output_format)?;
+    save_transcription_file(
+        path.to_string_lossy().to_string(),
+        result.subtitle_text.clone(),
+    )?;
+    upsert_artifact_from_path(
+        store,
+        task_id,
+        ARTIFACT_TRANSLATED_SUBTITLE,
+        &path,
+        json!({
+            "format": result.output_format,
+            "mode": result.output_mode,
+            "sourceSegmentCount": result.source_segments.len(),
+            "translatedSegmentCount": result.translated_segments.len(),
+            "logPath": result.log_path,
+            "warnings": result.warnings,
+        }),
+    )?;
+    Ok(path)
+}
+
+fn workbench_subtitle_path(
+    _store: &SettingsStore,
+    task_id: &str,
+    suggested_path: &str,
+) -> Result<PathBuf, String> {
+    let extension = Path::new(suggested_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("srt");
+    workbench_file_path(task_id, "transcription", extension)
+}
+
+fn workbench_file_path(task_id: &str, stem: &str, extension: &str) -> Result<PathBuf, String> {
+    let dir = app_paths::youtube_task_dir(task_id)?.join("workbench");
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建工作台目录: {error}"))?;
+    Ok(dir.join(format!(
+        "{}.{}",
+        stem,
+        normalize_extension(extension, "srt")
+    )))
+}
+
+fn export_final_artifacts(
+    store: &SettingsStore,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+    video_path: &Path,
+    subtitle_path: &Path,
+) -> Result<ExportedFinalPaths, String> {
+    let export_dir = resolved_export_dir(&options.export_dir)?;
+    let title = store.with_connection(|connection| {
+        read_home_video_task_by_id(connection, task_id).map(|task| {
+            if task.title.trim().is_empty() {
+                task_id.to_string()
+            } else {
+                task.title
+            }
+        })
+    })?;
+    let base_name = sanitize_file_segment(&title);
+    let video_extension = path_extension(video_path).unwrap_or_else(|| "mp4".to_string());
+    let subtitle_extension = path_extension(subtitle_path).unwrap_or_else(|| "srt".to_string());
+    let video_destination = unique_export_path(&export_dir, &base_name, &video_extension)?;
+    let subtitle_destination = unique_export_path(&export_dir, &base_name, &subtitle_extension)?;
+    fs::copy(video_path, &video_destination)
+        .map_err(|error| format!("无法导出视频文件: {error}"))?;
+    fs::copy(subtitle_path, &subtitle_destination)
+        .map_err(|error| format!("无法导出字幕文件: {error}"))?;
+    Ok(ExportedFinalPaths {
+        video_path: video_destination,
+        subtitle_path: subtitle_destination,
+    })
+}
+
+fn selected_downloaded_subtitle(
+    store: &SettingsStore,
+    task_id: &str,
+    subtitle_id: &str,
+) -> Result<Option<HomeVideoSubtitle>, String> {
+    store.with_connection(|connection| {
+        let task = read_home_video_task_by_id(connection, task_id)?;
+        if !subtitle_id.trim().is_empty() {
+            if let Some(subtitle) = task.downloaded_subtitles.into_iter().find(|subtitle| {
+                subtitle.id == subtitle_id && Path::new(&subtitle.file_path).is_file()
+            }) {
+                return Ok(Some(subtitle));
+            }
+            return Ok(None);
+        }
+
+        Ok(task
+            .downloaded_subtitles
+            .into_iter()
+            .find(|subtitle| Path::new(&subtitle.file_path).is_file()))
+    })
+}
+
+fn initialize_run(
+    store: &SettingsStore,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+) -> Result<(), String> {
+    store.with_connection(|connection| {
+        ensure_home_task_exists(connection, task_id)?;
+        let now = Utc::now().to_rfc3339();
+        let existing = read_workbench_record(connection, task_id)?
+            .unwrap_or_else(|| default_workbench_record(task_id, options.clone(), &now));
+        upsert_workbench_record(
+            connection,
+            task_id,
+            WORKBENCH_STATUS_RUNNING,
+            STAGE_DOWNLOAD_VIDEO,
+            0,
+            "工作台开始执行",
+            &initial_stages(options),
+            options,
+            &[],
+            "",
+            existing.revision + 1,
+            &existing.created_at,
+            &now,
+        )
+    })
+}
+
+fn mark_workbench_done(
+    store: &SettingsStore,
+    app: &AppHandle,
+    task_id: &str,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let settings = store.load()?;
+    let snapshot = store.with_connection(|connection| {
+        let mut record = read_workbench_record(connection, task_id)?
+            .ok_or_else(|| "未找到工作台任务".to_string())?;
+        record.status = WORKBENCH_STATUS_DONE.to_string();
+        record.current_stage = STAGE_EXPORT.to_string();
+        record.progress = 100;
+        record.message = "工作台已完成".to_string();
+        record.error_message.clear();
+        let now = Utc::now().to_rfc3339();
+        upsert_workbench_record(
+            connection,
+            task_id,
+            &record.status,
+            &record.current_stage,
+            record.progress,
+            &record.message,
+            &record.stages,
+            &record.options,
+            &record.warnings,
+            &record.error_message,
+            record.revision + 1,
+            &record.created_at,
+            &now,
+        )?;
+        read_or_create_workbench_snapshot(connection, task_id, &settings)
+    })?;
+    emit_workbench_progress(app, &snapshot);
+    Ok(snapshot)
+}
+
+fn mark_workbench_failed(
+    store: &SettingsStore,
+    task_id: &str,
+    error: &str,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let settings = store.load()?;
+    store.with_connection(|connection| {
+        let mut record = read_workbench_record(connection, task_id)?.unwrap_or_else(|| {
+            default_workbench_record(
+                task_id,
+                default_workbench_options(&settings),
+                &Utc::now().to_rfc3339(),
+            )
+        });
+        record.status = WORKBENCH_STATUS_FAILED.to_string();
+        record.progress = overall_progress(&record.stages);
+        record.message = "工作台执行失败".to_string();
+        record.error_message = compact_error(error);
+        if let Some(stage) = record
+            .stages
+            .iter_mut()
+            .find(|stage| stage.status == STAGE_STATUS_ACTIVE)
+        {
+            stage.status = STAGE_STATUS_FAILED.to_string();
+            stage.message = compact_error(error);
+        }
+        let now = Utc::now().to_rfc3339();
+        upsert_workbench_record(
+            connection,
+            task_id,
+            &record.status,
+            &record.current_stage,
+            record.progress,
+            &record.message,
+            &record.stages,
+            &record.options,
+            &record.warnings,
+            &record.error_message,
+            record.revision + 1,
+            &record.created_at,
+            &now,
+        )?;
+        read_or_create_workbench_snapshot(connection, task_id, &settings)
+    })
+}
+
+fn set_stage_active(
+    store: &SettingsStore,
+    app: &AppHandle,
+    task_id: &str,
+    stage_key: &str,
+    message: &str,
+    progress: u8,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    update_stage(
+        store,
+        app,
+        task_id,
+        stage_key,
+        progress,
+        STAGE_STATUS_ACTIVE,
+        message,
+        WORKBENCH_STATUS_RUNNING,
+    )
+}
+
+fn set_stage_done(
+    store: &SettingsStore,
+    app: &AppHandle,
+    task_id: &str,
+    stage_key: &str,
+    message: &str,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    update_stage(
+        store,
+        app,
+        task_id,
+        stage_key,
+        100,
+        STAGE_STATUS_DONE,
+        message,
+        WORKBENCH_STATUS_RUNNING,
+    )
+}
+
+fn set_stage_skipped(
+    store: &SettingsStore,
+    app: &AppHandle,
+    task_id: &str,
+    stage_key: &str,
+    message: &str,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    update_stage(
+        store,
+        app,
+        task_id,
+        stage_key,
+        100,
+        STAGE_STATUS_SKIPPED,
+        message,
+        WORKBENCH_STATUS_RUNNING,
+    )
+}
+
+fn update_stage(
+    store: &SettingsStore,
+    app: &AppHandle,
+    task_id: &str,
+    stage_key: &str,
+    progress: u8,
+    status: &str,
+    message: &str,
+    workbench_status: &str,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let settings = store.load()?;
+    let snapshot = store.with_connection(|connection| {
+        let mut record = read_workbench_record(connection, task_id)?
+            .ok_or_else(|| "未找到工作台任务".to_string())?;
+        for stage in &mut record.stages {
+            if stage.key == stage_key {
+                stage.progress = progress.min(100);
+                stage.status = status.to_string();
+                stage.message = message.to_string();
+            }
+        }
+        record.status = workbench_status.to_string();
+        record.current_stage = stage_key.to_string();
+        record.progress = overall_progress(&record.stages);
+        record.message = message.to_string();
+        record.error_message.clear();
+        let now = Utc::now().to_rfc3339();
+        upsert_workbench_record(
+            connection,
+            task_id,
+            &record.status,
+            &record.current_stage,
+            record.progress,
+            &record.message,
+            &record.stages,
+            &record.options,
+            &record.warnings,
+            &record.error_message,
+            record.revision + 1,
+            &record.created_at,
+            &now,
+        )?;
+        read_or_create_workbench_snapshot(connection, task_id, &settings)
+    })?;
+    emit_workbench_progress(app, &snapshot);
+    Ok(snapshot)
+}
+
+fn read_or_create_workbench_snapshot(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    settings: &AppSettings,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    ensure_home_task_exists(connection, task_id)?;
+    let now = Utc::now().to_rfc3339();
+    if read_workbench_record(connection, task_id)?.is_none() {
+        let options = default_workbench_options(settings);
+        let stages = initial_stages(&options);
+        upsert_workbench_record(
+            connection,
+            task_id,
+            WORKBENCH_STATUS_IDLE,
+            "",
+            0,
+            "等待开始",
+            &stages,
+            &options,
+            &[],
+            "",
+            1,
+            &now,
+            &now,
+        )?;
+    }
+    let mut record = read_workbench_record(connection, task_id)?
+        .ok_or_else(|| "无法创建工作台任务".to_string())?;
+    if sync_idle_workbench_stages(connection, task_id, &mut record)? {
+        let now = Utc::now().to_rfc3339();
+        upsert_workbench_record(
+            connection,
+            task_id,
+            &record.status,
+            &record.current_stage,
+            record.progress,
+            &record.message,
+            &record.stages,
+            &record.options,
+            &record.warnings,
+            &record.error_message,
+            record.revision + 1,
+            &record.created_at,
+            &now,
+        )?;
+        record.updated_at = now;
+        record.revision += 1;
+    }
+    let artifacts = read_workbench_artifacts(connection, task_id)?;
+
+    Ok(HomeWorkbenchSnapshot {
+        task_id: task_id.to_string(),
+        status: record.status,
+        current_stage: record.current_stage,
+        progress: record.progress,
+        message: record.message,
+        stages: record.stages,
+        options: normalize_options(record.options, settings),
+        artifacts,
+        warnings: record.warnings,
+        error_message: record.error_message,
+        revision: record.revision,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    })
+}
+
+fn sync_idle_workbench_stages(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    record: &mut HomeWorkbenchRecord,
+) -> Result<bool, String> {
+    if record.status != WORKBENCH_STATUS_IDLE {
+        return Ok(false);
+    }
+
+    let task = read_home_video_task_by_id(connection, task_id)?;
+    let is_video_ready = matches!(
+        task.downloaded_video.as_ref(),
+        Some(video) if Path::new(&video.file_path).is_file()
+    );
+    if !is_video_ready {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    for stage in &mut record.stages {
+        if stage.key == STAGE_DOWNLOAD_VIDEO && stage.status != STAGE_STATUS_DONE {
+            stage.progress = 100;
+            stage.status = STAGE_STATUS_DONE.to_string();
+            stage.message = "视频文件已就绪".to_string();
+            changed = true;
+        }
+    }
+
+    if changed {
+        record.progress = overall_progress(&record.stages);
+    }
+
+    Ok(changed)
+}
+
+fn default_workbench_options(settings: &AppSettings) -> HomeWorkbenchOptions {
+    HomeWorkbenchOptions {
+        subtitle_source: SUBTITLE_SOURCE_TRANSCRIBE.to_string(),
+        subtitle_id: String::new(),
+        translation_enabled: settings.home_workbench_translation_enabled,
+        dubbing_enabled: settings.home_workbench_dubbing_enabled
+            && settings.home_workbench_translation_enabled,
+        export_dir: settings.home_workbench_export_dir.clone(),
+        transcription_model: settings.transcription_model.clone(),
+        source_language: settings.source_language.clone(),
+        transcription_format: settings.transcription_format.clone(),
+        is_smart_segmentation_enabled: settings.is_smart_segmentation_enabled,
+        is_subtitle_correction_enabled: settings.is_subtitle_correction_enabled,
+        translation_format: settings.translation_format.clone(),
+        translation_service: settings.translation_service.clone(),
+        needs_reflection_translation: settings.needs_reflection_translation,
+        translation_batch_size: settings.translation_batch_size,
+        translation_thread_count: settings.translation_thread_count,
+        video_content_type: settings.video_content_type.clone(),
+        output_mode: settings.output_mode.clone(),
+        is_subtitle_translation_enabled: settings.is_subtitle_translation_enabled,
+        is_post_translation_optimization_enabled: settings.is_post_translation_optimization_enabled,
+        target_language: settings.target_language.clone(),
+        dubbing_tts_interval_ms: settings.dubbing_tts_interval_ms,
+        dubbing_reference_audio_source: settings.dubbing_reference_audio_source.clone(),
+        dubbing_custom_reference_audio_path: settings.dubbing_custom_reference_audio_path.clone(),
+        dubbing_is_background_music_enabled: settings.dubbing_is_background_music_enabled,
+        dubbing_background_music_volume: settings.dubbing_background_music_volume,
+    }
+}
+
+fn normalize_options(
+    mut options: HomeWorkbenchOptions,
+    settings: &AppSettings,
+) -> HomeWorkbenchOptions {
+    if options.subtitle_source != SUBTITLE_SOURCE_DOWNLOADED {
+        options.subtitle_source = SUBTITLE_SOURCE_TRANSCRIBE.to_string();
+        options.subtitle_id.clear();
+    }
+    if options.dubbing_enabled {
+        options.translation_enabled = true;
+    }
+    if !options.translation_enabled {
+        options.dubbing_enabled = false;
+    }
+    if options.transcription_model.trim().is_empty() {
+        options.transcription_model = settings.transcription_model.clone();
+    }
+    if options.source_language.trim().is_empty() {
+        options.source_language = settings.source_language.clone();
+    }
+    options.transcription_format = normalize_extension(&options.transcription_format, "srt");
+    options.translation_format = normalize_extension(&options.translation_format, "srt");
+    if options.translation_service.trim().is_empty() {
+        options.translation_service = settings.translation_service.clone();
+    }
+    if options.translation_batch_size == 0 {
+        options.translation_batch_size = settings.translation_batch_size;
+    }
+    if options.translation_thread_count == 0 {
+        options.translation_thread_count = settings.translation_thread_count;
+    }
+    if options.video_content_type.trim().is_empty() {
+        options.video_content_type = settings.video_content_type.clone();
+    }
+    if options.output_mode.trim().is_empty() {
+        options.output_mode = settings.output_mode.clone();
+    }
+    if options.target_language.trim().is_empty() {
+        options.target_language = settings.target_language.clone();
+    }
+    if options.dubbing_tts_interval_ms > 1000 {
+        options.dubbing_tts_interval_ms = 1000;
+    }
+    if options.dubbing_reference_audio_source.trim().is_empty() {
+        options.dubbing_reference_audio_source = settings.dubbing_reference_audio_source.clone();
+    }
+    options.dubbing_background_music_volume =
+        options.dubbing_background_music_volume.clamp(0.0, 1.0);
+    options
+}
+
+fn apply_transcription_options(settings: &mut AppSettings, options: &HomeWorkbenchOptions) {
+    settings.transcription_model = options.transcription_model.clone();
+    settings.source_language = options.source_language.clone();
+    settings.transcription_format = options.transcription_format.clone();
+    settings.is_smart_segmentation_enabled = options.is_smart_segmentation_enabled;
+    settings.is_subtitle_correction_enabled = options.is_subtitle_correction_enabled;
+    settings.video_content_type = options.video_content_type.clone();
+    settings.translation_batch_size = options.translation_batch_size;
+    settings.translation_thread_count = options.translation_thread_count;
+}
+
+fn apply_translation_options(settings: &mut AppSettings, options: &HomeWorkbenchOptions) {
+    settings.translation_format = options.translation_format.clone();
+    settings.translation_service = options.translation_service.clone();
+    settings.needs_reflection_translation = options.needs_reflection_translation;
+    settings.translation_batch_size = options.translation_batch_size;
+    settings.translation_thread_count = options.translation_thread_count;
+    settings.video_content_type = options.video_content_type.clone();
+    settings.output_mode = options.output_mode.clone();
+    settings.is_subtitle_translation_enabled = options.is_subtitle_translation_enabled;
+    settings.is_post_translation_optimization_enabled =
+        options.is_post_translation_optimization_enabled;
+    settings.target_language = options.target_language.clone();
+}
+
+fn initial_stages(options: &HomeWorkbenchOptions) -> Vec<HomeWorkbenchStage> {
+    [
+        (STAGE_DOWNLOAD_VIDEO, "下载视频", "等待下载视频"),
+        (STAGE_PREPARE_SUBTITLE, "准备字幕", "等待准备字幕"),
+        (
+            STAGE_TRANSLATION,
+            "翻译与优化",
+            if options.translation_enabled {
+                "等待翻译与优化"
+            } else {
+                "已关闭"
+            },
+        ),
+        (
+            STAGE_DUBBING,
+            "配音",
+            if options.dubbing_enabled {
+                "等待配音"
+            } else {
+                "已关闭"
+            },
+        ),
+        (STAGE_EXPORT, "导出", "等待导出"),
+    ]
+    .into_iter()
+    .map(|(key, label, message)| HomeWorkbenchStage {
+        key: key.to_string(),
+        label: label.to_string(),
+        progress: 0,
+        status: STAGE_STATUS_PENDING.to_string(),
+        message: message.to_string(),
+    })
+    .collect()
+}
+
+struct HomeWorkbenchRecord {
+    status: String,
+    current_stage: String,
+    progress: u8,
+    message: String,
+    stages: Vec<HomeWorkbenchStage>,
+    options: HomeWorkbenchOptions,
+    warnings: Vec<String>,
+    error_message: String,
+    revision: u64,
+    created_at: String,
+    updated_at: String,
+}
+
+fn default_workbench_record(
+    task_id: &str,
+    options: HomeWorkbenchOptions,
+    now: &str,
+) -> HomeWorkbenchRecord {
+    let _ = task_id;
+    HomeWorkbenchRecord {
+        status: WORKBENCH_STATUS_IDLE.to_string(),
+        current_stage: String::new(),
+        progress: 0,
+        message: "等待开始".to_string(),
+        stages: initial_stages(&options),
+        options,
+        warnings: Vec::new(),
+        error_message: String::new(),
+        revision: 0,
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+    }
+}
+
+fn read_workbench_record(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Option<HomeWorkbenchRecord>, String> {
+    connection
+        .query_row(
+            "
+            SELECT status, current_stage, progress, message, stages, options,
+                   warnings, error_message, revision, created_at, updated_at
+            FROM home_workbench_tasks
+            WHERE task_id = ?1
+            ",
+            params![task_id],
+            map_workbench_record,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取工作台任务: {error}"))
+}
+
+fn map_workbench_record(row: &Row<'_>) -> rusqlite::Result<HomeWorkbenchRecord> {
+    let stages_text: String = row.get(4)?;
+    let options_text: String = row.get(5)?;
+    let warnings_text: String = row.get(6)?;
+    let stages = serde_json::from_str::<Vec<HomeWorkbenchStage>>(&stages_text).unwrap_or_default();
+    let options = serde_json::from_str::<HomeWorkbenchOptions>(&options_text)
+        .unwrap_or_else(|_| default_workbench_options_from_empty());
+    let warnings = serde_json::from_str::<Vec<String>>(&warnings_text).unwrap_or_default();
+    let progress: i64 = row.get(2)?;
+    let revision: i64 = row.get(8)?;
+    Ok(HomeWorkbenchRecord {
+        status: row.get(0)?,
+        current_stage: row.get(1)?,
+        progress: progress.clamp(0, 100) as u8,
+        message: row.get(3)?,
+        stages,
+        options,
+        warnings,
+        error_message: row.get(7)?,
+        revision: revision.max(0) as u64,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn default_workbench_options_from_empty() -> HomeWorkbenchOptions {
+    HomeWorkbenchOptions {
+        subtitle_source: SUBTITLE_SOURCE_TRANSCRIBE.to_string(),
+        subtitle_id: String::new(),
+        translation_enabled: true,
+        dubbing_enabled: false,
+        export_dir: String::new(),
+        transcription_model: "bilibili".to_string(),
+        source_language: "auto".to_string(),
+        transcription_format: "srt".to_string(),
+        is_smart_segmentation_enabled: true,
+        is_subtitle_correction_enabled: true,
+        translation_format: "srt".to_string(),
+        translation_service: "llm".to_string(),
+        needs_reflection_translation: true,
+        translation_batch_size: 30,
+        translation_thread_count: 10,
+        video_content_type: "general".to_string(),
+        output_mode: "bilingual".to_string(),
+        is_subtitle_translation_enabled: true,
+        is_post_translation_optimization_enabled: true,
+        target_language: "zh-Hans".to_string(),
+        dubbing_tts_interval_ms: 150,
+        dubbing_reference_audio_source: "existing-dubbing".to_string(),
+        dubbing_custom_reference_audio_path: String::new(),
+        dubbing_is_background_music_enabled: true,
+        dubbing_background_music_volume: 0.5,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_workbench_record(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    status: &str,
+    current_stage: &str,
+    progress: u8,
+    message: &str,
+    stages: &[HomeWorkbenchStage],
+    options: &HomeWorkbenchOptions,
+    warnings: &[String],
+    error_message: &str,
+    revision: u64,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<(), String> {
+    let stages_text =
+        serde_json::to_string(stages).map_err(|error| format!("无法保存工作台阶段: {error}"))?;
+    let options_text =
+        serde_json::to_string(options).map_err(|error| format!("无法保存工作台参数: {error}"))?;
+    let warnings_text =
+        serde_json::to_string(warnings).map_err(|error| format!("无法保存工作台警告: {error}"))?;
+    connection
+        .execute(
+            "
+            INSERT INTO home_workbench_tasks (
+                task_id, status, current_stage, progress, message, stages,
+                options, warnings, error_message, revision, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status = excluded.status,
+                current_stage = excluded.current_stage,
+                progress = excluded.progress,
+                message = excluded.message,
+                stages = excluded.stages,
+                options = excluded.options,
+                warnings = excluded.warnings,
+                error_message = excluded.error_message,
+                revision = excluded.revision,
+                updated_at = excluded.updated_at
+            ",
+            params![
+                task_id,
+                status,
+                current_stage,
+                progress,
+                message,
+                stages_text,
+                options_text,
+                warnings_text,
+                error_message,
+                revision.min(i64::MAX as u64) as i64,
+                created_at,
+                updated_at,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法保存工作台任务: {error}"))
+}
+
+fn read_workbench_artifacts(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Vec<HomeWorkbenchArtifact>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT kind, path, file_size, metadata, created_at, updated_at
+            FROM home_workbench_artifacts
+            WHERE task_id = ?1
+            ORDER BY datetime(updated_at) DESC
+            ",
+        )
+        .map_err(|error| format!("无法读取工作台产物: {error}"))?;
+    let rows = statement
+        .query_map(params![task_id], |row| {
+            let metadata_text: String = row.get(3)?;
+            Ok(HomeWorkbenchArtifact {
+                kind: row.get(0)?,
+                path: row.get(1)?,
+                file_size: row.get(2)?,
+                metadata: serde_json::from_str(&metadata_text).unwrap_or_else(|_| json!({})),
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("无法读取工作台产物: {error}"))?;
+    let mut artifacts = Vec::new();
+    for row in rows {
+        artifacts.push(row.map_err(|error| format!("无法解析工作台产物: {error}"))?);
+    }
+    Ok(artifacts)
+}
+
+fn upsert_artifact_from_path(
+    store: &SettingsStore,
+    task_id: &str,
+    kind: &str,
+    path: &Path,
+    metadata: Value,
+) -> Result<(), String> {
+    let file_size = fs::metadata(path)
+        .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
+        .unwrap_or_default();
+    let metadata_text = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+    let path_text = path.to_string_lossy().to_string();
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        let existing_created_at = connection
+            .query_row(
+                "
+                SELECT created_at
+                FROM home_workbench_artifacts
+                WHERE task_id = ?1 AND kind = ?2
+                LIMIT 1
+                ",
+                params![task_id, kind],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法检查工作台产物: {error}"))?
+            .unwrap_or_else(|| now.clone());
+        connection
+            .execute(
+                "
+                INSERT INTO home_workbench_artifacts (
+                    id, task_id, kind, path, file_size, metadata, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(task_id, kind) DO UPDATE SET
+                    path = excluded.path,
+                    file_size = excluded.file_size,
+                    metadata = excluded.metadata,
+                    updated_at = excluded.updated_at
+                ",
+                params![
+                    Uuid::new_v4().to_string(),
+                    task_id,
+                    kind,
+                    path_text,
+                    file_size,
+                    metadata_text,
+                    existing_created_at,
+                    now,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("无法保存工作台产物: {error}"))
+    })
+}
+
+fn ensure_home_task_exists(connection: &rusqlite::Connection, task_id: &str) -> Result<(), String> {
+    read_home_video_task_by_id(connection, task_id).map(|_| ())
+}
+
+fn overall_progress(stages: &[HomeWorkbenchStage]) -> u8 {
+    if stages.is_empty() {
+        return 0;
+    }
+    let total = stages
+        .iter()
+        .map(|stage| stage.progress as u32)
+        .sum::<u32>();
+    (total / stages.len() as u32).min(100) as u8
+}
+
+fn resolved_export_dir(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return app_paths::exports_dir();
+    }
+    let path = PathBuf::from(trimmed);
+    fs::create_dir_all(&path).map_err(|error| format!("无法创建导出目录: {error}"))?;
+    Ok(path)
+}
+
+fn unique_export_path(dir: &Path, base_name: &str, extension: &str) -> Result<PathBuf, String> {
+    let extension = normalize_extension(extension, "bin");
+    for index in 0..1000 {
+        let name = if index == 0 {
+            format!("{base_name}.{extension}")
+        } else {
+            format!("{base_name}-{index}.{extension}")
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("无法生成唯一导出文件名".to_string())
+}
+
+fn path_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| normalize_extension(value, ""))
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_extension(value: &str, fallback: &str) -> String {
+    let value = value
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
+
+fn sanitize_file_segment(value: &str) -> String {
+    let mut sanitized = value
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>();
+    sanitized = sanitized.trim_matches(['.', ' ']).trim().to_string();
+    if sanitized.is_empty() {
+        "untitled".to_string()
+    } else {
+        sanitized.chars().take(96).collect()
+    }
+}
+
+fn compact_error(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("工作台执行失败")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn emit_workbench_progress(app: &AppHandle, snapshot: &HomeWorkbenchSnapshot) {
+    let _ = app.emit(HOME_WORKBENCH_PROGRESS_EVENT, snapshot);
+}

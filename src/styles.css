@@ -2730,6 +2730,288 @@ html[data-theme='dark'] .home-subtitle-row.downloaded {
   font-variant-numeric: tabular-nums;
 }
 
+.home-workbench-panel {
+  padding: 16px;
+}
+
+.home-workbench-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.home-workbench-status {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.home-workbench-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: 12px;
+}
+
+.home-workbench-run {
+  min-width: 124px;
+}
+
+.home-workbench-stage-list {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin-top: 16px;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: var(--hairline);
+}
+
+.home-workbench-stage {
+  min-height: 96px;
+  background: color-mix(in srgb, var(--bg-surface) 92%, var(--bg));
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px 10px;
+  padding: 13px 14px;
+}
+
+html[data-theme='dark'] .home-workbench-stage {
+  background: color-mix(in srgb, var(--bg-surface) 88%, #000);
+}
+
+.home-workbench-stage-mark {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  grid-row: 1 / 3;
+}
+
+.home-workbench-stage-mark svg {
+  width: 16px;
+  height: 16px;
+}
+
+.home-workbench-stage.active .home-workbench-stage-mark {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--hairline));
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.home-workbench-stage.done .home-workbench-stage-mark,
+.home-workbench-stage.skipped .home-workbench-stage-mark {
+  border-color: rgba(47, 138, 85, 0.28);
+  color: #2f8a55;
+  background: rgba(47, 138, 85, 0.1);
+}
+
+.home-workbench-stage.failed .home-workbench-stage-mark {
+  border-color: rgba(184, 59, 59, 0.28);
+  color: #9f3030;
+  background: rgba(184, 59, 59, 0.1);
+}
+
+html[data-theme='dark'] .home-workbench-stage.done .home-workbench-stage-mark,
+html[data-theme='dark'] .home-workbench-stage.skipped .home-workbench-stage-mark {
+  color: #8ed0a8;
+}
+
+html[data-theme='dark'] .home-workbench-stage.failed .home-workbench-stage-mark {
+  color: #f0a2a2;
+}
+
+.home-workbench-stage-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.home-workbench-stage-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-workbench-stage-message {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-workbench-stage-value {
+  color: var(--text-subtle);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.home-workbench-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.74fr) minmax(460px, 1.15fr) minmax(460px, 1.15fr);
+  gap: 0;
+  margin-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+
+.home-workbench-block {
+  min-width: 0;
+  padding: 15px 14px 0;
+}
+
+.home-workbench-block + .home-workbench-block {
+  border-left: 1px solid var(--hairline);
+}
+
+.home-workbench-block-title {
+  min-height: 28px;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 8px;
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.home-workbench-block-title svg {
+  width: 16px;
+  height: 16px;
+}
+
+.setting-row.compact {
+  min-height: 58px;
+  grid-template-columns: minmax(180px, 1fr) minmax(max-content, auto);
+  gap: 12px;
+  padding: 0 8px;
+}
+
+.setting-row.compact.range {
+  grid-template-columns: minmax(150px, 0.62fr) minmax(240px, 1fr);
+}
+
+.setting-row.compact + .setting-row.compact .setting-copy,
+.setting-row.compact + .setting-row-button.compact .setting-copy,
+.setting-row-button.compact + .setting-row.compact .setting-copy,
+.setting-row-button.compact + .setting-row-button.compact .setting-copy {
+  border-top: 1px solid var(--hairline);
+}
+
+.setting-row.compact .setting-title {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.setting-row.compact .setting-subtitle {
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.setting-row.compact .setting-value {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setting-row.compact .setting-range-control {
+  width: min(100%, 430px);
+  grid-template-columns: 74px minmax(170px, 1fr);
+}
+
+.setting-row.compact .settings-action {
+  min-height: 36px;
+  min-width: 86px;
+  padding: 0 14px;
+  white-space: nowrap;
+}
+
+.home-workbench-alert {
+  margin-top: 16px;
+}
+
+.home-workbench-artifacts {
+  display: flex;
+  flex-direction: column;
+  margin-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+
+.home-workbench-artifact {
+  min-height: 62px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 86px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 8px;
+}
+
+.home-workbench-artifact + .home-workbench-artifact {
+  border-top: 1px solid var(--hairline);
+}
+
+.home-workbench-artifact > svg {
+  width: 18px;
+  height: 18px;
+  color: #2f8a55;
+}
+
+html[data-theme='dark'] .home-workbench-artifact > svg {
+  color: #8ed0a8;
+}
+
+.home-workbench-artifact-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.home-workbench-artifact-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.2;
+}
+
+.home-workbench-artifact-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .youtube-monitor-page {
   min-height: 100%;
   height: 100%;
@@ -3458,6 +3740,22 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
   }
 }
 
+@media (max-width: 1500px) {
+  .home-workbench-grid {
+    grid-template-columns: minmax(300px, 0.88fr) minmax(520px, 1.12fr);
+  }
+
+  .home-workbench-block:nth-child(3) {
+    grid-column: 1 / -1;
+    border-left: 0;
+    border-top: 1px solid var(--hairline);
+  }
+
+  .home-workbench-block:nth-child(3) .setting-row.compact.range {
+    grid-template-columns: minmax(190px, 0.45fr) minmax(320px, 0.55fr);
+  }
+}
+
 @media (max-width: 1180px) {
   .translate-grid {
     grid-template-columns: minmax(300px, 0.95fr) minmax(390px, 1.05fr);
@@ -3492,6 +3790,21 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
 
   .home-video-overview {
     grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+  }
+
+  .home-workbench-stage-list {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .home-workbench-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .home-workbench-block + .home-workbench-block,
+  .home-workbench-block:nth-child(3) {
+    grid-column: auto;
+    border-left: 0;
+    border-top: 1px solid var(--hairline);
   }
 
   .youtube-channel-row {
@@ -3700,6 +4013,56 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
 
   .home-subtitle-row .settings-action {
     width: 100%;
+  }
+
+  .home-workbench-top {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .home-workbench-top .settings-action {
+    width: 100%;
+  }
+
+  .home-workbench-stage-list {
+    grid-template-columns: 1fr;
+  }
+
+  .home-workbench-stage {
+    min-height: 76px;
+  }
+
+  .setting-row.compact {
+    grid-template-columns: 1fr;
+    min-height: 76px;
+    padding: 12px 8px;
+  }
+
+  .setting-row.compact.range {
+    grid-template-columns: 1fr;
+  }
+
+  .setting-row.compact .setting-inline-action,
+  .setting-row.compact .setting-toggle,
+  .setting-row.compact .settings-action {
+    grid-column: 1;
+    justify-self: start;
+  }
+
+  .setting-row.compact .setting-value {
+    max-width: 220px;
+  }
+
+  .setting-row.compact .setting-range-control {
+    width: 100%;
+  }
+
+  .home-workbench-artifact {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+
+  .home-workbench-artifact .home-file-size {
+    grid-column: 2;
   }
 
   .home-file-size {
