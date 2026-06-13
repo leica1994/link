@@ -590,6 +590,8 @@ type TranscriptionResult = {
 type TranscriptionProgress = {
   progress: number
   message: string
+  progressSource?: string
+  progressRunId?: string
   stageProgress?: TranscriptionStageProgress
   revision?: number
   segments?: TranscriptionSegment[]
@@ -608,6 +610,8 @@ type SubtitlePreviewResult = {
 type SubtitleTranslationProgress = {
   progress: number
   message: string
+  progressSource?: string
+  progressRunId?: string
   stageProgress?: SubtitleTranslationStageProgress
   revision?: number
   sourceSegments?: TranscriptionSegment[]
@@ -674,6 +678,7 @@ const transcriptionWarnings = ref<string[]>([])
 const transcriptionSegments = ref<TranscriptionSegment[]>([])
 const transcriptionText = ref('')
 const lastTranscriptionRevision = ref(0)
+const activeTranscriptionRunId = ref('')
 const suggestedTranscriptionExportPath = ref('')
 const lastOutputPath = ref('')
 const subtitleInputError = ref('')
@@ -687,6 +692,7 @@ const sourceSubtitleSegments = ref<TranscriptionSegment[]>([])
 const translatedSubtitleSegments = ref<TranscriptionSegment[]>([])
 const translationText = ref('')
 const lastTranslationRevision = ref(0)
+const activeTranslationRunId = ref('')
 let isApplyingStoredSettings = false
 let hasLoadedOnce = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
@@ -695,6 +701,9 @@ let unlistenSubtitleTranslationProgress: UnlistenFn | undefined
 let unlistenDragDrop: UnlistenFn | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
+const createRunId = (prefix: string) => {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
 const mediaExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v', 'mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg']
 const subtitleExtensions = ['srt', 'vtt', 'ass']
 
@@ -1109,6 +1118,7 @@ const applyVideoFile = (path: string) => {
   transcriptionSegments.value = []
   transcriptionText.value = ''
   lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
+  activeTranscriptionRunId.value = ''
   suggestedTranscriptionExportPath.value = ''
   lastOutputPath.value = ''
 }
@@ -1131,6 +1141,7 @@ const applySubtitleFile = (path: string) => {
   translatedSubtitleSegments.value = []
   translationText.value = ''
   lastTranslationRevision.value = Number.MAX_SAFE_INTEGER
+  activeTranslationRunId.value = ''
   void loadSubtitlePreview(path)
 }
 
@@ -1250,6 +1261,8 @@ const startTranscription = async () => {
   }
 
   await flushPendingSave()
+  const runId = createRunId('transcription')
+  activeTranscriptionRunId.value = runId
   isTranscribing.value = true
   transcriptionError.value = ''
   transcriptionProgress.value = 0
@@ -1277,8 +1290,13 @@ const startTranscription = async () => {
         model: selectedTranscriptionModel.value,
         sourceLanguage: selectedSourceLanguage.value,
         outputFormat: selectedTranscriptionFormat.value,
+        clientRunId: runId,
       },
     })
+
+    if (activeTranscriptionRunId.value !== runId) {
+      return
+    }
 
     lastTranscriptionRevision.value = Number.MAX_SAFE_INTEGER
     transcriptionSegments.value = result.segments
@@ -1289,11 +1307,18 @@ const startTranscription = async () => {
     transcriptionStageProgress.value = markStageProgressDone(transcriptionStageProgress.value)
     transcriptionMessage.value = `转录成功 · ${result.segments.length} 条字幕，可导出`
   } catch (error) {
-    transcriptionError.value = stringifyError(error)
-    transcriptionMessage.value = '转录失败'
-    transcriptionStageProgress.value = markActiveStageFailed(transcriptionStageProgress.value)
+    if (activeTranscriptionRunId.value === runId) {
+      transcriptionError.value = stringifyError(error)
+      transcriptionMessage.value = '转录失败'
+      transcriptionStageProgress.value = markActiveStageFailed(transcriptionStageProgress.value)
+    }
   } finally {
-    isTranscribing.value = false
+    if (activeTranscriptionRunId.value === runId) {
+      activeTranscriptionRunId.value = ''
+    }
+    if (!activeTranscriptionRunId.value) {
+      isTranscribing.value = false
+    }
   }
 }
 
@@ -1348,6 +1373,8 @@ const startTranslationProcessing = async () => {
     return
   }
 
+  const runId = createRunId('translation')
+  activeTranslationRunId.value = runId
   isTranslationProcessing.value = true
   translationError.value = ''
   subtitleInputError.value = ''
@@ -1380,8 +1407,13 @@ const startTranslationProcessing = async () => {
     const result = await invoke<SubtitleTranslationResult>('start_subtitle_translation', {
       request: {
         filePath: subtitlePath,
+        clientRunId: runId,
       },
     })
+
+    if (activeTranslationRunId.value !== runId) {
+      return
+    }
 
     lastTranslationRevision.value = Number.MAX_SAFE_INTEGER
     sourceSubtitleSegments.value = result.sourceSegments
@@ -1392,11 +1424,18 @@ const startTranslationProcessing = async () => {
     translationStageProgress.value = markTranslationStageProgressDone(translationStageProgress.value)
     translationMessage.value = `处理完成 · ${result.translatedSegments.length} 条字幕`
   } catch (error) {
-    translationError.value = stringifyError(error)
-    translationMessage.value = '处理失败'
-    translationStageProgress.value = markActiveTranslationStageFailed(translationStageProgress.value)
+    if (activeTranslationRunId.value === runId) {
+      translationError.value = stringifyError(error)
+      translationMessage.value = '处理失败'
+      translationStageProgress.value = markActiveTranslationStageFailed(translationStageProgress.value)
+    }
   } finally {
-    isTranslationProcessing.value = false
+    if (activeTranslationRunId.value === runId) {
+      activeTranslationRunId.value = ''
+    }
+    if (!activeTranslationRunId.value) {
+      isTranslationProcessing.value = false
+    }
   }
 }
 
@@ -1503,6 +1542,13 @@ const registerProgressListener = async () => {
 
   unlistenTranscriptionProgress = await listen<TranscriptionProgress>('transcription-progress', (event) => {
     const payload = event.payload
+    if (
+      payload.progressSource !== 'translate-page' ||
+      !payload.progressRunId ||
+      payload.progressRunId !== activeTranscriptionRunId.value
+    ) {
+      return
+    }
 
     if (typeof payload.revision === 'number') {
       if (payload.revision <= lastTranscriptionRevision.value) {
@@ -1543,6 +1589,13 @@ const registerSubtitleTranslationProgressListener = async () => {
     'subtitle-translation-progress',
     (event) => {
       const payload = event.payload
+      if (
+        payload.progressSource !== 'translate-page' ||
+        !payload.progressRunId ||
+        payload.progressRunId !== activeTranslationRunId.value
+      ) {
+        return
+      }
 
       if (typeof payload.revision === 'number') {
         if (payload.revision <= lastTranslationRevision.value) {

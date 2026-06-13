@@ -28,6 +28,10 @@ pub(crate) type SubtitleTranslationProgressSink =
 #[serde(rename_all = "camelCase")]
 pub struct SubtitleTranslationRequest {
     pub file_path: String,
+    #[serde(default)]
+    pub client_run_id: String,
+    #[serde(default)]
+    pub progress_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +45,10 @@ pub struct SubtitlePreviewResult {
 pub struct SubtitleTranslationProgress {
     pub progress: u8,
     pub message: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_progress: Option<SubtitleTranslationStageProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +109,22 @@ struct TranslationSnapshotEmitter {
     revision: u64,
     workflow_progress: TranslationWorkflowProgress,
     progress_sink: Option<SubtitleTranslationProgressSink>,
+    progress_context: ProgressContext,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProgressContext {
+    source: String,
+    run_id: String,
+}
+
+impl ProgressContext {
+    fn from_request(request: &SubtitleTranslationRequest) -> Self {
+        Self {
+            source: request.progress_source.clone(),
+            run_id: request.client_run_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,8 +167,9 @@ pub async fn start_subtitle_translation(
     settings_store: tauri::State<'_, SettingsStore>,
     ai_service: tauri::State<'_, AiService>,
     app_logger: tauri::State<'_, AppLogger>,
-    request: SubtitleTranslationRequest,
+    mut request: SubtitleTranslationRequest,
 ) -> Result<SubtitleTranslationResult, String> {
+    request.progress_source = "translate-page".to_string();
     let settings = settings_store.load()?;
     run_subtitle_translation_workflow(
         app,
@@ -186,6 +211,7 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
     settings: AppSettings,
     progress_sink: Option<SubtitleTranslationProgressSink>,
 ) -> Result<SubtitleTranslationResult, String> {
+    let progress_context = ProgressContext::from_request(&request);
     let log_session = app_logger.start_session("subtitle_translation")?;
     log_session.info(
         "request_received",
@@ -209,6 +235,7 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
         None,
         &[],
         progress_sink.as_ref(),
+        &progress_context,
     );
 
     let mut source_segments = load_subtitle_segments(&input_path)?;
@@ -223,6 +250,7 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
         app.clone(),
         workflow_progress.clone(),
         progress_sink.clone(),
+        progress_context.clone(),
     );
     emitter.emit(
         "字幕已导入",
@@ -502,12 +530,14 @@ impl TranslationSnapshotEmitter {
         app: AppHandle,
         workflow_progress: TranslationWorkflowProgress,
         progress_sink: Option<SubtitleTranslationProgressSink>,
+        progress_context: ProgressContext,
     ) -> Self {
         Self {
             app,
             revision: 0,
             workflow_progress,
             progress_sink,
+            progress_context,
         }
     }
 
@@ -530,6 +560,7 @@ impl TranslationSnapshotEmitter {
             Some(translated_segments.to_vec()),
             warnings,
             self.progress_sink.as_ref(),
+            &self.progress_context,
         );
     }
 }
@@ -2366,10 +2397,13 @@ fn emit_progress_event(
     translated_segments: Option<Vec<TranscriptionSegment>>,
     warnings: &[String],
     progress_sink: Option<&SubtitleTranslationProgressSink>,
+    progress_context: &ProgressContext,
 ) {
     let payload = SubtitleTranslationProgress {
         progress,
         message: message.to_string(),
+        progress_source: progress_context.source.clone(),
+        progress_run_id: progress_context.run_id.clone(),
         stage_progress,
         revision,
         source_segments,

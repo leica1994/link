@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -232,6 +232,10 @@ pub struct StartDubbingTaskRequest {
     pub task_id: String,
     #[serde(default)]
     pub options: DubbingTaskOptions,
+    #[serde(default)]
+    pub client_run_id: String,
+    #[serde(default)]
+    pub progress_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +304,10 @@ pub struct DubbingTaskArtifact {
 pub struct DubbingTaskSnapshot {
     pub id: String,
     pub pair_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_run_id: String,
     pub video_path: String,
     pub subtitle_path: String,
     pub work_dir: String,
@@ -332,6 +340,64 @@ struct DubbingTaskRecord {
     revision: u64,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DubbingProgressContext {
+    source: String,
+    run_id: String,
+}
+
+impl DubbingProgressContext {
+    fn from_request(request: &StartDubbingTaskRequest) -> Self {
+        Self {
+            source: request.progress_source.clone(),
+            run_id: request.client_run_id.clone(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.source.is_empty() && self.run_id.is_empty()
+    }
+}
+
+static DUBBING_PROGRESS_CONTEXTS: OnceLock<Mutex<HashMap<String, DubbingProgressContext>>> =
+    OnceLock::new();
+
+fn dubbing_progress_contexts() -> &'static Mutex<HashMap<String, DubbingProgressContext>> {
+    DUBBING_PROGRESS_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_dubbing_progress_context(task_id: &str, context: &DubbingProgressContext) {
+    if context.is_empty() {
+        return;
+    }
+
+    if let Ok(mut contexts) = dubbing_progress_contexts().lock() {
+        contexts.insert(task_id.to_string(), context.clone());
+    }
+}
+
+fn clear_dubbing_progress_context(task_id: &str, context: &DubbingProgressContext) {
+    if context.is_empty() {
+        return;
+    }
+
+    if let Ok(mut contexts) = dubbing_progress_contexts().lock() {
+        if contexts
+            .get(task_id)
+            .is_some_and(|active| active == context)
+        {
+            contexts.remove(task_id);
+        }
+    }
+}
+
+fn active_dubbing_progress_context(task_id: &str) -> Option<DubbingProgressContext> {
+    dubbing_progress_contexts()
+        .lock()
+        .ok()
+        .and_then(|contexts| contexts.get(task_id).cloned())
 }
 
 struct DubbingSubtitlePreprocessResult {
@@ -861,8 +927,9 @@ pub(crate) fn prepare_dubbing_material_internal(
 #[tauri::command]
 pub async fn start_dubbing_task(
     app: AppHandle,
-    request: StartDubbingTaskRequest,
+    mut request: StartDubbingTaskRequest,
 ) -> Result<DubbingTaskSnapshot, String> {
+    request.progress_source = "dubbing-page".to_string();
     start_dubbing_task_internal(app, request).await
 }
 
@@ -870,11 +937,21 @@ pub(crate) async fn start_dubbing_task_internal(
     app: AppHandle,
     request: StartDubbingTaskRequest,
 ) -> Result<DubbingTaskSnapshot, String> {
+    let task_id = request.task_id.clone();
+    let progress_context = DubbingProgressContext::from_request(&request);
+    register_dubbing_progress_context(&task_id, &progress_context);
+
     match tauri::async_runtime::spawn_blocking(move || start_dubbing_task_blocking(app, request))
         .await
     {
-        Ok(result) => result,
-        Err(error) => Err(format!("配音任务执行失败: {error}")),
+        Ok(result) => {
+            clear_dubbing_progress_context(&task_id, &progress_context);
+            result
+        }
+        Err(error) => {
+            clear_dubbing_progress_context(&task_id, &progress_context);
+            Err(format!("配音任务执行失败: {error}"))
+        }
     }
 }
 
@@ -2962,6 +3039,8 @@ fn read_dubbing_task_snapshot_by_id(
     Ok(DubbingTaskSnapshot {
         id: record.id,
         pair_key: record.pair_key,
+        progress_source: String::new(),
+        progress_run_id: String::new(),
         video_path: record.video_path,
         subtitle_path: record.subtitle_path,
         work_dir: record.work_dir,
@@ -4095,7 +4174,12 @@ fn update_dubbing_task_state(
 }
 
 fn emit_dubbing_progress(app: &AppHandle, snapshot: &DubbingTaskSnapshot) {
-    let _ = app.emit(DUBBING_PROGRESS_EVENT, snapshot);
+    let mut payload = snapshot.clone();
+    if let Some(context) = active_dubbing_progress_context(&payload.id) {
+        payload.progress_source = context.source;
+        payload.progress_run_id = context.run_id;
+    }
+    let _ = app.emit(DUBBING_PROGRESS_EVENT, payload);
 }
 
 fn emit_audio_video_alignment_progress(

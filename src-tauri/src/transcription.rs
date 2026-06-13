@@ -43,6 +43,10 @@ pub struct TranscriptionRequest {
     pub model: String,
     pub source_language: String,
     pub output_format: String,
+    #[serde(default)]
+    pub client_run_id: String,
+    #[serde(default)]
+    pub progress_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +54,10 @@ pub struct TranscriptionRequest {
 pub struct TranscriptionProgress {
     pub progress: u8,
     pub message: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_progress: Option<TranscriptionStageProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,6 +222,7 @@ struct SnapshotEmitter {
     revision: u64,
     workflow_progress: WorkflowProgress,
     progress_sink: Option<TranscriptionProgressSink>,
+    progress_context: ProgressContext,
 }
 
 impl SnapshotEmitter {
@@ -221,12 +230,14 @@ impl SnapshotEmitter {
         app: AppHandle,
         workflow_progress: WorkflowProgress,
         progress_sink: Option<TranscriptionProgressSink>,
+        progress_context: ProgressContext,
     ) -> Self {
         Self {
             app,
             revision: 0,
             workflow_progress,
             progress_sink,
+            progress_context,
         }
     }
 
@@ -240,7 +251,23 @@ impl SnapshotEmitter {
             segments,
             warnings,
             self.progress_sink.as_ref(),
+            &self.progress_context,
         );
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProgressContext {
+    source: String,
+    run_id: String,
+}
+
+impl ProgressContext {
+    fn from_request(request: &TranscriptionRequest) -> Self {
+        Self {
+            source: request.progress_source.clone(),
+            run_id: request.client_run_id.clone(),
+        }
     }
 }
 
@@ -630,8 +657,9 @@ pub async fn start_transcription(
     settings_store: tauri::State<'_, SettingsStore>,
     ai_service: tauri::State<'_, AiService>,
     app_logger: tauri::State<'_, AppLogger>,
-    request: TranscriptionRequest,
+    mut request: TranscriptionRequest,
 ) -> Result<TranscriptionResult, String> {
+    request.progress_source = "translate-page".to_string();
     let settings = settings_store.load()?;
     run_transcription_workflow(
         app,
@@ -673,6 +701,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
     settings: AppSettings,
     progress_sink: Option<TranscriptionProgressSink>,
 ) -> Result<TranscriptionResult, String> {
+    let progress_context = ProgressContext::from_request(&request);
     let log_session = app_logger.start_session("transcription")?;
     log_session.info(
         "request_received",
@@ -714,12 +743,14 @@ pub(crate) async fn run_transcription_workflow_with_sink(
         None,
         &[],
         progress_sink.as_ref(),
+        &progress_context,
     );
 
     let transcription_app = app.clone();
     let raw_log_session = log_session.clone();
     let raw_workflow_progress = workflow_progress.clone();
     let raw_progress_sink = progress_sink.clone();
+    let raw_progress_context = progress_context.clone();
     let raw_result = match tauri::async_runtime::spawn_blocking(move || {
         run_transcription(
             transcription_app,
@@ -727,6 +758,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
             raw_log_session,
             raw_workflow_progress,
             raw_progress_sink,
+            raw_progress_context,
         )
     })
     .await
@@ -753,6 +785,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
         app.clone(),
         workflow_progress.clone(),
         progress_sink.clone(),
+        progress_context.clone(),
     );
 
     assign_segment_metadata(&mut segments, "raw", "raw");
@@ -783,6 +816,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
             None,
             &warnings,
             progress_sink.as_ref(),
+            &progress_context,
         );
         log_session.info(
             "smart_segmentation_start",
@@ -845,6 +879,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
             None,
             &warnings,
             progress_sink.as_ref(),
+            &progress_context,
         );
         log_session.info(
             "subtitle_correction_start",
@@ -1009,6 +1044,7 @@ fn run_transcription(
     log_session: LogSession,
     workflow_progress: WorkflowProgress,
     progress_sink: Option<TranscriptionProgressSink>,
+    progress_context: ProgressContext,
 ) -> Result<RawTranscriptionResult, String> {
     let input_path = PathBuf::from(&request.file_path);
     if !input_path.is_file() {
@@ -1073,6 +1109,7 @@ fn run_transcription(
         5,
         "转换音频中",
         progress_sink.as_ref(),
+        &progress_context,
     );
     log_session.info(
         "audio_conversion_start",
@@ -1102,6 +1139,7 @@ fn run_transcription(
         10,
         "语音转录中",
         progress_sink.as_ref(),
+        &progress_context,
     );
 
     let strategy = match create_strategy(&request.model) {
@@ -1137,6 +1175,7 @@ fn run_transcription(
             scaled.min(100),
             message,
             progress_sink.as_ref(),
+            &progress_context,
         );
     };
 
@@ -1163,6 +1202,7 @@ fn run_transcription(
         100,
         "语音转录完成",
         progress_sink.as_ref(),
+        &progress_context,
     );
     log_session.info(
         "asr_provider_completed",
@@ -1201,6 +1241,7 @@ fn emit_progress(
     progress: u8,
     message: &str,
     progress_sink: Option<&TranscriptionProgressSink>,
+    progress_context: &ProgressContext,
 ) {
     workflow_progress.set_stage(
         ProgressStage::Transcription,
@@ -1217,6 +1258,7 @@ fn emit_progress(
         None,
         &[],
         progress_sink,
+        progress_context,
     );
 }
 
@@ -1228,6 +1270,7 @@ fn emit_progress_snapshot(
     segments: &[TranscriptionSegment],
     warnings: &[String],
     progress_sink: Option<&TranscriptionProgressSink>,
+    progress_context: &ProgressContext,
 ) {
     let progress = overall_progress(&stage_progress);
     emit_progress_event(
@@ -1239,6 +1282,7 @@ fn emit_progress_snapshot(
         Some(segments.to_vec()),
         warnings,
         progress_sink,
+        progress_context,
     );
 }
 
@@ -1251,10 +1295,13 @@ fn emit_progress_event(
     segments: Option<Vec<TranscriptionSegment>>,
     warnings: &[String],
     progress_sink: Option<&TranscriptionProgressSink>,
+    progress_context: &ProgressContext,
 ) {
     let payload = TranscriptionProgress {
         progress,
         message: message.to_string(),
+        progress_source: progress_context.source.clone(),
+        progress_run_id: progress_context.run_id.clone(),
         stage_progress,
         revision,
         segments,

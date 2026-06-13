@@ -928,6 +928,8 @@ type DubbingSubtitleRow = {
 type DubbingTaskSnapshot = {
   id: string
   pairKey: string
+  progressSource?: string
+  progressRunId?: string
   videoPath: string
   subtitlePath: string
   workDir: string
@@ -1098,6 +1100,7 @@ const isPreparingMaterial = ref(false)
 const isDubbingRunning = ref(false)
 const dubbingError = ref('')
 const lastDubbingRevision = ref(0)
+const activeDubbingRunId = ref('')
 const selectedVoiceKey = ref('')
 const voiceSearch = ref('')
 const indexTts2Endpoint = ref(INDEX_TTS2_DEFAULT_ENDPOINT)
@@ -1124,6 +1127,9 @@ let isApplyingStoredSettings = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
+const createRunId = (prefix: string) => {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
 const dubbingVideoExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v']
 const dubbingSubtitleExtensions = ['srt', 'vtt', 'ass', 'ssa', 'lrc', 'sbv', 'smi', 'sami', 'ttml', 'dfxp', 'txt']
 const referenceAudioExtensions = ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma']
@@ -1976,6 +1982,7 @@ const resetDubbingTaskState = () => {
   activeDubbingTask.value = null
   dubbingError.value = ''
   lastDubbingRevision.value = 0
+  activeDubbingRunId.value = ''
 }
 
 const prepareDubbingMaterial = async () => {
@@ -2047,19 +2054,32 @@ const startDubbing = async () => {
 
   isDubbingRunning.value = true
   dubbingError.value = ''
+  const runId = createRunId('dubbing')
+  activeDubbingRunId.value = runId
 
   try {
     const snapshot = await invoke<DubbingTaskSnapshot>('start_dubbing_task', {
       request: {
         taskId: task.id,
         options: currentDubbingTaskOptions(),
+        clientRunId: runId,
       },
     })
+    if (activeDubbingRunId.value !== runId) {
+      return
+    }
     applyDubbingTaskSnapshot(snapshot)
   } catch (error) {
-    dubbingError.value = stringifyError(error, '配音失败')
+    if (activeDubbingRunId.value === runId) {
+      dubbingError.value = stringifyError(error, '配音失败')
+    }
   } finally {
-    isDubbingRunning.value = false
+    if (activeDubbingRunId.value === runId) {
+      activeDubbingRunId.value = ''
+    }
+    if (!activeDubbingRunId.value) {
+      isDubbingRunning.value = false
+    }
   }
 }
 
@@ -3052,6 +3072,13 @@ const registerDubbingProgressListener = async () => {
 
   unlistenDubbingProgress = await listen<DubbingTaskSnapshot>('dubbing-progress', (event) => {
     const snapshot = event.payload
+    if (
+      snapshot.progressSource !== 'dubbing-page' ||
+      !snapshot.progressRunId ||
+      snapshot.progressRunId !== activeDubbingRunId.value
+    ) {
+      return
+    }
 
     if (activeDubbingTask.value && snapshot.id !== activeDubbingTask.value.id) {
       return

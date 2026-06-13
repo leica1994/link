@@ -855,6 +855,8 @@ async fn prepare_subtitle(
             model: options.transcription_model.clone(),
             source_language: options.source_language.clone(),
             output_format: options.transcription_format.clone(),
+            client_run_id: task_id.to_string(),
+            progress_source: "home-workbench".to_string(),
         },
         run_settings,
         Some(progress_sink),
@@ -914,6 +916,8 @@ async fn translate_subtitle(
         Some(store),
         SubtitleTranslationRequest {
             file_path: subtitle_path.to_string_lossy().to_string(),
+            client_run_id: task_id.to_string(),
+            progress_source: "home-workbench".to_string(),
         },
         run_settings,
         Some(progress_sink),
@@ -986,6 +990,8 @@ async fn run_dubbing(
                 is_background_music_enabled: options.dubbing_is_background_music_enabled,
                 background_music_volume: options.dubbing_background_music_volume,
             },
+            client_run_id: task_id.to_string(),
+            progress_source: "home-workbench".to_string(),
         },
     )
     .await?;
