@@ -2336,14 +2336,11 @@ const registerHomeWorkbenchProgressListener = async () => {
 const setDownloadProgress = (payload: HomeVideoDownloadProgress, options: { reset?: boolean } = {}) => {
   const next = new Map(downloadProgressByKey.value)
   const key = downloadProgressKey(payload.taskId, payload.kind, payload.key)
-  const previous = options.reset ? null : next.get(key)
   const incomingProgress = clampProgress(payload.progress)
-  const shouldKeepPreviousProgress =
-    payload.status === 'active' && previous?.status === 'active' && previous.progress > incomingProgress
 
   next.set(key, {
     ...payload,
-    progress: shouldKeepPreviousProgress ? previous.progress : incomingProgress,
+    progress: incomingProgress,
   })
   downloadProgressByKey.value = next
 }

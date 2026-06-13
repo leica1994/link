@@ -271,13 +271,20 @@ impl DownloadProgressEmitter {
     fn emit_ytdlp_progress(&self, progress: &YtdlpProgressLine) {
         let value = match progress.phase.as_str() {
             "postprocess" => {
+                // 后处理阶段：95-98%
                 if progress.status == "finished" {
                     98
                 } else {
-                    96
+                    95
                 }
             }
-            _ => progress.progress.unwrap_or(0).clamp(2, 94),
+            // 下载阶段：将 yt-dlp 的 0-100% 映射到 2-95%
+            _ => {
+                let raw_progress = progress.progress.unwrap_or(0);
+                // 将 0-100 线性映射到 2-95
+                let mapped = 2 + (raw_progress as f64 * 0.93).round() as u8;
+                mapped.clamp(2, 95)
+            }
         };
         let message = download_progress_message(&self.kind, &progress.phase, &progress.status);
         self.emit(
