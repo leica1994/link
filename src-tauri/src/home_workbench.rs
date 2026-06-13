@@ -661,6 +661,22 @@ fn ensure_video_downloaded(
         .downloaded_video
         .filter(|video| Path::new(&video.file_path).is_file())
     {
+        // 视频已存在，发送进度完成事件以同步工作台UI
+        let _ = app.emit(
+            "home-video-download-progress",
+            serde_json::json!({
+                "taskId": task.id,
+                "kind": "video",
+                "key": "video",
+                "progress": 100,
+                "status": "done",
+                "message": "视频文件已就绪",
+                "downloadedBytes": null as Option<u64>,
+                "totalBytes": null as Option<u64>,
+                "language": null as Option<String>,
+                "sourceKind": null as Option<String>,
+            }),
+        );
         return Ok(video);
     }
 
