@@ -605,12 +605,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL UNIQUE,
                 is_default INTEGER NOT NULL DEFAULT 0,
+                render_mode TEXT NOT NULL DEFAULT 'ass',
+                subtitle_layout TEXT NOT NULL DEFAULT 'target-above',
+                preview_text_mode TEXT NOT NULL DEFAULT 'medium',
                 primary_font_name TEXT NOT NULL DEFAULT 'Arial',
                 primary_font_size INTEGER NOT NULL DEFAULT 48,
                 primary_color TEXT NOT NULL DEFAULT '#FFFFFF',
                 primary_outline_color TEXT NOT NULL DEFAULT '#000000',
                 primary_outline_width REAL NOT NULL DEFAULT 2.0,
                 primary_spacing REAL NOT NULL DEFAULT 0.0,
+                primary_margin_bottom INTEGER NOT NULL DEFAULT 48,
                 secondary_font_name TEXT NOT NULL DEFAULT 'Arial',
                 secondary_font_size INTEGER NOT NULL DEFAULT 36,
                 secondary_color TEXT NOT NULL DEFAULT '#FFFFFF',
@@ -618,6 +622,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 secondary_outline_width REAL NOT NULL DEFAULT 2.0,
                 secondary_spacing REAL NOT NULL DEFAULT 0.0,
                 vertical_spacing INTEGER NOT NULL DEFAULT 15,
+                rounded_font_name TEXT NOT NULL DEFAULT 'Microsoft YaHei',
+                rounded_font_size INTEGER NOT NULL DEFAULT 34,
+                rounded_text_color TEXT NOT NULL DEFAULT '#FFFFFF',
+                rounded_background_color TEXT NOT NULL DEFAULT '#191919CC',
+                rounded_corner_radius INTEGER NOT NULL DEFAULT 14,
+                rounded_padding_x INTEGER NOT NULL DEFAULT 24,
+                rounded_padding_y INTEGER NOT NULL DEFAULT 14,
+                rounded_margin_bottom INTEGER NOT NULL DEFAULT 60,
+                rounded_line_spacing INTEGER NOT NULL DEFAULT 10,
+                rounded_letter_spacing INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -716,6 +730,90 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         "published_rank",
         "ALTER TABLE youtube_videos ADD COLUMN published_rank INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "render_mode",
+        "ALTER TABLE subtitle_styles ADD COLUMN render_mode TEXT NOT NULL DEFAULT 'ass'",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "subtitle_layout",
+        "ALTER TABLE subtitle_styles ADD COLUMN subtitle_layout TEXT NOT NULL DEFAULT 'target-above'",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "preview_text_mode",
+        "ALTER TABLE subtitle_styles ADD COLUMN preview_text_mode TEXT NOT NULL DEFAULT 'medium'",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "primary_margin_bottom",
+        "ALTER TABLE subtitle_styles ADD COLUMN primary_margin_bottom INTEGER NOT NULL DEFAULT 48",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_font_name",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_font_name TEXT NOT NULL DEFAULT 'Microsoft YaHei'",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_font_size",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_font_size INTEGER NOT NULL DEFAULT 34",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_text_color",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_text_color TEXT NOT NULL DEFAULT '#FFFFFF'",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_background_color",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_background_color TEXT NOT NULL DEFAULT '#191919CC'",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_corner_radius",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_corner_radius INTEGER NOT NULL DEFAULT 14",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_padding_x",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_padding_x INTEGER NOT NULL DEFAULT 24",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_padding_y",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_padding_y INTEGER NOT NULL DEFAULT 14",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_margin_bottom",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_margin_bottom INTEGER NOT NULL DEFAULT 60",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_line_spacing",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_line_spacing INTEGER NOT NULL DEFAULT 10",
+    )?;
+    ensure_column(
+        connection,
+        "subtitle_styles",
+        "rounded_letter_spacing",
+        "ALTER TABLE subtitle_styles ADD COLUMN rounded_letter_spacing INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     for service in LLM_SERVICES {
         connection
@@ -744,12 +842,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 id,
                 name,
                 is_default,
+                render_mode,
+                subtitle_layout,
+                preview_text_mode,
                 primary_font_name,
                 primary_font_size,
                 primary_color,
                 primary_outline_color,
                 primary_outline_width,
                 primary_spacing,
+                primary_margin_bottom,
                 secondary_font_name,
                 secondary_font_size,
                 secondary_color,
@@ -757,6 +859,16 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 secondary_outline_width,
                 secondary_spacing,
                 vertical_spacing,
+                rounded_font_name,
+                rounded_font_size,
+                rounded_text_color,
+                rounded_background_color,
+                rounded_corner_radius,
+                rounded_padding_x,
+                rounded_padding_y,
+                rounded_margin_bottom,
+                rounded_line_spacing,
+                rounded_letter_spacing,
                 created_at,
                 updated_at
             )
@@ -764,19 +876,33 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 'default',
                 '默认样式',
                 1,
-                'Arial',
+                'ass',
+                'target-above',
+                'medium',
+                'Microsoft YaHei',
                 48,
                 '#FFFFFF',
                 '#000000',
                 2.0,
                 0.0,
-                'Arial',
+                48,
+                'Microsoft YaHei',
                 36,
                 '#FFFFFF',
                 '#000000',
                 2.0,
                 0.0,
                 15,
+                'Microsoft YaHei',
+                34,
+                '#FFFFFF',
+                '#191919CC',
+                14,
+                24,
+                14,
+                60,
+                10,
+                0,
                 datetime('now'),
                 datetime('now')
             )
@@ -784,6 +910,156 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| format!("无法初始化默认字幕样式: {error}"))?;
+    connection
+        .execute(
+            "
+            INSERT OR IGNORE INTO subtitle_styles (
+                id,
+                name,
+                is_default,
+                render_mode,
+                subtitle_layout,
+                preview_text_mode,
+                primary_font_name,
+                primary_font_size,
+                primary_color,
+                primary_outline_color,
+                primary_outline_width,
+                primary_spacing,
+                primary_margin_bottom,
+                secondary_font_name,
+                secondary_font_size,
+                secondary_color,
+                secondary_outline_color,
+                secondary_outline_width,
+                secondary_spacing,
+                vertical_spacing,
+                rounded_font_name,
+                rounded_font_size,
+                rounded_text_color,
+                rounded_background_color,
+                rounded_corner_radius,
+                rounded_padding_x,
+                rounded_padding_y,
+                rounded_margin_bottom,
+                rounded_line_spacing,
+                rounded_letter_spacing,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                'rounded-default',
+                '圆角背景',
+                0,
+                'rounded',
+                'target-above',
+                'medium',
+                'Microsoft YaHei',
+                44,
+                '#FFFFFF',
+                '#000000',
+                2.0,
+                0.0,
+                48,
+                'Microsoft YaHei',
+                32,
+                '#FFFFFF',
+                '#000000',
+                2.0,
+                0.0,
+                15,
+                'Microsoft YaHei',
+                34,
+                '#FFFFFF',
+                '#191919CC',
+                14,
+                24,
+                14,
+                60,
+                10,
+                0,
+                datetime('now'),
+                datetime('now')
+            )
+            ",
+            [],
+        )
+        .map_err(|error| format!("无法初始化圆角字幕样式: {error}"))?;
+    connection
+        .execute(
+            "
+            INSERT OR IGNORE INTO subtitle_styles (
+                id,
+                name,
+                is_default,
+                render_mode,
+                subtitle_layout,
+                preview_text_mode,
+                primary_font_name,
+                primary_font_size,
+                primary_color,
+                primary_outline_color,
+                primary_outline_width,
+                primary_spacing,
+                primary_margin_bottom,
+                secondary_font_name,
+                secondary_font_size,
+                secondary_color,
+                secondary_outline_color,
+                secondary_outline_width,
+                secondary_spacing,
+                vertical_spacing,
+                rounded_font_name,
+                rounded_font_size,
+                rounded_text_color,
+                rounded_background_color,
+                rounded_corner_radius,
+                rounded_padding_x,
+                rounded_padding_y,
+                rounded_margin_bottom,
+                rounded_line_spacing,
+                rounded_letter_spacing,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                'anime',
+                '活力描边',
+                0,
+                'ass',
+                'target-above',
+                'short',
+                'Microsoft YaHei',
+                46,
+                '#FFF5F3',
+                '#F58709',
+                2.6,
+                2.6,
+                40,
+                'Microsoft YaHei',
+                26,
+                '#FFFFFF',
+                '#F58709',
+                2.0,
+                0.0,
+                14,
+                'Microsoft YaHei',
+                34,
+                '#FFFFFF',
+                '#191919CC',
+                14,
+                24,
+                14,
+                60,
+                10,
+                0,
+                datetime('now'),
+                datetime('now')
+            )
+            ",
+            [],
+        )
+        .map_err(|error| format!("无法初始化活力字幕样式: {error}"))?;
 
     Ok(())
 }
