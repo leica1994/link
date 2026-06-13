@@ -12,6 +12,10 @@
       <MicVocal class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
       <span>配音</span>
     </RouterLink>
+    <RouterLink to="/subtitle-style" class="nav-item" :class="{ active: route.path === '/subtitle-style' }">
+      <Type class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
+      <span>字幕</span>
+    </RouterLink>
     <RouterLink
       to="/youtube-monitor"
       class="nav-item"
@@ -28,7 +32,7 @@
 </template>
 
 <script setup lang="ts">
-import { House, Languages, MicVocal, Radar, Settings } from 'lucide-vue-next'
+import { House, Languages, MicVocal, Radar, Settings, Type } from 'lucide-vue-next'
 import { useRoute, RouterLink } from 'vue-router'
 
 const route = useRoute()

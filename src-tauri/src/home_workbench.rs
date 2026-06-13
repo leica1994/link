@@ -671,10 +671,10 @@ fn ensure_video_downloaded(
                 "progress": 100,
                 "status": "done",
                 "message": "视频文件已就绪",
-                "downloadedBytes": null as Option<u64>,
-                "totalBytes": null as Option<u64>,
-                "language": null as Option<String>,
-                "sourceKind": null as Option<String>,
+                "downloadedBytes": serde_json::Value::Null,
+                "totalBytes": serde_json::Value::Null,
+                "language": serde_json::Value::Null,
+                "sourceKind": serde_json::Value::Null,
             }),
         );
         return Ok(video);

@@ -119,7 +119,7 @@ impl SettingsStore {
                 "video_content_type",
                 "general",
             ),
-            output_mode: read_string_setting(&setting_values, "output_mode", "bilingual"),
+            output_mode: read_string_setting(&setting_values, "output_mode", "ass"),
             is_subtitle_correction_enabled: read_bool_setting(
                 &setting_values,
                 "is_subtitle_correction_enabled",
@@ -601,6 +601,27 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS subtitle_styles (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL UNIQUE,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                primary_font_name TEXT NOT NULL DEFAULT 'Arial',
+                primary_font_size INTEGER NOT NULL DEFAULT 48,
+                primary_color TEXT NOT NULL DEFAULT '#FFFFFF',
+                primary_outline_color TEXT NOT NULL DEFAULT '#000000',
+                primary_outline_width REAL NOT NULL DEFAULT 2.0,
+                primary_spacing REAL NOT NULL DEFAULT 0.0,
+                secondary_font_name TEXT NOT NULL DEFAULT 'Arial',
+                secondary_font_size INTEGER NOT NULL DEFAULT 36,
+                secondary_color TEXT NOT NULL DEFAULT '#FFFFFF',
+                secondary_outline_color TEXT NOT NULL DEFAULT '#000000',
+                secondary_outline_width REAL NOT NULL DEFAULT 2.0,
+                secondary_spacing REAL NOT NULL DEFAULT 0.0,
+                vertical_spacing INTEGER NOT NULL DEFAULT 15,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_youtube_channels_updated_at
                 ON youtube_channels(updated_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_seen
@@ -623,6 +644,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON home_workbench_tasks(updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_workbench_artifacts_task
                 ON home_workbench_artifacts(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_subtitle_styles_name
+                ON subtitle_styles(name);
             ",
         )
         .map_err(|error| format!("无法初始化设置数据库: {error}"))?;
@@ -712,6 +735,55 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             )
             .map_err(|error| format!("无法初始化 LLM 配置: {error}"))?;
     }
+
+    // 初始化默认字幕样式
+    connection
+        .execute(
+            "
+            INSERT OR IGNORE INTO subtitle_styles (
+                id,
+                name,
+                is_default,
+                primary_font_name,
+                primary_font_size,
+                primary_color,
+                primary_outline_color,
+                primary_outline_width,
+                primary_spacing,
+                secondary_font_name,
+                secondary_font_size,
+                secondary_color,
+                secondary_outline_color,
+                secondary_outline_width,
+                secondary_spacing,
+                vertical_spacing,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                'default',
+                '默认样式',
+                1,
+                'Arial',
+                48,
+                '#FFFFFF',
+                '#000000',
+                2.0,
+                0.0,
+                'Arial',
+                36,
+                '#FFFFFF',
+                '#000000',
+                2.0,
+                0.0,
+                15,
+                datetime('now'),
+                datetime('now')
+            )
+            ",
+            [],
+        )
+        .map_err(|error| format!("无法初始化默认字幕样式: {error}"))?;
 
     Ok(())
 }

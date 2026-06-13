@@ -134,6 +134,10 @@ export const outputModeOptions = [
   { value: OutputMode.SourceAndTargetFiles, label: '原文与译文文件' },
 ] as const
 
+const assModeOptions = [
+  { value: 'ass', label: 'ASS' },
+] as const
+
 export const referenceAudioSourceOptions = [
   { value: ReferenceAudioSource.ExistingDubbing, label: '克隆现有配音' },
   { value: ReferenceAudioSource.CustomAudioFile, label: '自定义音频文件' },
