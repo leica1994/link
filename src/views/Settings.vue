@@ -400,6 +400,67 @@
         </div>
       </section>
 
+      <section class="settings-section" aria-labelledby="home-workbench-settings-title">
+        <div id="home-workbench-settings-title" class="section-heading">
+          <Workflow aria-hidden="true" />
+          <span>工作台</span>
+        </div>
+
+        <div class="settings-panel">
+          <div class="setting-row">
+            <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">翻译与优化</div>
+              <div class="setting-subtitle">开启后待办工作台会默认执行字幕翻译与优化</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: homeWorkbenchTranslationEnabled }"
+              type="button"
+              :aria-pressed="homeWorkbenchTranslationEnabled"
+              @click="toggleHomeWorkbenchTranslation"
+            >
+              <span class="setting-toggle-label">{{ homeWorkbenchTranslationEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <MicVocal class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">配音</div>
+              <div class="setting-subtitle">开启后待办工作台会在翻译后继续生成配音视频</div>
+            </div>
+            <button
+              class="setting-toggle"
+              :class="{ active: homeWorkbenchDubbingEnabled }"
+              type="button"
+              :aria-pressed="homeWorkbenchDubbingEnabled"
+              :disabled="!homeWorkbenchTranslationEnabled"
+              @click="toggleHomeWorkbenchDubbing"
+            >
+              <span class="setting-toggle-label">{{ homeWorkbenchDubbingEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-track" aria-hidden="true">
+                <span class="setting-toggle-thumb" />
+              </span>
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <FolderOpen class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">导出目录</div>
+              <div class="setting-subtitle">{{ homeWorkbenchExportDirLabel }}</div>
+            </div>
+            <button class="settings-action" type="button" @click="selectHomeWorkbenchExportDir">
+              选择目录
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section" aria-labelledby="network-settings-title">
         <div id="network-settings-title" class="section-heading">
           <Globe aria-hidden="true" />
@@ -424,67 +485,6 @@
               spellcheck="false"
               aria-label="yt-dlp 代理"
             />
-          </div>
-        </div>
-      </section>
-
-      <section class="settings-section" aria-labelledby="home-workbench-settings-title">
-        <div id="home-workbench-settings-title" class="section-heading">
-          <Workflow aria-hidden="true" />
-          <span>主页工作台</span>
-        </div>
-
-        <div class="settings-panel">
-          <div class="setting-row">
-            <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
-            <div class="setting-copy">
-              <div class="setting-title">默认翻译与优化</div>
-              <div class="setting-subtitle">开启后主页待办工作台会默认执行字幕翻译与优化</div>
-            </div>
-            <button
-              class="setting-toggle"
-              :class="{ active: homeWorkbenchTranslationEnabled }"
-              type="button"
-              :aria-pressed="homeWorkbenchTranslationEnabled"
-              @click="toggleHomeWorkbenchTranslation"
-            >
-              <span class="setting-toggle-label">{{ homeWorkbenchTranslationEnabled ? '开' : '关' }}</span>
-              <span class="setting-toggle-track" aria-hidden="true">
-                <span class="setting-toggle-thumb" />
-              </span>
-            </button>
-          </div>
-
-          <div class="setting-row">
-            <MicVocal class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
-            <div class="setting-copy">
-              <div class="setting-title">默认配音</div>
-              <div class="setting-subtitle">开启后主页待办工作台会在翻译后继续生成配音视频</div>
-            </div>
-            <button
-              class="setting-toggle"
-              :class="{ active: homeWorkbenchDubbingEnabled }"
-              type="button"
-              :aria-pressed="homeWorkbenchDubbingEnabled"
-              :disabled="!homeWorkbenchTranslationEnabled"
-              @click="toggleHomeWorkbenchDubbing"
-            >
-              <span class="setting-toggle-label">{{ homeWorkbenchDubbingEnabled ? '开' : '关' }}</span>
-              <span class="setting-toggle-track" aria-hidden="true">
-                <span class="setting-toggle-thumb" />
-              </span>
-            </button>
-          </div>
-
-          <div class="setting-row">
-            <FolderOpen class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
-            <div class="setting-copy">
-              <div class="setting-title">默认导出目录</div>
-              <div class="setting-subtitle">{{ homeWorkbenchExportDirLabel }}</div>
-            </div>
-            <button class="settings-action" type="button" @click="selectHomeWorkbenchExportDir">
-              选择目录
-            </button>
           </div>
         </div>
       </section>
