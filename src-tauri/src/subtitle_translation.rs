@@ -12,11 +12,15 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
 const PROGRESS_EVENT: &str = "subtitle-translation-progress";
 const MAX_TRANSLATION_ATTEMPTS: usize = 3;
 const MAX_POST_OPTIMIZATION_ATTEMPTS: usize = 3;
+
+pub(crate) type SubtitleTranslationProgressSink =
+    Arc<dyn Fn(SubtitleTranslationProgress) + Send + Sync>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +98,7 @@ struct TranslationSnapshotEmitter {
     app: AppHandle,
     revision: u64,
     workflow_progress: TranslationWorkflowProgress,
+    progress_sink: Option<SubtitleTranslationProgressSink>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +154,18 @@ pub(crate) async fn run_subtitle_translation_workflow(
     request: SubtitleTranslationRequest,
     settings: AppSettings,
 ) -> Result<SubtitleTranslationResult, String> {
+    run_subtitle_translation_workflow_with_sink(app, ai_service, app_logger, request, settings, None)
+        .await
+}
+
+pub(crate) async fn run_subtitle_translation_workflow_with_sink(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: SubtitleTranslationRequest,
+    settings: AppSettings,
+    progress_sink: Option<SubtitleTranslationProgressSink>,
+) -> Result<SubtitleTranslationResult, String> {
     let log_session = app_logger.start_session("subtitle_translation")?;
     log_session.info(
         "request_received",
@@ -171,6 +188,7 @@ pub(crate) async fn run_subtitle_translation_workflow(
         None,
         None,
         &[],
+        progress_sink.as_ref(),
     );
 
     let mut source_segments = load_subtitle_segments(&input_path)?;
@@ -181,7 +199,11 @@ pub(crate) async fn run_subtitle_translation_workflow(
     assign_segment_metadata(&mut source_segments, "src", "raw");
     let mut translated_segments = build_empty_translated_segments(&source_segments);
     let mut warnings = Vec::new();
-    let mut emitter = TranslationSnapshotEmitter::new(app.clone(), workflow_progress.clone());
+    let mut emitter = TranslationSnapshotEmitter::new(
+        app.clone(),
+        workflow_progress.clone(),
+        progress_sink.clone(),
+    );
     emitter.emit(
         "字幕已导入",
         &source_segments,
@@ -418,11 +440,16 @@ impl TranslationWorkflowProgress {
 }
 
 impl TranslationSnapshotEmitter {
-    fn new(app: AppHandle, workflow_progress: TranslationWorkflowProgress) -> Self {
+    fn new(
+        app: AppHandle,
+        workflow_progress: TranslationWorkflowProgress,
+        progress_sink: Option<SubtitleTranslationProgressSink>,
+    ) -> Self {
         Self {
             app,
             revision: 0,
             workflow_progress,
+            progress_sink,
         }
     }
 
@@ -444,6 +471,7 @@ impl TranslationSnapshotEmitter {
             Some(source_segments.to_vec()),
             Some(translated_segments.to_vec()),
             warnings,
+            self.progress_sink.as_ref(),
         );
     }
 }
@@ -2338,19 +2366,21 @@ fn emit_progress_event(
     source_segments: Option<Vec<TranscriptionSegment>>,
     translated_segments: Option<Vec<TranscriptionSegment>>,
     warnings: &[String],
+    progress_sink: Option<&SubtitleTranslationProgressSink>,
 ) {
-    let _ = app.emit(
-        PROGRESS_EVENT,
-        SubtitleTranslationProgress {
-            progress,
-            message: message.to_string(),
-            stage_progress,
-            revision,
-            source_segments,
-            translated_segments,
-            warnings: warnings.to_vec(),
-        },
-    );
+    let payload = SubtitleTranslationProgress {
+        progress,
+        message: message.to_string(),
+        stage_progress,
+        revision,
+        source_segments,
+        translated_segments,
+        warnings: warnings.to_vec(),
+    };
+    if let Some(sink) = progress_sink {
+        sink(payload.clone());
+    }
+    let _ = app.emit(PROGRESS_EVENT, payload);
 }
 
 fn estimate_max_output_tokens(text: &str) -> u32 {

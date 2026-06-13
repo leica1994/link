@@ -293,22 +293,37 @@
                   </span>
                 </span>
 
-                <button
-                  class="settings-action youtube-monitor-action home-video-download-button"
-                  type="button"
-                  :disabled="isActiveTaskDownloadingVideo || !ytdlpStatus.isAvailable"
-                  @click="downloadVideo"
-                >
-                  <LoaderCircle
-                    v-if="isActiveTaskDownloadingVideo"
-                    class="spinning"
-                    :stroke-width="2.1"
-                    aria-hidden="true"
-                  />
-                  <CheckCircle2 v-else-if="activeTask.downloadedVideo" :stroke-width="2.1" aria-hidden="true" />
-                  <Download v-else :stroke-width="2.1" aria-hidden="true" />
-                  <span>{{ videoActionLabel }}</span>
-                </button>
+                <span class="home-video-download-actions">
+                  <button
+                    class="settings-action youtube-monitor-action home-video-download-button"
+                    type="button"
+                    :disabled="isActiveTaskDownloadingVideo || !ytdlpStatus.isAvailable"
+                    @click="downloadVideo"
+                  >
+                    <LoaderCircle
+                      v-if="isActiveTaskDownloadingVideo"
+                      class="spinning"
+                      :stroke-width="2.1"
+                      aria-hidden="true"
+                    />
+                    <CheckCircle2 v-else-if="activeTask.downloadedVideo" :stroke-width="2.1" aria-hidden="true" />
+                    <Download v-else :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ videoActionLabel }}</span>
+                  </button>
+
+                  <button
+                    v-if="activeTask.downloadedVideo"
+                    class="settings-action youtube-monitor-action"
+                    type="button"
+                    :disabled="isVideoAddedToWorkbench || isAddingWorkbenchVideo || isWorkbenchRunning"
+                    @click="addVideoToWorkbench"
+                  >
+                    <LoaderCircle v-if="isAddingWorkbenchVideo" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+                    <CheckCircle2 v-else-if="isVideoAddedToWorkbench" :stroke-width="2.1" aria-hidden="true" />
+                    <Plus v-else :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ isVideoAddedToWorkbench ? '已加入工作台' : '添加到工作台' }}</span>
+                  </button>
+                </span>
               </div>
 
               <div
@@ -382,6 +397,28 @@
                     <span>{{ subtitleActionLabel(option) }}</span>
                   </button>
 
+                  <button
+                    v-if="downloadedSubtitleForOption(option)"
+                    class="settings-action youtube-monitor-action"
+                    type="button"
+                    :disabled="isSubtitleAddedToWorkbench(option) || isAddingSubtitleToWorkbench(option) || isWorkbenchRunning"
+                    @click="addSubtitleOptionToWorkbench(option)"
+                  >
+                    <LoaderCircle
+                      v-if="isAddingSubtitleToWorkbench(option)"
+                      class="spinning"
+                      :stroke-width="2.1"
+                      aria-hidden="true"
+                    />
+                    <CheckCircle2
+                      v-else-if="isSubtitleAddedToWorkbench(option)"
+                      :stroke-width="2.1"
+                      aria-hidden="true"
+                    />
+                    <Plus v-else :stroke-width="2.1" aria-hidden="true" />
+                    <span>{{ isSubtitleAddedToWorkbench(option) ? '已加入工作台' : '添加到工作台' }}</span>
+                  </button>
+
                   <div
                     v-if="isSubtitleDownloading(option)"
                     class="home-download-progress home-subtitle-progress"
@@ -444,7 +481,7 @@
                 >
                   <LoaderCircle v-if="isWorkbenchRunning" class="spinning" :stroke-width="2.1" aria-hidden="true" />
                   <Play v-else :stroke-width="2.1" aria-hidden="true" />
-                  <span>{{ isWorkbenchRunning ? '执行中' : '开始执行' }}</span>
+                  <span>{{ workbenchRunLabel }}</span>
                 </button>
 
                 <button
@@ -546,11 +583,14 @@
               </div>
 
               <div class="home-workbench-stage-list" aria-label="工作台执行步骤">
-                <article
+                <button
                   v-for="stage in workbenchStages"
                   :key="stage.key"
                   class="home-workbench-stage"
-                  :class="stage.status"
+                  :class="[stage.status, { selected: selectedWorkbenchStage?.key === stage.key }]"
+                  type="button"
+                  :aria-pressed="selectedWorkbenchStage?.key === stage.key"
+                  @click="selectWorkbenchStage(stage)"
                 >
                   <span class="home-workbench-stage-mark">
                     <CheckCircle2 v-if="stage.status === 'done' || stage.status === 'skipped'" :stroke-width="2.1" aria-hidden="true" />
@@ -575,7 +615,175 @@
                     </span>
                   </span>
                   <span class="home-workbench-stage-value">{{ stage.progress }}%</span>
-                </article>
+                </button>
+              </div>
+
+              <div v-if="selectedWorkbenchStage" class="home-workbench-detail" aria-live="polite">
+                <div class="home-workbench-detail-header">
+                  <span class="home-workbench-detail-title">{{ selectedWorkbenchStage.label }}详情</span>
+                  <span class="home-workbench-detail-status" :class="selectedWorkbenchStage.status">
+                    {{ workbenchStageStatusLabel(selectedWorkbenchStage.status) }}
+                  </span>
+                </div>
+
+                <div v-if="selectedWorkbenchStage.key === 'download-video'" class="home-workbench-detail-file">
+                  <FileCheck2 :stroke-width="2.1" aria-hidden="true" />
+                  <span class="home-workbench-artifact-copy">
+                    <span class="home-workbench-artifact-title">
+                      {{ isVideoAddedToWorkbench ? '工作台视频已就绪' : selectedWorkbenchStage.message }}
+                    </span>
+                    <span class="home-workbench-artifact-path">
+                      {{ readStringValue(selectedWorkbenchStageSnapshot.path) || activeTask.downloadedVideo?.filePath || '等待视频下载或添加到工作台' }}
+                    </span>
+                  </span>
+                </div>
+
+                <template v-else-if="selectedWorkbenchStage.key === 'prepare-subtitle'">
+                  <div v-if="workbenchPrepareSubtitleSteps.length > 0" class="home-workbench-detail-steps">
+                    <div
+                      v-for="step in workbenchPrepareSubtitleSteps"
+                      :key="step.key"
+                      class="dubbing-media-step"
+                      :class="step.status"
+                    >
+                      <div class="dubbing-media-step-top">
+                        <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                        <span class="dubbing-media-step-title">{{ step.label }}</span>
+                        <span class="dubbing-media-step-status">{{ workbenchStageStatusLabel(step.status) }}</span>
+                      </div>
+                      <span class="dubbing-media-step-subtitle">{{ step.message }}</span>
+                      <div class="dubbing-media-step-progress">
+                        <span class="dubbing-media-step-track" role="progressbar" :aria-valuenow="step.progress" aria-valuemin="0" aria-valuemax="100" :aria-label="`${step.label}进度`">
+                          <span class="dubbing-media-step-bar" :style="{ width: `${step.progress}%` }" aria-hidden="true" />
+                        </span>
+                        <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="workbenchSubtitleSegments.length > 0" class="translate-preview translate-subtitle-list home-workbench-subtitle-preview">
+                    <article
+                      v-for="(segment, index) in workbenchSubtitleSegments"
+                      :key="segment.uid || `workbench-subtitle-${index}`"
+                      class="translate-subtitle-row"
+                    >
+                      <span class="translate-subtitle-index">{{ index + 1 }}</span>
+                      <span class="translate-subtitle-status" :class="`status-${normalizeSegmentStatus(segment.status)}`">
+                        {{ segmentStatusLabel(segment.status) }}
+                      </span>
+                      <span class="translate-subtitle-time translate-subtitle-start">{{ formatSegmentTime(segment.startTime) }}</span>
+                      <span class="translate-subtitle-time translate-subtitle-end">{{ formatSegmentTime(segment.endTime) }}</span>
+                      <p>{{ segment.text }}</p>
+                    </article>
+                  </div>
+                  <div v-else class="home-workbench-detail-file">
+                    <Captions :stroke-width="2.1" aria-hidden="true" />
+                    <span class="home-workbench-artifact-copy">
+                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-path">
+                        {{ readStringValue(selectedWorkbenchStageSnapshot.path) || '等待转录或添加下载字幕' }}
+                      </span>
+                    </span>
+                  </div>
+                </template>
+
+                <template v-else-if="selectedWorkbenchStage.key === 'translation'">
+                  <div v-if="workbenchTranslationSteps.length > 0" class="home-workbench-detail-steps">
+                    <div
+                      v-for="step in workbenchTranslationSteps"
+                      :key="step.key"
+                      class="dubbing-media-step"
+                      :class="step.status"
+                    >
+                      <div class="dubbing-media-step-top">
+                        <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                        <span class="dubbing-media-step-title">{{ step.label }}</span>
+                        <span class="dubbing-media-step-status">{{ workbenchStageStatusLabel(step.status) }}</span>
+                      </div>
+                      <span class="dubbing-media-step-subtitle">{{ step.message }}</span>
+                      <div class="dubbing-media-step-progress">
+                        <span class="dubbing-media-step-track" role="progressbar" :aria-valuenow="step.progress" aria-valuemin="0" aria-valuemax="100" :aria-label="`${step.label}进度`">
+                          <span class="dubbing-media-step-bar" :style="{ width: `${step.progress}%` }" aria-hidden="true" />
+                        </span>
+                        <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="workbenchTranslationRows.length > 0" class="translate-preview translate-subtitle-list translate-translation-table home-workbench-subtitle-preview" role="table" aria-label="工作台翻译详情">
+                    <article v-for="row in workbenchTranslationRows" :key="row.key" class="translate-translation-row" role="row">
+                      <span class="translate-subtitle-index" role="cell">{{ row.index }}</span>
+                      <span class="translate-subtitle-status" :class="`status-${normalizeSegmentStatus(row.status)}`" role="cell">
+                        {{ segmentStatusLabel(row.status) }}
+                      </span>
+                      <span class="translate-subtitle-time translate-subtitle-start translate-translation-start" role="cell">{{ formatSegmentTime(row.startTime) }}</span>
+                      <span class="translate-subtitle-time translate-subtitle-end translate-translation-end" role="cell">{{ formatSegmentTime(row.endTime) }}</span>
+                      <p class="translate-translation-source" role="cell">{{ row.sourceText }}</p>
+                      <p class="translate-translation-target" :class="{ empty: !row.targetText }" role="cell">
+                        {{ row.targetText || '等待处理' }}
+                      </p>
+                    </article>
+                  </div>
+                  <div v-else class="home-workbench-detail-file">
+                    <WandSparkles :stroke-width="2.1" aria-hidden="true" />
+                    <span class="home-workbench-artifact-copy">
+                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-path">{{ readStringValue(selectedWorkbenchStageSnapshot.path) || '等待字幕翻译' }}</span>
+                    </span>
+                  </div>
+                </template>
+
+                <template v-else-if="selectedWorkbenchStage.key === 'dubbing'">
+                  <div v-if="workbenchDubbingSteps.length > 0" class="home-workbench-detail-steps">
+                    <div
+                      v-for="step in workbenchDubbingSteps"
+                      :key="step.key"
+                      class="dubbing-media-step"
+                      :class="step.status"
+                    >
+                      <div class="dubbing-media-step-top">
+                        <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                        <span class="dubbing-media-step-title">{{ step.label }}</span>
+                        <span class="dubbing-media-step-status">{{ workbenchStageStatusLabel(step.status) }}</span>
+                      </div>
+                      <span class="dubbing-media-step-subtitle">{{ step.message }}</span>
+                      <div class="dubbing-media-step-progress">
+                        <span class="dubbing-media-step-track" role="progressbar" :aria-valuenow="step.progress" aria-valuemin="0" aria-valuemax="100" :aria-label="`${step.label}进度`">
+                          <span class="dubbing-media-step-bar" :style="{ width: `${step.progress}%` }" aria-hidden="true" />
+                        </span>
+                        <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="home-workbench-detail-file">
+                    <MicVocal :stroke-width="2.1" aria-hidden="true" />
+                    <span class="home-workbench-artifact-copy">
+                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-path">
+                        {{ readStringValue(selectedWorkbenchStageSnapshot.dubbingTaskId) || '等待配音流程' }}
+                      </span>
+                    </span>
+                  </div>
+                </template>
+
+                <template v-else-if="selectedWorkbenchStage.key === 'export'">
+                  <div v-if="workbenchExportRows.length > 0" class="home-workbench-artifacts inline">
+                    <article v-for="row in workbenchExportRows" :key="row.kind" class="home-workbench-artifact">
+                      <FileCheck2 :stroke-width="2.1" aria-hidden="true" />
+                      <span class="home-workbench-artifact-copy">
+                        <span class="home-workbench-artifact-title">{{ row.label }}</span>
+                        <span class="home-workbench-artifact-path">{{ row.path }}</span>
+                      </span>
+                    </article>
+                  </div>
+                  <div v-else class="home-workbench-detail-file">
+                    <FolderOpen :stroke-width="2.1" aria-hidden="true" />
+                    <span class="home-workbench-artifact-copy">
+                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-path">等待导出最终产物</span>
+                    </span>
+                  </div>
+                </template>
               </div>
 
               <div v-if="workbenchSnapshot?.errorMessage" class="translate-alert home-workbench-alert" role="alert">
@@ -1019,6 +1227,7 @@ type DownloadProgressKind = 'video' | 'subtitle'
 type WorkbenchStatus = 'idle' | 'running' | 'done' | 'failed'
 type WorkbenchStageStatus = 'pending' | 'active' | 'done' | 'skipped' | 'failed'
 type WorkbenchSubtitleSource = 'transcribe' | 'downloaded'
+type WorkbenchDetailStageStatus = WorkbenchStageStatus | 'interrupted'
 
 const VIDEO_DESCRIPTION_FALLBACK_HEIGHT = 276
 const HOME_DETAIL_NARROW_QUERY = '(max-width: 860px)'
@@ -1168,6 +1377,7 @@ type HomeWorkbenchStage = {
   progress: number
   status: WorkbenchStageStatus
   message: string
+  snapshot?: Record<string, unknown>
 }
 
 type HomeWorkbenchArtifact = {
@@ -1195,6 +1405,32 @@ type HomeWorkbenchSnapshot = {
   updatedAt: string
 }
 
+type WorkbenchDetailStep = {
+  key: string
+  label: string
+  progress: number
+  status: WorkbenchDetailStageStatus
+  message: string
+}
+
+type WorkbenchSubtitleSegment = {
+  uid?: string
+  text: string
+  startTime: number
+  endTime: number
+  status?: string
+}
+
+type WorkbenchTranslationRow = {
+  key: string
+  index: number
+  startTime: number
+  endTime: number
+  sourceText: string
+  targetText: string
+  status: string
+}
+
 const route = useRoute()
 const router = useRouter()
 
@@ -1211,6 +1447,7 @@ const isLoadingTasks = ref(false)
 const isAddingTask = ref(false)
 const isDeletingTask = ref(false)
 const isRefreshingDetail = ref(false)
+const isAddingWorkbenchVideo = ref(false)
 const downloadingVideoTaskIds = ref(new Set<string>())
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
@@ -1220,6 +1457,7 @@ const deleteError = ref('')
 const subtitleErrorsByTaskId = ref(new Map<string, string>())
 const videoErrorsByTaskId = ref(new Map<string, string>())
 const downloadingSubtitleKeys = ref(new Set<string>())
+const addingWorkbenchSubtitleIds = ref(new Set<string>())
 const downloadProgressByKey = ref(new Map<string, HomeVideoDownloadProgress>())
 const videoSideRef = ref<HTMLElement | null>(null)
 const videoCopyRef = ref<HTMLElement | null>(null)
@@ -1260,6 +1498,8 @@ const isWorkbenchLoading = ref(false)
 const isWorkbenchStarting = ref(false)
 const activeWorkbenchDialog = ref<WorkbenchDialog | null>(null)
 const activeWorkbenchParameterPanel = ref<WorkbenchParameterPanel | null>(null)
+const selectedWorkbenchStageKey = ref('')
+const isWorkbenchStageSelectionPinned = ref(false)
 const workbenchDialogSearch = ref('')
 let unlistenHomeDownloadProgress: UnlistenFn | undefined
 let unlistenHomeWorkbenchProgress: UnlistenFn | undefined
@@ -1454,6 +1694,27 @@ const workbenchStages = computed(() => {
   return workbenchSnapshot.value?.stages?.length ? workbenchSnapshot.value.stages : createDefaultWorkbenchStages()
 })
 
+const selectedWorkbenchStage = computed(() => {
+  return (
+    workbenchStages.value.find((stage) => stage.key === selectedWorkbenchStageKey.value) ??
+    preferredWorkbenchStage.value
+  )
+})
+
+const selectedWorkbenchStageSnapshot = computed(() => {
+  return selectedWorkbenchStage.value?.snapshot ?? {}
+})
+
+const preferredWorkbenchStage = computed(() => {
+  return (
+    workbenchStages.value.find((stage) => stage.status === 'active') ??
+    workbenchStages.value.find((stage) => stage.status === 'failed') ??
+    workbenchStages.value.find((stage) => stage.status === 'pending') ??
+    workbenchStages.value[0] ??
+    null
+  )
+})
+
 const workbenchMainMessage = computed(() => {
   if (isWorkbenchLoading.value) {
     return '正在读取工作台'
@@ -1520,6 +1781,118 @@ const exportedArtifacts = computed(() => {
   return (workbenchSnapshot.value?.artifacts ?? []).filter((artifact) =>
     ['exported-video', 'exported-subtitle'].includes(artifact.kind),
   )
+})
+
+const sourceVideoArtifact = computed(() => workbenchArtifactByKind('source-video'))
+
+const selectedSubtitleArtifact = computed(() => workbenchArtifactByKind('selected-subtitle'))
+
+const isVideoAddedToWorkbench = computed(() => Boolean(sourceVideoArtifact.value))
+
+const registeredSubtitleIds = computed(() => {
+  const subtitleId = readStringValue(selectedSubtitleArtifact.value?.metadata.subtitleId)
+  return subtitleId ? new Set([subtitleId]) : new Set<string>()
+})
+
+const workbenchRunLabel = computed(() => {
+  if (isWorkbenchRunning.value) {
+    return '执行中'
+  }
+  if (workbenchSnapshot.value?.status === 'failed') {
+    return '继续执行'
+  }
+  if (workbenchSnapshot.value?.stages.some((stage) => ['done', 'skipped'].includes(stage.status))) {
+    return '继续执行'
+  }
+  return '开始执行'
+})
+
+const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
+  const snapshot = selectedWorkbenchStageSnapshot.value
+  const mode = readStringValue(snapshot.mode)
+  if (mode === 'downloaded') {
+    return [
+      {
+        key: 'downloaded-subtitle',
+        label: '下载字幕',
+        progress: 100,
+        status: 'done',
+        message: '已添加到工作台',
+      },
+    ]
+  }
+  const stageProgress = readRecordValue(snapshot.stageProgress)
+  return [
+    { key: 'transcription', label: '转录', source: stageProgress.transcription },
+    { key: 'smartSegmentation', label: '智能断句', source: stageProgress.smartSegmentation },
+    { key: 'subtitleCorrection', label: '字幕校正', source: stageProgress.subtitleCorrection },
+  ]
+    .filter((item) => readRecordValue(item.source))
+    .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
+})
+
+const workbenchSubtitleSegments = computed<WorkbenchSubtitleSegment[]>(() => {
+  return readSubtitleSegments(selectedWorkbenchStageSnapshot.value.segments)
+})
+
+const workbenchTranslationSteps = computed<WorkbenchDetailStep[]>(() => {
+  const stageProgress = readRecordValue(selectedWorkbenchStageSnapshot.value.stageProgress)
+  return [
+    { key: 'subtitleTranslation', label: '字幕翻译', source: stageProgress.subtitleTranslation },
+    {
+      key: 'postTranslationOptimization',
+      label: '译后优化',
+      source: stageProgress.postTranslationOptimization,
+    },
+  ]
+    .filter((item) => readRecordValue(item.source))
+    .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
+})
+
+const workbenchTranslationRows = computed<WorkbenchTranslationRow[]>(() => {
+  const sourceSegments = readSubtitleSegments(selectedWorkbenchStageSnapshot.value.sourceSegments)
+  const translatedSegments = readSubtitleSegments(selectedWorkbenchStageSnapshot.value.translatedSegments)
+  const total = Math.max(sourceSegments.length, translatedSegments.length)
+  return Array.from({ length: total }, (_, index) => {
+    const source = sourceSegments[index]
+    const translated = translatedSegments[index]
+    return {
+      key: translated?.uid || source?.uid || `workbench-translation-${index}`,
+      index: index + 1,
+      startTime: source?.startTime ?? translated?.startTime ?? 0,
+      endTime: source?.endTime ?? translated?.endTime ?? 0,
+      sourceText: source?.text ?? '',
+      targetText: translated?.text ?? '',
+      status: translated?.status || source?.status || 'raw',
+    }
+  })
+})
+
+const workbenchDubbingSnapshot = computed(() => {
+  return readRecordValue(selectedWorkbenchStageSnapshot.value.dubbingSnapshot)
+})
+
+const workbenchDubbingSteps = computed<WorkbenchDetailStep[]>(() => {
+  const stages = readRecordValue(workbenchDubbingSnapshot.value.stages)
+  return [
+    { key: 'material', label: '素材准备', source: stages.material },
+    { key: 'subtitlePreprocess', label: '字幕预处理', source: stages.subtitlePreprocess },
+    { key: 'mediaSeparation', label: '音视频分离', source: stages.mediaSeparation },
+    { key: 'referenceAudio', label: '参考音频生成', source: stages.referenceAudio },
+    { key: 'ttsSynthesis', label: 'TTS 配音', source: stages.ttsSynthesis },
+    { key: 'audioVideoAlignment', label: '音视频对齐', source: stages.audioVideoAlignment },
+    { key: 'videoCompose', label: '视频合成', source: stages.videoCompose },
+  ]
+    .filter((item) => readRecordValue(item.source))
+    .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
+})
+
+const workbenchExportRows = computed(() => {
+  const snapshot = selectedWorkbenchStageSnapshot.value
+  return [
+    { kind: 'video', label: '视频文件', path: readStringValue(snapshot.videoPath) },
+    { kind: 'subtitle', label: '字幕文件', path: readStringValue(snapshot.subtitlePath) },
+  ].filter((row) => row.path)
 })
 
 const isWorkbenchLanguageDialog = computed(() => {
@@ -1648,6 +2021,8 @@ const workbenchDialogValue = computed(() => {
 })
 
 watch(activeTaskId, async () => {
+  selectedWorkbenchStageKey.value = ''
+  isWorkbenchStageSelectionPinned.value = false
   if (!activeTaskId.value) {
     workbenchSnapshot.value = null
     return
@@ -1664,6 +2039,10 @@ watch(activeTask, async () => {
   await nextTick()
   refreshVideoDescriptionObserver()
   scheduleVideoDescriptionMeasure()
+})
+
+watch(workbenchStages, () => {
+  syncSelectedWorkbenchStage()
 })
 
 onMounted(async () => {
@@ -2094,6 +2473,50 @@ const downloadVideo = async () => {
   }
 }
 
+const addVideoToWorkbench = async () => {
+  const task = activeTask.value
+  if (!task || isAddingWorkbenchVideo.value || isWorkbenchRunning.value || !isTauriRuntime()) {
+    return
+  }
+
+  isAddingWorkbenchVideo.value = true
+  pageError.value = ''
+  try {
+    const snapshot = await invoke<HomeWorkbenchSnapshot>('add_home_workbench_video_input', {
+      request: { taskId: task.id },
+    })
+    applyWorkbenchSnapshot(snapshot)
+    await reloadTask(task.id)
+  } catch (error) {
+    pageError.value = stringifyError(error, '添加视频到工作台失败')
+  } finally {
+    isAddingWorkbenchVideo.value = false
+  }
+}
+
+const addSubtitleToWorkbench = async (subtitle: HomeVideoSubtitle) => {
+  const task = activeTask.value
+  if (!task || addingWorkbenchSubtitleIds.value.has(subtitle.id) || isWorkbenchRunning.value || !isTauriRuntime()) {
+    return
+  }
+
+  addingWorkbenchSubtitleIds.value = new Set(addingWorkbenchSubtitleIds.value).add(subtitle.id)
+  pageError.value = ''
+  try {
+    const snapshot = await invoke<HomeWorkbenchSnapshot>('add_home_workbench_subtitle_input', {
+      request: { taskId: task.id, subtitleId: subtitle.id },
+    })
+    applyWorkbenchSnapshot(snapshot)
+    await reloadTask(task.id)
+  } catch (error) {
+    pageError.value = stringifyError(error, '添加字幕到工作台失败')
+  } finally {
+    const next = new Set(addingWorkbenchSubtitleIds.value)
+    next.delete(subtitle.id)
+    addingWorkbenchSubtitleIds.value = next
+  }
+}
+
 const startWorkbench = async () => {
   const taskId = activeTaskId.value
   if (!taskId || !canStartWorkbench.value || !isTauriRuntime()) {
@@ -2283,6 +2706,70 @@ const upsertTask = (task: HomeVideoTask) => {
 const applyWorkbenchSnapshot = (snapshot: HomeWorkbenchSnapshot) => {
   workbenchSnapshot.value = snapshot
   workbenchOptions.value = normalizeWorkbenchOptions(snapshot.options)
+  syncSelectedWorkbenchStage()
+}
+
+const syncSelectedWorkbenchStage = () => {
+  const stages = workbenchStages.value
+  if (
+    isWorkbenchStageSelectionPinned.value &&
+    selectedWorkbenchStageKey.value &&
+    stages.some((stage) => stage.key === selectedWorkbenchStageKey.value)
+  ) {
+    return
+  }
+  selectedWorkbenchStageKey.value = preferredWorkbenchStage.value?.key ?? ''
+}
+
+const selectWorkbenchStage = (stage: HomeWorkbenchStage) => {
+  selectedWorkbenchStageKey.value = stage.key
+  isWorkbenchStageSelectionPinned.value = true
+}
+
+const workbenchArtifactByKind = (kind: string) => {
+  return workbenchSnapshot.value?.artifacts.find((artifact) => artifact.kind === kind && artifact.path) ?? null
+}
+
+const readRecordValue = (value: unknown): Record<string, unknown> => {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+const readStringValue = (value: unknown) => {
+  return typeof value === 'string' ? value : ''
+}
+
+const readNumberValue = (value: unknown) => {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+const detailStepFromRecord = (key: string, label: string, value: Record<string, unknown>): WorkbenchDetailStep => ({
+  key,
+  label,
+  progress: clampProgress(readNumberValue(value.progress) ?? 0),
+  status: normalizeWorkbenchDetailStatus(readStringValue(value.status)),
+  message: readStringValue(value.message) || '等待处理',
+})
+
+const readSubtitleSegments = (value: unknown): WorkbenchSubtitleSegment[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value.map((item, index) => {
+    const record = readRecordValue(item)
+    return {
+      uid: readStringValue(record.uid) || `workbench-subtitle-${index}`,
+      text: readStringValue(record.text),
+      startTime: readNumberValue(record.startTime) ?? 0,
+      endTime: readNumberValue(record.endTime) ?? 0,
+      status: readStringValue(record.status) || 'raw',
+    }
+  })
+}
+
+const normalizeWorkbenchDetailStatus = (value: string): WorkbenchDetailStageStatus => {
+  return ['pending', 'active', 'done', 'skipped', 'failed', 'interrupted'].includes(value)
+    ? (value as WorkbenchDetailStageStatus)
+    : 'pending'
 }
 
 const sortTasksByCreatedAtDesc = (items: HomeVideoTask[]) => {
@@ -2430,13 +2917,15 @@ const normalizeWorkbenchOptions = (options: HomeWorkbenchOptions): HomeWorkbench
   return next
 }
 
-const createDefaultWorkbenchStages = (): HomeWorkbenchStage[] => [
-  { key: 'download-video', label: '下载视频', progress: 0, status: 'pending', message: '等待下载视频' },
-  { key: 'prepare-subtitle', label: '准备字幕', progress: 0, status: 'pending', message: '等待准备字幕' },
-  { key: 'translation', label: '翻译', progress: 0, status: 'pending', message: '等待翻译' },
-  { key: 'dubbing', label: '配音', progress: 0, status: 'pending', message: '等待配音' },
-  { key: 'export', label: '导出', progress: 0, status: 'pending', message: '等待导出' },
-]
+function createDefaultWorkbenchStages(): HomeWorkbenchStage[] {
+  return [
+    { key: 'download-video', label: '下载视频', progress: 0, status: 'pending', message: '等待下载视频' },
+    { key: 'prepare-subtitle', label: '准备字幕', progress: 0, status: 'pending', message: '等待准备字幕' },
+    { key: 'translation', label: '翻译', progress: 0, status: 'pending', message: '等待翻译' },
+    { key: 'dubbing', label: '配音', progress: 0, status: 'pending', message: '等待配音' },
+    { key: 'export', label: '导出', progress: 0, status: 'pending', message: '等待导出' },
+  ]
+}
 
 const stageOrderLabel = (key: string) => {
   const index = createDefaultWorkbenchStages().findIndex((stage) => stage.key === key)
@@ -2451,6 +2940,23 @@ const artifactLabel = (kind: string) => {
     return '导出字幕'
   }
   return '工作台产物'
+}
+
+const workbenchStageStatusLabel = (status: WorkbenchDetailStageStatus | string) => {
+  switch (status) {
+    case 'active':
+      return '执行中'
+    case 'done':
+      return '完成'
+    case 'skipped':
+      return '跳过'
+    case 'failed':
+      return '失败'
+    case 'interrupted':
+      return '已中断'
+    default:
+      return '等待'
+  }
 }
 
 const subtitleSubtitleLabel = (subtitle: HomeVideoSubtitle) => {
@@ -2519,6 +3025,23 @@ const downloadedSubtitleForOption = (option: HomeVideoSubtitleOption) => {
   }) ?? null
 }
 
+const isSubtitleAddedToWorkbench = (option: HomeVideoSubtitleOption) => {
+  const subtitle = downloadedSubtitleForOption(option)
+  return Boolean(subtitle && registeredSubtitleIds.value.has(subtitle.id))
+}
+
+const isAddingSubtitleToWorkbench = (option: HomeVideoSubtitleOption) => {
+  const subtitle = downloadedSubtitleForOption(option)
+  return Boolean(subtitle && addingWorkbenchSubtitleIds.value.has(subtitle.id))
+}
+
+const addSubtitleOptionToWorkbench = (option: HomeVideoSubtitleOption) => {
+  const subtitle = downloadedSubtitleForOption(option)
+  if (subtitle) {
+    void addSubtitleToWorkbench(subtitle)
+  }
+}
+
 const subtitleActionLabel = (option: HomeVideoSubtitleOption) => {
   if (isSubtitleDownloading(option)) {
     return '下载中'
@@ -2552,6 +3075,10 @@ const clearTaskError = (errors: Ref<Map<string, string>>, taskId: string) => {
 
 const clearTaskDownloadState = (taskId: string) => {
   setVideoTaskDownloading(taskId, false)
+  if (activeTaskId.value === taskId) {
+    isAddingWorkbenchVideo.value = false
+    addingWorkbenchSubtitleIds.value = new Set()
+  }
 
   const scopedPrefix = `${taskId}:`
   downloadingSubtitleKeys.value = new Set(
@@ -2582,6 +3109,48 @@ const clampProgress = (value: number) => {
   }
 
   return Math.min(100, Math.max(0, Math.round(value)))
+}
+
+const normalizeSegmentStatus = (status?: string) => {
+  const value = status || 'raw'
+  return ['raw', 'active', 'done', 'failed', 'translating', 'translated', 'optimizing', 'optimized', 'kept'].includes(value)
+    ? value
+    : 'raw'
+}
+
+const segmentStatusLabel = (status?: string) => {
+  switch (normalizeSegmentStatus(status)) {
+    case 'active':
+      return '处理中'
+    case 'done':
+      return '完成'
+    case 'failed':
+      return '失败'
+    case 'translating':
+      return '翻译中'
+    case 'translated':
+      return '已翻译'
+    case 'optimizing':
+      return '优化中'
+    case 'optimized':
+      return '已优化'
+    case 'kept':
+      return '保留原文'
+    default:
+      return '原文'
+  }
+}
+
+const formatSegmentTime = (ms: number) => {
+  const safeMs = Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : 0
+  const totalSeconds = Math.floor(safeMs / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const millis = safeMs % 1000
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds
+    .toString()
+    .padStart(2, '0')}.${millis.toString().padStart(3, '0')}`
 }
 
 const formatDuration = (duration?: number | null) => {

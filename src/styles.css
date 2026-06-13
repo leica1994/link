@@ -2671,7 +2671,7 @@ html[data-theme='dark'] .home-info-strip.error {
 }
 
 .home-subtitle-row {
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
 }
 
 .home-subtitle-progress {
@@ -2794,13 +2794,32 @@ html[data-theme='dark'] .home-subtitle-row.downloaded {
 
 .home-workbench-stage {
   min-height: 108px;
+  border: 0;
   background: color-mix(in srgb, var(--bg-surface) 92%, var(--bg));
+  color: inherit;
+  cursor: pointer;
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
   align-items: start;
   gap: 8px 10px;
   padding: 13px 14px;
+  text-align: left;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.home-workbench-stage:hover,
+.home-workbench-stage.selected {
+  background: var(--bg-surface-hover);
+}
+
+.home-workbench-stage.selected {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, var(--hairline));
+}
+
+.home-workbench-stage:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 64%, transparent);
+  outline-offset: -2px;
 }
 
 html[data-theme='dark'] .home-workbench-stage {
@@ -2900,6 +2919,108 @@ html[data-theme='dark'] .home-workbench-stage.failed .home-workbench-stage-mark 
 .home-workbench-stage-progress .translate-progress-track {
   height: 7px;
   background: color-mix(in srgb, var(--bg-surface-hover) 62%, var(--bg));
+}
+
+.home-video-download-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.home-workbench-detail {
+  margin-top: 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-surface) 88%, var(--bg));
+  padding: 14px;
+}
+
+html[data-theme='dark'] .home-workbench-detail {
+  background: color-mix(in srgb, var(--bg-surface) 84%, #000);
+}
+
+.home-workbench-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.home-workbench-detail-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 850;
+  line-height: 1.2;
+}
+
+.home-workbench-detail-status {
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+
+.home-workbench-detail-status.active {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--hairline));
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.home-workbench-detail-status.done,
+.home-workbench-detail-status.skipped {
+  border-color: rgba(47, 138, 85, 0.28);
+  color: #2f8a55;
+  background: rgba(47, 138, 85, 0.1);
+}
+
+.home-workbench-detail-status.failed,
+.home-workbench-detail-status.interrupted {
+  border-color: rgba(184, 59, 59, 0.28);
+  color: #9f3030;
+  background: rgba(184, 59, 59, 0.1);
+}
+
+.home-workbench-detail-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.home-workbench-detail-file {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  min-height: 64px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.home-workbench-detail-file > svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+  justify-self: center;
+}
+
+.home-workbench-subtitle-preview {
+  margin-top: 12px;
+  max-height: 360px;
+}
+
+.home-workbench-artifacts.inline {
+  margin-top: 12px;
 }
 
 .home-workbench-config-list {
@@ -4149,6 +4270,15 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
     width: 100%;
   }
 
+  .home-video-download-actions {
+    width: 100%;
+    flex-direction: column;
+  }
+
+  .home-video-download-actions .settings-action {
+    width: 100%;
+  }
+
   .home-video-download-meta {
     white-space: normal;
   }
@@ -4203,6 +4333,10 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
 
   .home-workbench-stage {
     min-height: 76px;
+  }
+
+  .home-workbench-detail-steps {
+    grid-template-columns: 1fr;
   }
 
   .setting-row.compact {

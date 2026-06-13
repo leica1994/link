@@ -10,6 +10,7 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -30,6 +31,8 @@ const SILENCE_THRESH_MAX_DB: f64 = -25.0;
 const MAX_UTTERANCE_DURATION_MS: u64 = 60 * 1000;
 const BLOB_SUB_CHUNK_DURATION_MS: u64 = 5 * 60 * 1000;
 const PROGRESS_EVENT: &str = "transcription-progress";
+
+pub(crate) type TranscriptionProgressSink = Arc<dyn Fn(TranscriptionProgress) + Send + Sync>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,14 +211,20 @@ struct SnapshotEmitter {
     app: AppHandle,
     revision: u64,
     workflow_progress: WorkflowProgress,
+    progress_sink: Option<TranscriptionProgressSink>,
 }
 
 impl SnapshotEmitter {
-    fn new(app: AppHandle, workflow_progress: WorkflowProgress) -> Self {
+    fn new(
+        app: AppHandle,
+        workflow_progress: WorkflowProgress,
+        progress_sink: Option<TranscriptionProgressSink>,
+    ) -> Self {
         Self {
             app,
             revision: 0,
             workflow_progress,
+            progress_sink,
         }
     }
 
@@ -228,6 +237,7 @@ impl SnapshotEmitter {
             self.revision,
             segments,
             warnings,
+            self.progress_sink.as_ref(),
         );
     }
 }
@@ -631,6 +641,17 @@ pub(crate) async fn run_transcription_workflow(
     request: TranscriptionRequest,
     settings: AppSettings,
 ) -> Result<TranscriptionResult, String> {
+    run_transcription_workflow_with_sink(app, ai_service, app_logger, request, settings, None).await
+}
+
+pub(crate) async fn run_transcription_workflow_with_sink(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: TranscriptionRequest,
+    settings: AppSettings,
+    progress_sink: Option<TranscriptionProgressSink>,
+) -> Result<TranscriptionResult, String> {
     let log_session = app_logger.start_session("transcription")?;
     log_session.info(
         "request_received",
@@ -671,17 +692,20 @@ pub(crate) async fn run_transcription_workflow(
         None,
         None,
         &[],
+        progress_sink.as_ref(),
     );
 
     let transcription_app = app.clone();
     let raw_log_session = log_session.clone();
     let raw_workflow_progress = workflow_progress.clone();
+    let raw_progress_sink = progress_sink.clone();
     let raw_result = match tauri::async_runtime::spawn_blocking(move || {
         run_transcription(
             transcription_app,
             request,
             raw_log_session,
             raw_workflow_progress,
+            raw_progress_sink,
         )
     })
     .await
@@ -704,7 +728,8 @@ pub(crate) async fn run_transcription_workflow(
 
     let mut segments = raw_result.segments;
     let mut warnings = Vec::new();
-    let mut emitter = SnapshotEmitter::new(app.clone(), workflow_progress.clone());
+    let mut emitter =
+        SnapshotEmitter::new(app.clone(), workflow_progress.clone(), progress_sink.clone());
 
     assign_segment_metadata(&mut segments, "raw", "raw");
     workflow_progress.set_stage(ProgressStage::Transcription, 100, "语音转录完成", "done");
@@ -733,6 +758,7 @@ pub(crate) async fn run_transcription_workflow(
             None,
             None,
             &warnings,
+            progress_sink.as_ref(),
         );
         log_session.info(
             "smart_segmentation_start",
@@ -794,6 +820,7 @@ pub(crate) async fn run_transcription_workflow(
             None,
             None,
             &warnings,
+            progress_sink.as_ref(),
         );
         log_session.info(
             "subtitle_correction_start",
@@ -932,6 +959,7 @@ fn run_transcription(
     request: TranscriptionRequest,
     log_session: LogSession,
     workflow_progress: WorkflowProgress,
+    progress_sink: Option<TranscriptionProgressSink>,
 ) -> Result<RawTranscriptionResult, String> {
     let input_path = PathBuf::from(&request.file_path);
     if !input_path.is_file() {
@@ -990,7 +1018,13 @@ fn run_transcription(
         }
     };
 
-    emit_progress(&app, &workflow_progress, 5, "转换音频中");
+    emit_progress(
+        &app,
+        &workflow_progress,
+        5,
+        "转换音频中",
+        progress_sink.as_ref(),
+    );
     log_session.info(
         "audio_conversion_start",
         "开始转换音频",
@@ -1013,7 +1047,13 @@ fn run_transcription(
         json!({ "tempAudioPath": audio_file.to_string_lossy() }),
     );
 
-    emit_progress(&app, &workflow_progress, 10, "语音转录中");
+    emit_progress(
+        &app,
+        &workflow_progress,
+        10,
+        "语音转录中",
+        progress_sink.as_ref(),
+    );
 
     let strategy = match create_strategy(&request.model) {
         Ok(strategy) => strategy,
@@ -1042,7 +1082,13 @@ fn run_transcription(
     };
     let mut progress_callback = |progress: u8, message: &str| {
         let scaled = 10_u8.saturating_add(((progress as u16 * 90) / 100) as u8);
-        emit_progress(&app, &workflow_progress, scaled.min(100), message);
+        emit_progress(
+            &app,
+            &workflow_progress,
+            scaled.min(100),
+            message,
+            progress_sink.as_ref(),
+        );
     };
 
     let segments = match strategy.transcribe(&audio_file, &options, &mut progress_callback) {
@@ -1062,7 +1108,13 @@ fn run_transcription(
         return Err("转录结果为空，请检查音频文件".to_string());
     }
 
-    emit_progress(&app, &workflow_progress, 100, "语音转录完成");
+    emit_progress(
+        &app,
+        &workflow_progress,
+        100,
+        "语音转录完成",
+        progress_sink.as_ref(),
+    );
     log_session.info(
         "asr_provider_completed",
         "转录服务返回字幕",
@@ -1099,6 +1151,7 @@ fn emit_progress(
     workflow_progress: &WorkflowProgress,
     progress: u8,
     message: &str,
+    progress_sink: Option<&TranscriptionProgressSink>,
 ) {
     workflow_progress.set_stage(
         ProgressStage::Transcription,
@@ -1114,6 +1167,7 @@ fn emit_progress(
         None,
         None,
         &[],
+        progress_sink,
     );
 }
 
@@ -1124,6 +1178,7 @@ fn emit_progress_snapshot(
     revision: u64,
     segments: &[TranscriptionSegment],
     warnings: &[String],
+    progress_sink: Option<&TranscriptionProgressSink>,
 ) {
     let progress = overall_progress(&stage_progress);
     emit_progress_event(
@@ -1134,6 +1189,7 @@ fn emit_progress_snapshot(
         Some(revision),
         Some(segments.to_vec()),
         warnings,
+        progress_sink,
     );
 }
 
@@ -1145,18 +1201,20 @@ fn emit_progress_event(
     revision: Option<u64>,
     segments: Option<Vec<TranscriptionSegment>>,
     warnings: &[String],
+    progress_sink: Option<&TranscriptionProgressSink>,
 ) {
-    let _ = app.emit(
-        PROGRESS_EVENT,
-        TranscriptionProgress {
-            progress,
-            message: message.to_string(),
-            stage_progress,
-            revision,
-            segments,
-            warnings: warnings.to_vec(),
-        },
-    );
+    let payload = TranscriptionProgress {
+        progress,
+        message: message.to_string(),
+        stage_progress,
+        revision,
+        segments,
+        warnings: warnings.to_vec(),
+    };
+    if let Some(sink) = progress_sink {
+        sink(payload.clone());
+    }
+    let _ = app.emit(PROGRESS_EVENT, payload);
 }
 
 fn overall_progress(stages: &TranscriptionStageProgress) -> u8 {
