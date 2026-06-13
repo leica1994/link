@@ -314,14 +314,20 @@
                   <button
                     v-if="activeTask.downloadedVideo"
                     class="settings-action youtube-monitor-action"
+                    :class="{ danger: isVideoAddedToWorkbench }"
                     type="button"
-                    :disabled="isVideoAddedToWorkbench || isAddingWorkbenchVideo || isWorkbenchRunning"
-                    @click="addVideoToWorkbench"
+                    :disabled="isAddingWorkbenchVideo || isRemovingWorkbenchVideo || isWorkbenchRunning"
+                    @click="isVideoAddedToWorkbench ? removeVideoFromWorkbench() : addVideoToWorkbench()"
                   >
-                    <LoaderCircle v-if="isAddingWorkbenchVideo" class="spinning" :stroke-width="2.1" aria-hidden="true" />
-                    <CheckCircle2 v-else-if="isVideoAddedToWorkbench" :stroke-width="2.1" aria-hidden="true" />
+                    <LoaderCircle
+                      v-if="isAddingWorkbenchVideo || isRemovingWorkbenchVideo"
+                      class="spinning"
+                      :stroke-width="2.1"
+                      aria-hidden="true"
+                    />
+                    <Trash2 v-else-if="isVideoAddedToWorkbench" :stroke-width="2.1" aria-hidden="true" />
                     <Plus v-else :stroke-width="2.1" aria-hidden="true" />
-                    <span>{{ isVideoAddedToWorkbench ? '已加入工作台' : '添加到工作台' }}</span>
+                    <span>{{ videoWorkbenchActionLabel }}</span>
                   </button>
                 </span>
               </div>
@@ -400,23 +406,28 @@
                   <button
                     v-if="downloadedSubtitleForOption(option)"
                     class="settings-action youtube-monitor-action"
+                    :class="{ danger: isSubtitleAddedToWorkbench(option) }"
                     type="button"
-                    :disabled="isSubtitleAddedToWorkbench(option) || isAddingSubtitleToWorkbench(option) || isWorkbenchRunning"
-                    @click="addSubtitleOptionToWorkbench(option)"
+                    :disabled="
+                      isAddingSubtitleToWorkbench(option) ||
+                      isRemovingSubtitleFromWorkbench(option) ||
+                      isWorkbenchRunning
+                    "
+                    @click="
+                      isSubtitleAddedToWorkbench(option)
+                        ? removeSubtitleOptionFromWorkbench(option)
+                        : addSubtitleOptionToWorkbench(option)
+                    "
                   >
                     <LoaderCircle
-                      v-if="isAddingSubtitleToWorkbench(option)"
+                      v-if="isAddingSubtitleToWorkbench(option) || isRemovingSubtitleFromWorkbench(option)"
                       class="spinning"
                       :stroke-width="2.1"
                       aria-hidden="true"
                     />
-                    <CheckCircle2
-                      v-else-if="isSubtitleAddedToWorkbench(option)"
-                      :stroke-width="2.1"
-                      aria-hidden="true"
-                    />
+                    <Trash2 v-else-if="isSubtitleAddedToWorkbench(option)" :stroke-width="2.1" aria-hidden="true" />
                     <Plus v-else :stroke-width="2.1" aria-hidden="true" />
-                    <span>{{ isSubtitleAddedToWorkbench(option) ? '已加入工作台' : '添加到工作台' }}</span>
+                    <span>{{ subtitleWorkbenchActionLabel(option) }}</span>
                   </button>
 
                   <div
@@ -791,16 +802,6 @@
                 <span>{{ workbenchSnapshot.errorMessage }}</span>
               </div>
 
-              <div v-if="exportedArtifacts.length > 0" class="home-workbench-artifacts">
-                <article v-for="artifact in exportedArtifacts" :key="artifact.kind" class="home-workbench-artifact">
-                  <FileCheck2 :stroke-width="2.1" aria-hidden="true" />
-                  <span class="home-workbench-artifact-copy">
-                    <span class="home-workbench-artifact-title">{{ artifactLabel(artifact.kind) }}</span>
-                    <span class="home-workbench-artifact-path">{{ artifact.path }}</span>
-                  </span>
-                  <span class="home-file-size">{{ formatFileSize(artifact.fileSize) }}</span>
-                </article>
-              </div>
             </div>
           </section>
 
@@ -1448,6 +1449,7 @@ const isAddingTask = ref(false)
 const isDeletingTask = ref(false)
 const isRefreshingDetail = ref(false)
 const isAddingWorkbenchVideo = ref(false)
+const isRemovingWorkbenchVideo = ref(false)
 const downloadingVideoTaskIds = ref(new Set<string>())
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
@@ -1458,6 +1460,7 @@ const subtitleErrorsByTaskId = ref(new Map<string, string>())
 const videoErrorsByTaskId = ref(new Map<string, string>())
 const downloadingSubtitleKeys = ref(new Set<string>())
 const addingWorkbenchSubtitleIds = ref(new Set<string>())
+const removingWorkbenchSubtitleIds = ref(new Set<string>())
 const downloadProgressByKey = ref(new Map<string, HomeVideoDownloadProgress>())
 const videoSideRef = ref<HTMLElement | null>(null)
 const videoCopyRef = ref<HTMLElement | null>(null)
@@ -1657,6 +1660,19 @@ const videoActionLabel = computed(() => {
   return '下载视频'
 })
 
+const videoWorkbenchActionLabel = computed(() => {
+  if (isAddingWorkbenchVideo.value) {
+    return '添加中'
+  }
+  if (isRemovingWorkbenchVideo.value) {
+    return '移除中'
+  }
+  if (isVideoAddedToWorkbench.value) {
+    return '移除工作台'
+  }
+  return '添加到工作台'
+})
+
 const videoDownloadProgress = computed(() => {
   if (!activeTask.value) {
     return null
@@ -1794,9 +1810,24 @@ const registeredSubtitleIds = computed(() => {
   return subtitleId ? new Set([subtitleId]) : new Set<string>()
 })
 
+const isWorkbenchCompleted = computed(() => {
+  if (workbenchSnapshot.value?.status === 'done') {
+    return true
+  }
+  if (!workbenchSnapshot.value || isWorkbenchRunning.value || workbenchSnapshot.value.errorMessage) {
+    return false
+  }
+
+  const exportStage = workbenchSnapshot.value.stages.find((stage) => stage.key === 'export')
+  return Boolean(exportStage && exportStage.status === 'done' && exportStage.progress >= 100)
+})
+
 const workbenchRunLabel = computed(() => {
   if (isWorkbenchRunning.value) {
     return '执行中'
+  }
+  if (isWorkbenchCompleted.value) {
+    return '开始执行'
   }
   if (workbenchSnapshot.value?.status === 'failed') {
     return '继续执行'
@@ -2500,6 +2531,27 @@ const addVideoToWorkbench = async () => {
   }
 }
 
+const removeVideoFromWorkbench = async () => {
+  const task = activeTask.value
+  if (!task || isRemovingWorkbenchVideo.value || isWorkbenchRunning.value || !isTauriRuntime()) {
+    return
+  }
+
+  isRemovingWorkbenchVideo.value = true
+  pageError.value = ''
+  try {
+    const snapshot = await invoke<HomeWorkbenchSnapshot>('remove_home_workbench_video_input', {
+      request: { taskId: task.id },
+    })
+    applyWorkbenchSnapshot(snapshot)
+    await reloadTask(task.id)
+  } catch (error) {
+    pageError.value = stringifyError(error, '移除工作台视频失败')
+  } finally {
+    isRemovingWorkbenchVideo.value = false
+  }
+}
+
 const addSubtitleToWorkbench = async (subtitle: HomeVideoSubtitle) => {
   const task = activeTask.value
   if (!task || addingWorkbenchSubtitleIds.value.has(subtitle.id) || isWorkbenchRunning.value || !isTauriRuntime()) {
@@ -2520,6 +2572,29 @@ const addSubtitleToWorkbench = async (subtitle: HomeVideoSubtitle) => {
     const next = new Set(addingWorkbenchSubtitleIds.value)
     next.delete(subtitle.id)
     addingWorkbenchSubtitleIds.value = next
+  }
+}
+
+const removeSubtitleFromWorkbench = async (subtitle: HomeVideoSubtitle) => {
+  const task = activeTask.value
+  if (!task || removingWorkbenchSubtitleIds.value.has(subtitle.id) || isWorkbenchRunning.value || !isTauriRuntime()) {
+    return
+  }
+
+  removingWorkbenchSubtitleIds.value = new Set(removingWorkbenchSubtitleIds.value).add(subtitle.id)
+  pageError.value = ''
+  try {
+    const snapshot = await invoke<HomeWorkbenchSnapshot>('remove_home_workbench_subtitle_input', {
+      request: { taskId: task.id, subtitleId: subtitle.id },
+    })
+    applyWorkbenchSnapshot(snapshot)
+    await reloadTask(task.id)
+  } catch (error) {
+    pageError.value = stringifyError(error, '移除工作台字幕失败')
+  } finally {
+    const next = new Set(removingWorkbenchSubtitleIds.value)
+    next.delete(subtitle.id)
+    removingWorkbenchSubtitleIds.value = next
   }
 }
 
@@ -2938,16 +3013,6 @@ const stageOrderLabel = (key: string) => {
   return index >= 0 ? `${index + 1}` : ''
 }
 
-const artifactLabel = (kind: string) => {
-  if (kind === 'exported-video') {
-    return '导出视频'
-  }
-  if (kind === 'exported-subtitle') {
-    return '导出字幕'
-  }
-  return '工作台产物'
-}
-
 const workbenchStageStatusLabel = (status: WorkbenchDetailStageStatus | string) => {
   switch (status) {
     case 'active':
@@ -3041,11 +3106,36 @@ const isAddingSubtitleToWorkbench = (option: HomeVideoSubtitleOption) => {
   return Boolean(subtitle && addingWorkbenchSubtitleIds.value.has(subtitle.id))
 }
 
+const isRemovingSubtitleFromWorkbench = (option: HomeVideoSubtitleOption) => {
+  const subtitle = downloadedSubtitleForOption(option)
+  return Boolean(subtitle && removingWorkbenchSubtitleIds.value.has(subtitle.id))
+}
+
 const addSubtitleOptionToWorkbench = (option: HomeVideoSubtitleOption) => {
   const subtitle = downloadedSubtitleForOption(option)
   if (subtitle) {
     void addSubtitleToWorkbench(subtitle)
   }
+}
+
+const removeSubtitleOptionFromWorkbench = (option: HomeVideoSubtitleOption) => {
+  const subtitle = downloadedSubtitleForOption(option)
+  if (subtitle) {
+    void removeSubtitleFromWorkbench(subtitle)
+  }
+}
+
+const subtitleWorkbenchActionLabel = (option: HomeVideoSubtitleOption) => {
+  if (isAddingSubtitleToWorkbench(option)) {
+    return '添加中'
+  }
+  if (isRemovingSubtitleFromWorkbench(option)) {
+    return '移除中'
+  }
+  if (isSubtitleAddedToWorkbench(option)) {
+    return '移除工作台'
+  }
+  return '添加到工作台'
 }
 
 const subtitleActionLabel = (option: HomeVideoSubtitleOption) => {
@@ -3083,7 +3173,9 @@ const clearTaskDownloadState = (taskId: string) => {
   setVideoTaskDownloading(taskId, false)
   if (activeTaskId.value === taskId) {
     isAddingWorkbenchVideo.value = false
+    isRemovingWorkbenchVideo.value = false
     addingWorkbenchSubtitleIds.value = new Set()
+    removingWorkbenchSubtitleIds.value = new Set()
   }
 
   const scopedPrefix = `${taskId}:`

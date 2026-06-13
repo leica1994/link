@@ -262,6 +262,56 @@ pub fn add_home_workbench_video_input(
 }
 
 #[tauri::command]
+pub fn remove_home_workbench_video_input(
+    app: AppHandle,
+    request: HomeWorkbenchTaskRequest,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let settings = store.load()?;
+    let snapshot = store.with_connection(|connection| {
+        ensure_home_task_exists(connection, &request.task_id)?;
+        let now = Utc::now().to_rfc3339();
+        let mut record =
+            read_workbench_record(connection, &request.task_id)?.unwrap_or_else(|| {
+                default_workbench_record(
+                    &request.task_id,
+                    default_workbench_options(&settings),
+                    &now,
+                )
+            });
+        if record.status == WORKBENCH_STATUS_RUNNING {
+            return Err("工作台执行中，无法移除视频".to_string());
+        }
+
+        delete_workbench_artifact(connection, &request.task_id, ARTIFACT_SOURCE_VIDEO)?;
+        reset_stage_to_pending(&mut record, STAGE_DOWNLOAD_VIDEO, "等待下载视频");
+        record.status = WORKBENCH_STATUS_IDLE.to_string();
+        record.current_stage.clear();
+        record.progress = overall_progress(&record.stages);
+        record.message = "已移除工作台视频".to_string();
+        record.error_message.clear();
+        upsert_workbench_record(
+            connection,
+            &request.task_id,
+            &record.status,
+            &record.current_stage,
+            record.progress,
+            &record.message,
+            &record.stages,
+            &record.options,
+            &record.warnings,
+            &record.error_message,
+            record.revision + 1,
+            &record.created_at,
+            &now,
+        )?;
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+    })?;
+    emit_workbench_progress(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
 pub fn add_home_workbench_subtitle_input(
     app: AppHandle,
     request: AddHomeWorkbenchSubtitleInputRequest,
@@ -294,13 +344,14 @@ pub fn add_home_workbench_subtitle_input(
 
     store.with_connection(|connection| {
         let now = Utc::now().to_rfc3339();
-        let mut record = read_workbench_record(connection, &request.task_id)?.unwrap_or_else(|| {
-            default_workbench_record(
-                &request.task_id,
-                default_workbench_options(&settings),
-                &now,
-            )
-        });
+        let mut record =
+            read_workbench_record(connection, &request.task_id)?.unwrap_or_else(|| {
+                default_workbench_record(
+                    &request.task_id,
+                    default_workbench_options(&settings),
+                    &now,
+                )
+            });
         record.options.subtitle_source = SUBTITLE_SOURCE_DOWNLOADED.to_string();
         record.options.subtitle_id = subtitle.id.clone();
         upsert_workbench_record(
@@ -342,6 +393,80 @@ pub fn add_home_workbench_subtitle_input(
     store.with_connection(|connection| {
         read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
     })
+}
+
+#[tauri::command]
+pub fn remove_home_workbench_subtitle_input(
+    app: AppHandle,
+    request: AddHomeWorkbenchSubtitleInputRequest,
+) -> Result<HomeWorkbenchSnapshot, String> {
+    let store = app.state::<SettingsStore>();
+    let settings = store.load()?;
+    let snapshot = store.with_connection(|connection| {
+        ensure_home_task_exists(connection, &request.task_id)?;
+        let now = Utc::now().to_rfc3339();
+        let mut record =
+            read_workbench_record(connection, &request.task_id)?.unwrap_or_else(|| {
+                default_workbench_record(
+                    &request.task_id,
+                    default_workbench_options(&settings),
+                    &now,
+                )
+            });
+        if record.status == WORKBENCH_STATUS_RUNNING {
+            return Err("工作台执行中，无法移除字幕".to_string());
+        }
+
+        let selected_artifact =
+            read_workbench_artifact(connection, &request.task_id, ARTIFACT_SELECTED_SUBTITLE)?;
+        let should_remove = selected_artifact
+            .as_ref()
+            .map(|artifact| {
+                let selected_id = artifact
+                    .metadata
+                    .get("subtitleId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                selected_id.is_empty() || selected_id == request.subtitle_id
+            })
+            .unwrap_or(false);
+
+        if should_remove {
+            delete_workbench_artifact(connection, &request.task_id, ARTIFACT_SELECTED_SUBTITLE)?;
+            reset_stage_to_pending(&mut record, STAGE_PREPARE_SUBTITLE, "等待准备字幕");
+            if record.options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED
+                && (record.options.subtitle_id.is_empty()
+                    || record.options.subtitle_id == request.subtitle_id)
+            {
+                record.options.subtitle_source = SUBTITLE_SOURCE_TRANSCRIBE.to_string();
+                record.options.subtitle_id.clear();
+            }
+            record.status = WORKBENCH_STATUS_IDLE.to_string();
+            record.current_stage.clear();
+            record.progress = overall_progress(&record.stages);
+            record.message = "已移除工作台字幕".to_string();
+            record.error_message.clear();
+            upsert_workbench_record(
+                connection,
+                &request.task_id,
+                &record.status,
+                &record.current_stage,
+                record.progress,
+                &record.message,
+                &record.stages,
+                &record.options,
+                &record.warnings,
+                &record.error_message,
+                record.revision + 1,
+                &record.created_at,
+                &now,
+            )?;
+        }
+
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+    })?;
+    emit_workbench_progress(&app, &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -585,7 +710,8 @@ fn ensure_workbench_video(
         return Ok(video);
     }
 
-    let task = store.with_connection(|connection| read_home_video_task_by_id(connection, task_id))?;
+    let task =
+        store.with_connection(|connection| read_home_video_task_by_id(connection, task_id))?;
     let video = ensure_video_downloaded(app.clone(), task)?;
     upsert_artifact_from_path(
         store,
@@ -680,7 +806,8 @@ async fn prepare_subtitle(
         }
     }
 
-    if let Some(artifact) = workbench_artifact_file(store, task_id, ARTIFACT_TRANSCRIPTION_SUBTITLE)?
+    if let Some(artifact) =
+        workbench_artifact_file(store, task_id, ARTIFACT_TRANSCRIPTION_SUBTITLE)?
     {
         update_stage_snapshot_from_app(
             &app,
@@ -1077,7 +1204,10 @@ fn initialize_run(
             .unwrap_or_else(|| default_workbench_record(task_id, options.clone(), &now));
         merge_workbench_stages(&mut existing.stages, options);
         for stage in &mut existing.stages {
-            if matches!(stage.status.as_str(), STAGE_STATUS_ACTIVE | STAGE_STATUS_FAILED) {
+            if matches!(
+                stage.status.as_str(),
+                STAGE_STATUS_ACTIVE | STAGE_STATUS_FAILED
+            ) {
                 stage.status = STAGE_STATUS_PENDING.to_string();
                 stage.progress = stage.progress.min(99);
             }
@@ -1437,10 +1567,9 @@ fn sync_idle_workbench_stages(
         return Ok(false);
     }
 
-    let task = read_home_video_task_by_id(connection, task_id)?;
     let is_video_ready = matches!(
-        task.downloaded_video.as_ref(),
-        Some(video) if Path::new(&video.file_path).is_file()
+        read_workbench_artifact(connection, task_id, ARTIFACT_SOURCE_VIDEO)?,
+        Some(artifact) if Path::new(&artifact.path).is_file()
     );
     if !is_video_ready {
         return Ok(false);
@@ -1653,7 +1782,10 @@ fn merge_workbench_stages(stages: &mut Vec<HomeWorkbenchStage>, options: &HomeWo
     }
 
     for default_stage in defaults {
-        if let Some(stage) = stages.iter_mut().find(|stage| stage.key == default_stage.key) {
+        if let Some(stage) = stages
+            .iter_mut()
+            .find(|stage| stage.key == default_stage.key)
+        {
             stage.label = default_stage.label;
             if stage.message.trim().is_empty() {
                 stage.message = default_stage.message;
@@ -2046,6 +2178,34 @@ fn upsert_artifact_from_path(
             .map(|_| ())
             .map_err(|error| format!("无法保存工作台产物: {error}"))
     })
+}
+
+fn delete_workbench_artifact(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    kind: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "
+            DELETE FROM home_workbench_artifacts
+            WHERE task_id = ?1 AND kind = ?2
+            ",
+            params![task_id, kind],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法移除工作台产物: {error}"))
+}
+
+fn reset_stage_to_pending(record: &mut HomeWorkbenchRecord, stage_key: &str, message: &str) {
+    for stage in &mut record.stages {
+        if stage.key == stage_key {
+            stage.progress = 0;
+            stage.status = STAGE_STATUS_PENDING.to_string();
+            stage.message = message.to_string();
+            stage.snapshot = json!({});
+        }
+    }
 }
 
 fn ensure_home_task_exists(connection: &rusqlite::Connection, task_id: &str) -> Result<(), String> {

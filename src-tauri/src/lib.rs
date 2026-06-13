@@ -27,6 +27,7 @@ use home_tasks::{
 };
 use home_workbench::{
     add_home_workbench_subtitle_input, add_home_workbench_video_input, get_home_workbench,
+    remove_home_workbench_subtitle_input, remove_home_workbench_video_input,
     save_home_workbench_options, start_home_workbench,
 };
 use settings::{load_settings, save_settings, SettingsStore};
@@ -128,7 +129,9 @@ pub fn run() {
             download_home_video_task_subtitle,
             download_home_video_task_video,
             add_home_workbench_video_input,
+            remove_home_workbench_video_input,
             add_home_workbench_subtitle_input,
+            remove_home_workbench_subtitle_input,
             get_home_workbench,
             save_home_workbench_options,
             start_home_workbench,
