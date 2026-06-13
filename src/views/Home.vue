@@ -2316,6 +2316,7 @@ const registerHomeDownloadProgressListener = async () => {
     }
 
     setDownloadProgress(payload)
+    syncWorkbenchDownloadProgress(payload)
   })
 }
 
@@ -2343,6 +2344,48 @@ const setDownloadProgress = (payload: HomeVideoDownloadProgress, options: { rese
     progress: incomingProgress,
   })
   downloadProgressByKey.value = next
+}
+
+const syncWorkbenchDownloadProgress = (payload: HomeVideoDownloadProgress) => {
+  // 仅当工作台正在运行且处于下载视频阶段时同步进度
+  if (
+    payload.kind !== 'video' ||
+    payload.taskId !== activeTaskId.value ||
+    !workbenchSnapshot.value ||
+    workbenchSnapshot.value.status !== 'running'
+  ) {
+    return
+  }
+
+  const downloadStage = workbenchSnapshot.value.stages.find((stage) => stage.key === 'download-video')
+  if (!downloadStage || downloadStage.status !== 'active') {
+    return
+  }
+
+  // 更新工作台下载视频阶段的进度
+  const updatedStage = {
+    ...downloadStage,
+    progress: clampProgress(payload.progress),
+    message: payload.message || '视频下载中',
+  }
+
+  const updatedStages = workbenchSnapshot.value.stages.map((stage) =>
+    stage.key === 'download-video' ? updatedStage : stage
+  )
+
+  workbenchSnapshot.value = {
+    ...workbenchSnapshot.value,
+    stages: updatedStages,
+    progress: overall_progress_from_stages(updatedStages),
+  }
+}
+
+const overall_progress_from_stages = (stages: HomeWorkbenchStage[]): number => {
+  if (stages.length === 0) {
+    return 0
+  }
+  const total = stages.reduce((sum, stage) => sum + stage.progress, 0)
+  return Math.round(total / stages.length)
 }
 
 const refreshVideoDescriptionObserver = () => {
