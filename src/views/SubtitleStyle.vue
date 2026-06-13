@@ -11,115 +11,13 @@
       </div>
 
       <div class="subtitle-style-layout">
-        <aside class="subtitle-style-sidebar">
-          <section class="settings-section" aria-labelledby="style-list-title">
-            <div id="style-list-title" class="section-heading">
-              <List aria-hidden="true" />
-              <span>样式预设</span>
-            </div>
-
-            <div class="settings-panel subtitle-style-list-panel">
-              <div v-if="styles.length === 0" class="subtitle-style-empty">
-                <Palette :stroke-width="2.1" aria-hidden="true" />
-                <span>暂无样式</span>
-              </div>
-
-              <div v-else class="subtitle-style-list">
-                <button
-                  v-for="style in styles"
-                  :key="style.id"
-                  class="subtitle-style-item"
-                  :class="{ active: selectedStyleId === style.id }"
-                  type="button"
-                  @click="selectStyle(style)"
-                >
-                  <span class="subtitle-style-item-main">
-                    <Palette class="subtitle-style-item-icon" :stroke-width="2.1" aria-hidden="true" />
-                    <span class="subtitle-style-item-copy">
-                      <span class="subtitle-style-item-name">{{ style.name }}</span>
-                      <span class="subtitle-style-item-meta">
-                        {{ getOptionLabel(renderModeOptions, style.renderMode) }}
-                        <span v-if="style.isDefault"> · 默认</span>
-                      </span>
-                    </span>
-                  </span>
-                  <Check
-                    v-if="selectedStyleId === style.id"
-                    class="subtitle-style-item-check"
-                    :stroke-width="2.4"
-                    aria-hidden="true"
-                  />
-                </button>
-              </div>
-
-              <div class="subtitle-style-actions">
-                <button class="settings-action" type="button" @click="openCreateDialog">
-                  <Plus :stroke-width="2.1" aria-hidden="true" />
-                  <span>新建样式</span>
-                </button>
-                <button
-                  class="settings-action subtitle-style-danger-action"
-                  type="button"
-                  :disabled="!selectedStyleId || draftStyle.isDefault"
-                  @click="openDeleteDialog"
-                >
-                  <Trash2 :stroke-width="2.1" aria-hidden="true" />
-                  <span>删除样式</span>
-                </button>
-              </div>
-            </div>
-          </section>
-
-          <section class="settings-section" aria-labelledby="preview-settings-title">
-            <div id="preview-settings-title" class="section-heading">
-              <SlidersHorizontal aria-hidden="true" />
-              <span>预览设置</span>
-            </div>
-
-            <div class="settings-panel">
-              <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('renderMode')">
-                <span class="setting-copy">
-                  <span class="setting-title">渲染模式</span>
-                  <span class="setting-subtitle">选择字幕绘制方式</span>
-                </span>
-                <span class="setting-inline-action">
-                  <span class="setting-value">{{ renderModeLabel }}</span>
-                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                </span>
-              </button>
-
-              <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('subtitleLayout')">
-                <span class="setting-copy">
-                  <span class="setting-title">字幕排布</span>
-                  <span class="setting-subtitle">设置原文与译文位置</span>
-                </span>
-                <span class="setting-inline-action">
-                  <span class="setting-value">{{ subtitleLayoutLabel }}</span>
-                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                </span>
-              </button>
-
-              <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('previewTextMode')">
-                <span class="setting-copy">
-                  <span class="setting-title">预览文字</span>
-                  <span class="setting-subtitle">切换字幕长度样例</span>
-                </span>
-                <span class="setting-inline-action">
-                  <span class="setting-value">{{ previewTextModeLabel }}</span>
-                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                </span>
-              </button>
-            </div>
-          </section>
-        </aside>
-
         <section class="settings-section subtitle-preview-section" aria-labelledby="subtitle-preview-title">
           <div id="subtitle-preview-title" class="section-heading">
             <ImageIcon aria-hidden="true" />
             <span>效果预览</span>
           </div>
 
-          <div class="settings-panel subtitle-preview-panel">
+          <div ref="previewPanelRef" class="settings-panel subtitle-preview-panel">
             <div class="subtitle-preview-toolbar">
               <div class="subtitle-preview-copy">
                 <span class="subtitle-preview-name">{{ draftStyle.name || '字幕样式' }}</span>
@@ -161,9 +59,109 @@
             </div>
           </div>
         </section>
+
+        <section class="settings-section subtitle-style-presets-section" aria-labelledby="style-list-title">
+          <div id="style-list-title" class="section-heading">
+            <List aria-hidden="true" />
+            <span>样式预设</span>
+          </div>
+
+          <div class="settings-panel subtitle-style-list-panel" :style="styleListPanelStyle">
+            <div v-if="styles.length === 0" class="subtitle-style-empty">
+              <Palette :stroke-width="2.1" aria-hidden="true" />
+              <span>暂无样式</span>
+            </div>
+
+            <div v-else class="subtitle-style-list">
+              <button
+                v-for="style in styles"
+                :key="style.id"
+                class="subtitle-style-item"
+                :class="{ active: selectedStyleId === style.id }"
+                type="button"
+                @click="selectStyle(style)"
+              >
+                <span class="subtitle-style-item-main">
+                  <Palette class="subtitle-style-item-icon" :stroke-width="2.1" aria-hidden="true" />
+                  <span class="subtitle-style-item-copy">
+                    <span class="subtitle-style-item-name">{{ style.name }}</span>
+                    <span class="subtitle-style-item-meta">
+                      {{ getOptionLabel(renderModeOptions, style.renderMode) }}
+                      <span v-if="style.isDefault"> · 默认</span>
+                    </span>
+                  </span>
+                </span>
+                <Check
+                  v-if="selectedStyleId === style.id"
+                  class="subtitle-style-item-check"
+                  :stroke-width="2.4"
+                  aria-hidden="true"
+                />
+              </button>
+            </div>
+
+            <div class="subtitle-style-actions">
+              <button class="settings-action" type="button" @click="openCreateDialog">
+                <Plus :stroke-width="2.1" aria-hidden="true" />
+                <span>新建样式</span>
+              </button>
+              <button
+                class="settings-action subtitle-style-danger-action"
+                type="button"
+                :disabled="!selectedStyleId || draftStyle.isDefault"
+                @click="openDeleteDialog"
+              >
+                <Trash2 :stroke-width="2.1" aria-hidden="true" />
+                <span>删除样式</span>
+              </button>
+            </div>
+          </div>
+        </section>
       </div>
 
       <div class="subtitle-style-controls">
+        <section class="settings-section" aria-labelledby="preview-settings-title">
+          <div id="preview-settings-title" class="section-heading">
+            <SlidersHorizontal aria-hidden="true" />
+            <span>预览设置</span>
+          </div>
+
+          <div class="settings-panel">
+            <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('renderMode')">
+              <span class="setting-copy">
+                <span class="setting-title">渲染模式</span>
+                <span class="setting-subtitle">选择字幕绘制方式</span>
+              </span>
+              <span class="setting-inline-action">
+                <span class="setting-value">{{ renderModeLabel }}</span>
+                <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+              </span>
+            </button>
+
+            <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('subtitleLayout')">
+              <span class="setting-copy">
+                <span class="setting-title">字幕排布</span>
+                <span class="setting-subtitle">设置原文与译文位置</span>
+              </span>
+              <span class="setting-inline-action">
+                <span class="setting-value">{{ subtitleLayoutLabel }}</span>
+                <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+              </span>
+            </button>
+
+            <button class="setting-row setting-row-button compact" type="button" @click="openChoiceDialog('previewTextMode')">
+              <span class="setting-copy">
+                <span class="setting-title">预览文字</span>
+                <span class="setting-subtitle">切换字幕长度样例</span>
+              </span>
+              <span class="setting-inline-action">
+                <span class="setting-value">{{ previewTextModeLabel }}</span>
+                <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+              </span>
+            </button>
+          </div>
+        </section>
+
         <section class="settings-section" aria-labelledby="ass-primary-title">
           <div id="ass-primary-title" class="section-heading">
             <Type aria-hidden="true" />
@@ -171,32 +169,34 @@
           </div>
 
           <div class="settings-panel">
-            <label class="setting-row compact">
+            <button class="setting-row setting-row-button compact" type="button" @click="openFontDialog('primaryFontName')">
               <span class="setting-copy">
                 <span class="setting-title">字体</span>
                 <span class="setting-subtitle">主字幕字体</span>
               </span>
-              <input
-                v-model="draftStyle.primaryFontName"
-                class="settings-input subtitle-text-input"
-                type="text"
-                @change="saveCurrentStyle"
-              />
-            </label>
+              <span class="setting-inline-action">
+                <span class="setting-value">{{ draftStyle.primaryFontName }}</span>
+                <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+              </span>
+            </button>
 
             <label class="setting-row compact">
               <span class="setting-copy">
                 <span class="setting-title">字号</span>
                 <span class="setting-subtitle">主字幕大小</span>
               </span>
-              <input
-                v-model.number="draftStyle.primaryFontSize"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="8"
-                max="200"
-                @change="saveCurrentStyle"
-              />
+              <span class="subtitle-number-field">
+                <input
+                  v-model.number="draftStyle.primaryFontSize"
+                  class="settings-input subtitle-number-input"
+                  type="number"
+                  min="8"
+                  max="200"
+                  aria-label="主字幕字号"
+                  @change="saveCurrentStyle"
+                />
+                <span class="subtitle-number-unit">px</span>
+              </span>
             </label>
 
             <label class="setting-row compact">
@@ -225,51 +225,64 @@
               />
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">描边宽度</span>
                 <span class="setting-subtitle">主字幕边框粗细</span>
               </span>
-              <input
-                v-model.number="draftStyle.primaryOutlineWidth"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="10"
-                step="0.1"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.primaryOutlineWidth) }}</span>
+                <input
+                  v-model.number="draftStyle.primaryOutlineWidth"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="0.1"
+                  aria-label="主字幕描边宽度"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">字符间距</span>
                 <span class="setting-subtitle">主字幕字符间距</span>
               </span>
-              <input
-                v-model.number="draftStyle.primarySpacing"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="20"
-                step="0.1"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.primarySpacing) }}</span>
+                <input
+                  v-model.number="draftStyle.primarySpacing"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="20"
+                  step="0.1"
+                  aria-label="主字幕字符间距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">底部边距</span>
                 <span class="setting-subtitle">字幕距画面底部距离</span>
               </span>
-              <input
-                v-model.number="draftStyle.primaryMarginBottom"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="240"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.primaryMarginBottom) }}</span>
+                <input
+                  v-model.number="draftStyle.primaryMarginBottom"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="240"
+                  step="1"
+                  aria-label="主字幕底部边距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
           </div>
         </section>
@@ -281,32 +294,34 @@
           </div>
 
           <div class="settings-panel">
-            <label class="setting-row compact">
+            <button class="setting-row setting-row-button compact" type="button" @click="openFontDialog('secondaryFontName')">
               <span class="setting-copy">
                 <span class="setting-title">字体</span>
                 <span class="setting-subtitle">副字幕字体</span>
               </span>
-              <input
-                v-model="draftStyle.secondaryFontName"
-                class="settings-input subtitle-text-input"
-                type="text"
-                @change="saveCurrentStyle"
-              />
-            </label>
+              <span class="setting-inline-action">
+                <span class="setting-value">{{ draftStyle.secondaryFontName }}</span>
+                <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+              </span>
+            </button>
 
             <label class="setting-row compact">
               <span class="setting-copy">
                 <span class="setting-title">字号</span>
                 <span class="setting-subtitle">副字幕大小</span>
               </span>
-              <input
-                v-model.number="draftStyle.secondaryFontSize"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="8"
-                max="200"
-                @change="saveCurrentStyle"
-              />
+              <span class="subtitle-number-field">
+                <input
+                  v-model.number="draftStyle.secondaryFontSize"
+                  class="settings-input subtitle-number-input"
+                  type="number"
+                  min="8"
+                  max="200"
+                  aria-label="副字幕字号"
+                  @change="saveCurrentStyle"
+                />
+                <span class="subtitle-number-unit">px</span>
+              </span>
             </label>
 
             <label class="setting-row compact">
@@ -335,51 +350,64 @@
               />
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">描边宽度</span>
                 <span class="setting-subtitle">副字幕边框粗细</span>
               </span>
-              <input
-                v-model.number="draftStyle.secondaryOutlineWidth"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="10"
-                step="0.1"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.secondaryOutlineWidth) }}</span>
+                <input
+                  v-model.number="draftStyle.secondaryOutlineWidth"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="10"
+                  step="0.1"
+                  aria-label="副字幕描边宽度"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">字符间距</span>
                 <span class="setting-subtitle">副字幕字符间距</span>
               </span>
-              <input
-                v-model.number="draftStyle.secondarySpacing"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="20"
-                step="0.1"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.secondarySpacing) }}</span>
+                <input
+                  v-model.number="draftStyle.secondarySpacing"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="20"
+                  step="0.1"
+                  aria-label="副字幕字符间距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">垂直间距</span>
                 <span class="setting-subtitle">主副字幕之间的间距</span>
               </span>
-              <input
-                v-model.number="draftStyle.verticalSpacing"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="120"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.verticalSpacing) }}</span>
+                <input
+                  v-model.number="draftStyle.verticalSpacing"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="120"
+                  step="1"
+                  aria-label="主副字幕垂直间距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
           </div>
         </section>
@@ -391,32 +419,34 @@
           </div>
 
           <div class="settings-panel">
-            <label class="setting-row compact">
+            <button class="setting-row setting-row-button compact" type="button" @click="openFontDialog('roundedFontName')">
               <span class="setting-copy">
                 <span class="setting-title">字体</span>
                 <span class="setting-subtitle">圆角字幕字体</span>
               </span>
-              <input
-                v-model="draftStyle.roundedFontName"
-                class="settings-input subtitle-text-input"
-                type="text"
-                @change="saveCurrentStyle"
-              />
-            </label>
+              <span class="setting-inline-action">
+                <span class="setting-value">{{ draftStyle.roundedFontName }}</span>
+                <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+              </span>
+            </button>
 
             <label class="setting-row compact">
               <span class="setting-copy">
                 <span class="setting-title">字号</span>
                 <span class="setting-subtitle">圆角字幕大小</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedFontSize"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="12"
-                max="120"
-                @change="saveCurrentStyle"
-              />
+              <span class="subtitle-number-field">
+                <input
+                  v-model.number="draftStyle.roundedFontSize"
+                  class="settings-input subtitle-number-input"
+                  type="number"
+                  min="12"
+                  max="120"
+                  aria-label="圆角字幕字号"
+                  @change="saveCurrentStyle"
+                />
+                <span class="subtitle-number-unit">px</span>
+              </span>
             </label>
 
             <label class="setting-row compact">
@@ -432,108 +462,153 @@
               />
             </label>
 
-            <label class="setting-row compact">
+            <div class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">背景颜色</span>
-                <span class="setting-subtitle">支持 #RRGGBBAA 透明度</span>
+                <span class="setting-subtitle">颜色与透明度</span>
               </span>
-              <input
-                v-model="draftStyle.roundedBackgroundColor"
-                class="settings-input subtitle-hex-input"
-                type="text"
-                spellcheck="false"
-                @change="saveCurrentStyle"
-              />
-            </label>
+              <span class="subtitle-color-alpha-control">
+                <input
+                  v-model="roundedBackgroundRgb"
+                  class="subtitle-color-input"
+                  type="color"
+                  aria-label="圆角背景颜色"
+                  @change="saveCurrentStyle"
+                />
+                <span class="setting-range-control subtitle-alpha-range">
+                  <span class="setting-range-value">{{ roundedBackgroundAlphaLabel }}</span>
+                  <input
+                    v-model.number="roundedBackgroundAlpha"
+                    class="setting-range"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    aria-label="圆角背景透明度"
+                    @change="saveCurrentStyle"
+                  />
+                </span>
+              </span>
+            </div>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">圆角半径</span>
                 <span class="setting-subtitle">背景圆角大小</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedCornerRadius"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="60"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedCornerRadius) }}</span>
+                <input
+                  v-model.number="draftStyle.roundedCornerRadius"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="60"
+                  step="1"
+                  aria-label="圆角半径"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">水平内边距</span>
                 <span class="setting-subtitle">文字左右留白</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedPaddingX"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="120"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedPaddingX) }}</span>
+                <input
+                  v-model.number="draftStyle.roundedPaddingX"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="120"
+                  step="1"
+                  aria-label="圆角水平内边距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">垂直内边距</span>
                 <span class="setting-subtitle">文字上下留白</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedPaddingY"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="80"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedPaddingY) }}</span>
+                <input
+                  v-model.number="draftStyle.roundedPaddingY"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="80"
+                  step="1"
+                  aria-label="圆角垂直内边距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">底部边距</span>
                 <span class="setting-subtitle">背景距底部距离</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedMarginBottom"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="240"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedMarginBottom) }}</span>
+                <input
+                  v-model.number="draftStyle.roundedMarginBottom"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="240"
+                  step="1"
+                  aria-label="圆角底部边距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">行间距</span>
                 <span class="setting-subtitle">多行字幕间距</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedLineSpacing"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="60"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedLineSpacing) }}</span>
+                <input
+                  v-model.number="draftStyle.roundedLineSpacing"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="60"
+                  step="1"
+                  aria-label="圆角行间距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
 
-            <label class="setting-row compact">
+            <label class="setting-row compact range">
               <span class="setting-copy">
                 <span class="setting-title">字符间距</span>
                 <span class="setting-subtitle">圆角字幕字符间距</span>
               </span>
-              <input
-                v-model.number="draftStyle.roundedLetterSpacing"
-                class="settings-input subtitle-number-input"
-                type="number"
-                min="0"
-                max="20"
-                @change="saveCurrentStyle"
-              />
+              <span class="setting-range-control subtitle-range-control">
+                <span class="setting-range-value">{{ formatNumberValue(draftStyle.roundedLetterSpacing) }}</span>
+                <input
+                  v-model.number="draftStyle.roundedLetterSpacing"
+                  class="setting-range"
+                  type="range"
+                  min="0"
+                  max="20"
+                  step="1"
+                  aria-label="圆角字符间距"
+                  @change="saveCurrentStyle"
+                />
+              </span>
             </label>
           </div>
         </section>
@@ -562,6 +637,36 @@
             >
               <span class="dialog-radio" aria-hidden="true" />
               <span>{{ option.label }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="activeFontField" class="dialog-backdrop" role="presentation" @click.self="closeFontDialog">
+        <section
+          class="settings-dialog subtitle-choice-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="subtitle-font-dialog-title"
+        >
+          <h2 id="subtitle-font-dialog-title" class="dialog-title">{{ fontDialogTitle }}</h2>
+          <div class="dialog-options" role="radiogroup" :aria-label="fontDialogTitle">
+            <button
+              v-for="font in fontOptions"
+              :key="font.value"
+              class="dialog-option"
+              :class="{ active: fontDialogValue === font.value }"
+              type="button"
+              role="radio"
+              :aria-checked="fontDialogValue === font.value"
+              @click="selectFont(font.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span class="subtitle-font-option" :style="{ fontFamily: quoteFontFamily(font.value) }">
+                {{ font.label }}
+              </span>
             </button>
           </div>
         </section>
@@ -660,6 +765,7 @@ enum PreviewTextMode {
 }
 
 type ChoiceDialog = 'renderMode' | 'subtitleLayout' | 'previewTextMode'
+type FontField = 'primaryFontName' | 'secondaryFontName' | 'roundedFontName'
 
 type Option<T extends string> = {
   value: T
@@ -727,6 +833,27 @@ const previewTextModeOptions: readonly Option<PreviewTextMode>[] = [
   { value: PreviewTextMode.Short, label: '短文本' },
 ] as const
 
+const fontOptions = [
+  { value: 'Microsoft YaHei', label: 'Microsoft YaHei' },
+  { value: 'Microsoft YaHei UI', label: 'Microsoft YaHei UI' },
+  { value: 'SimHei', label: 'SimHei' },
+  { value: 'SimSun', label: 'SimSun' },
+  { value: 'KaiTi', label: 'KaiTi' },
+  { value: 'FangSong', label: 'FangSong' },
+  { value: 'DengXian', label: 'DengXian' },
+  { value: 'YouYuan', label: 'YouYuan' },
+  { value: 'Arial', label: 'Arial' },
+  { value: 'Segoe UI', label: 'Segoe UI' },
+] as const
+
+type FontOptionValue = (typeof fontOptions)[number]['value']
+
+const fontFieldTitles: Record<FontField, string> = {
+  primaryFontName: '主字幕字体',
+  secondaryFontName: '副字幕字体',
+  roundedFontName: '圆角字幕字体',
+}
+
 const previewTextSamples: Record<PreviewTextMode, { source: string; target: string }> = {
   [PreviewTextMode.Long]: {
     source: 'This is a long text for testing subtitle preview, text wrapping, and style settings.',
@@ -747,13 +874,17 @@ const selectedStyleId = ref('')
 const draftStyle = ref<SubtitleStyle>(createDefaultStyle())
 const styleError = ref('')
 const activeChoiceDialog = ref<ChoiceDialog | null>(null)
+const activeFontField = ref<FontField | null>(null)
 const showCreateDialog = ref(false)
 const newStyleName = ref('')
 const showDeleteDialog = ref(false)
+const previewPanelRef = ref<HTMLElement | null>(null)
 const previewViewportRef = ref<HTMLElement | null>(null)
+const previewPanelHeight = ref(0)
 const previewScale = ref(1)
 
-let previewObserver: ResizeObserver | null = null
+let previewViewportObserver: ResizeObserver | null = null
+let previewPanelObserver: ResizeObserver | null = null
 
 const getOptionLabel = <T extends string>(options: readonly Option<T>[], value: T) => {
   return options.find((option) => option.value === value)?.label ?? ''
@@ -762,6 +893,33 @@ const getOptionLabel = <T extends string>(options: readonly Option<T>[], value: 
 const renderModeLabel = computed(() => getOptionLabel(renderModeOptions, draftStyle.value.renderMode))
 const subtitleLayoutLabel = computed(() => getOptionLabel(subtitleLayoutOptions, draftStyle.value.subtitleLayout))
 const previewTextModeLabel = computed(() => getOptionLabel(previewTextModeOptions, draftStyle.value.previewTextMode))
+const styleListPanelStyle = computed<CSSProperties>(() =>
+  previewPanelHeight.value > 0 ? { maxHeight: `${Math.round(previewPanelHeight.value)}px` } : {},
+)
+
+const fontDialogTitle = computed(() => {
+  return activeFontField.value ? fontFieldTitles[activeFontField.value] : '字体'
+})
+
+const fontDialogValue = computed(() => {
+  return activeFontField.value ? draftStyle.value[activeFontField.value] : ''
+})
+
+const roundedBackgroundRgb = computed<string>({
+  get: () => readHexRgbaRgb(draftStyle.value.roundedBackgroundColor, '#191919'),
+  set: (color) => {
+    draftStyle.value.roundedBackgroundColor = buildHexRgba(color, roundedBackgroundAlpha.value)
+  },
+})
+
+const roundedBackgroundAlpha = computed<number>({
+  get: () => readHexRgbaAlphaPercent(draftStyle.value.roundedBackgroundColor, 80),
+  set: (alpha) => {
+    draftStyle.value.roundedBackgroundColor = buildHexRgba(roundedBackgroundRgb.value, alpha)
+  },
+})
+
+const roundedBackgroundAlphaLabel = computed(() => `${roundedBackgroundAlpha.value}%`)
 
 const choiceDialogTitle = computed(() => {
   if (activeChoiceDialog.value === 'renderMode') {
@@ -935,6 +1093,24 @@ const selectChoice = (value: string) => {
   void saveCurrentStyle()
 }
 
+const openFontDialog = (field: FontField) => {
+  activeFontField.value = field
+}
+
+const closeFontDialog = () => {
+  activeFontField.value = null
+}
+
+const selectFont = (fontName: FontOptionValue) => {
+  if (!activeFontField.value) {
+    return
+  }
+
+  draftStyle.value[activeFontField.value] = fontName
+  closeFontDialog()
+  void saveCurrentStyle()
+}
+
 const openCreateDialog = () => {
   newStyleName.value = ''
   showCreateDialog.value = true
@@ -1006,6 +1182,16 @@ const updatePreviewScale = () => {
   previewScale.value = Math.min(1, element.clientWidth / previewWidth)
 }
 
+const updatePreviewPanelHeight = () => {
+  const element = previewPanelRef.value
+  if (!element) {
+    previewPanelHeight.value = 0
+    return
+  }
+
+  previewPanelHeight.value = element.getBoundingClientRect().height
+}
+
 const handleKeydown = (event: KeyboardEvent) => {
   if (event.key !== 'Escape') {
     return
@@ -1013,6 +1199,8 @@ const handleKeydown = (event: KeyboardEvent) => {
 
   if (activeChoiceDialog.value) {
     closeChoiceDialog()
+  } else if (activeFontField.value) {
+    closeFontDialog()
   } else if (showCreateDialog.value) {
     closeCreateDialog()
   } else if (showDeleteDialog.value) {
@@ -1026,16 +1214,22 @@ onMounted(() => {
 
   void nextTick(() => {
     updatePreviewScale()
+    updatePreviewPanelHeight()
     if (previewViewportRef.value) {
-      previewObserver = new ResizeObserver(updatePreviewScale)
-      previewObserver.observe(previewViewportRef.value)
+      previewViewportObserver = new ResizeObserver(updatePreviewScale)
+      previewViewportObserver.observe(previewViewportRef.value)
+    }
+    if (previewPanelRef.value) {
+      previewPanelObserver = new ResizeObserver(updatePreviewPanelHeight)
+      previewPanelObserver.observe(previewPanelRef.value)
     }
   })
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
-  previewObserver?.disconnect()
+  previewViewportObserver?.disconnect()
+  previewPanelObserver?.disconnect()
 })
 
 function createDefaultStyle(): SubtitleStyle {
@@ -1173,6 +1367,37 @@ function normalizeHexRgba(value: string, fallback: string) {
   return /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(normalized) ? normalized.toUpperCase() : fallback
 }
 
+function readHexRgbaRgb(value: string, fallbackRgb: string) {
+  return normalizeHexRgba(value, `${fallbackRgb}FF`).slice(0, 7)
+}
+
+function readHexRgbaAlphaPercent(value: string, fallback: number) {
+  const normalized = value.trim()
+
+  if (/^#[0-9a-fA-F]{8}$/.test(normalized)) {
+    return Math.round((parseInt(normalized.slice(7, 9), 16) / 255) * 100)
+  }
+
+  if (/^#[0-9a-fA-F]{6}$/.test(normalized)) {
+    return 100
+  }
+
+  return Math.round(clampNumber(fallback, 0, 100))
+}
+
+function buildHexRgba(rgb: string, alphaPercent: number) {
+  const safeRgb = normalizeHexRgb(rgb, '#191919')
+  const alpha = Math.round((clampNumber(alphaPercent, 0, 100) / 100) * 255)
+  const alphaHex = alpha.toString(16).padStart(2, '0').toUpperCase()
+  return `${safeRgb}${alphaHex}`
+}
+
+function formatNumberValue(value: number, suffix = 'px') {
+  const rounded = Math.round(clampNumber(value, 0, 999) * 10) / 10
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
+  return `${text}${suffix}`
+}
+
 function stringifyError(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -1191,27 +1416,30 @@ function stringifyError(error: unknown) {
 
 .subtitle-style-layout {
   display: grid;
-  grid-template-columns: minmax(320px, 0.42fr) minmax(580px, 1fr);
+  grid-template-columns: minmax(620px, 1fr) minmax(320px, 0.38fr);
   gap: 24px;
   align-items: start;
 }
 
-.subtitle-style-sidebar {
+.subtitle-style-layout > .settings-section + .settings-section,
+.subtitle-style-controls > .settings-section + .settings-section {
+  margin-top: 0;
+}
+
+.subtitle-style-presets-section {
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
 }
 
 .subtitle-style-list-panel {
+  min-height: 0;
   display: flex;
   flex-direction: column;
   padding: 14px;
 }
 
 .subtitle-style-list {
+  flex: 1 1 auto;
   min-height: 0;
-  max-height: 420px;
   overflow: auto;
   display: flex;
   flex-direction: column;
@@ -1473,14 +1701,9 @@ html[data-theme='dark'] .subtitle-preview-badge {
 
 .subtitle-style-controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 24px;
   align-items: start;
-}
-
-.subtitle-text-input {
-  justify-self: end;
-  width: min(220px, 30vw);
 }
 
 .subtitle-number-input {
@@ -1489,10 +1712,69 @@ html[data-theme='dark'] .subtitle-preview-badge {
   text-align: center;
 }
 
-.subtitle-hex-input {
+.subtitle-number-input::-webkit-outer-spin-button,
+.subtitle-number-input::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.subtitle-number-input {
+  appearance: textfield;
+}
+
+.subtitle-number-field {
   justify-self: end;
-  width: 132px;
-  text-transform: uppercase;
+  width: 104px;
+  height: 36px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-surface-hover) 58%, var(--bg) 42%);
+  display: inline-grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+
+html[data-theme='dark'] .subtitle-number-field {
+  border-color: color-mix(in srgb, var(--text-muted) 28%, var(--hairline));
+  background: color-mix(in srgb, var(--bg-surface-hover) 64%, var(--bg) 36%);
+}
+
+.subtitle-number-field:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.subtitle-number-field .subtitle-number-input {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0 4px 0 10px;
+  text-align: right;
+  box-shadow: none;
+}
+
+.subtitle-number-field .subtitle-number-input:hover,
+.subtitle-number-field .subtitle-number-input:focus-visible {
+  background: transparent;
+  box-shadow: none;
+}
+
+.subtitle-number-unit {
+  padding-right: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.subtitle-range-control {
+  justify-self: end;
+  width: min(100%, 300px);
+  grid-template-columns: 62px minmax(150px, 1fr);
 }
 
 .subtitle-color-input {
@@ -1509,6 +1791,27 @@ html[data-theme='dark'] .subtitle-preview-badge {
 .subtitle-color-input:focus-visible {
   outline: 3px solid var(--accent-soft);
   outline-offset: 2px;
+}
+
+.subtitle-color-alpha-control {
+  justify-self: end;
+  width: min(100%, 330px);
+  display: grid;
+  grid-template-columns: 58px minmax(180px, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.subtitle-alpha-range {
+  width: 100%;
+  grid-template-columns: 52px minmax(120px, 1fr);
+}
+
+.subtitle-font-option {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .subtitle-choice-dialog,
@@ -1553,18 +1856,12 @@ html[data-theme='dark'] .subtitle-preview-badge {
     grid-template-columns: 1fr;
   }
 
-  .subtitle-style-sidebar {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  }
-
   .subtitle-style-controls {
     grid-template-columns: 1fr 1fr;
   }
 }
 
 @media (max-width: 860px) {
-  .subtitle-style-sidebar,
   .subtitle-style-controls {
     grid-template-columns: 1fr;
   }
@@ -1578,16 +1875,21 @@ html[data-theme='dark'] .subtitle-preview-badge {
     flex-direction: column;
   }
 
-  .subtitle-text-input,
-  .subtitle-number-input,
-  .subtitle-hex-input,
-  .subtitle-color-input {
+  .subtitle-number-field,
+  .subtitle-color-input,
+  .subtitle-range-control,
+  .subtitle-color-alpha-control {
     grid-column: 1;
     justify-self: start;
   }
 
-  .subtitle-text-input {
-    width: min(280px, 100%);
+  .subtitle-range-control,
+  .subtitle-color-alpha-control {
+    width: 100%;
+  }
+
+  .subtitle-color-alpha-control {
+    grid-template-columns: 58px minmax(0, 1fr);
   }
 
   .subtitle-style-actions {
