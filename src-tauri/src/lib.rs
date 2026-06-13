@@ -9,6 +9,7 @@ mod home_workbench;
 mod htdemucs;
 mod settings;
 mod subtitle_ai;
+mod subtitle_burn;
 mod subtitle_export;
 mod subtitle_style;
 mod subtitle_translation;
@@ -33,6 +34,7 @@ use home_workbench::{
     save_home_workbench_options, start_home_workbench,
 };
 use settings::{load_settings, save_settings, SettingsStore};
+use subtitle_burn::start_subtitle_burn;
 use subtitle_style::{
     create_subtitle_style, delete_subtitle_style, get_subtitle_style, list_subtitle_styles,
     select_subtitle_style, update_subtitle_style,
@@ -118,6 +120,7 @@ pub fn run() {
             load_subtitle_preview,
             start_subtitle_translation,
             save_subtitle_translation_file,
+            start_subtitle_burn,
             list_subtitle_styles,
             get_subtitle_style,
             create_subtitle_style,

@@ -19,5 +19,5 @@ import TitleBar from './components/TitleBar.vue'
 import Sidebar from './components/Sidebar.vue'
 import { RouterView } from 'vue-router'
 
-const keepAliveComponentNames = ['Home', 'Translate', 'Dubbing']
+const keepAliveComponentNames = ['Home', 'Translate', 'Dubbing', 'SubtitleBurn']
 </script>
