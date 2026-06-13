@@ -650,52 +650,57 @@
                 </div>
 
                 <template v-else-if="selectedWorkbenchStage.key === 'prepare-subtitle'">
-                  <div v-if="workbenchPrepareSubtitleSteps.length > 0" class="home-workbench-detail-steps">
-                    <div
-                      v-for="step in workbenchPrepareSubtitleSteps"
-                      :key="step.key"
-                      class="dubbing-media-step"
-                      :class="step.status"
-                    >
-                      <div class="dubbing-media-step-top">
-                        <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
-                        <span class="dubbing-media-step-title">{{ step.label }}</span>
-                        <span class="dubbing-media-step-status">{{ workbenchStageStatusLabel(step.status) }}</span>
-                      </div>
-                      <span class="dubbing-media-step-subtitle">{{ step.message }}</span>
-                      <div class="dubbing-media-step-progress">
-                        <span class="dubbing-media-step-track" role="progressbar" :aria-valuenow="step.progress" aria-valuemin="0" aria-valuemax="100" :aria-label="`${step.label}进度`">
-                          <span class="dubbing-media-step-bar" :style="{ width: `${step.progress}%` }" aria-hidden="true" />
-                        </span>
-                        <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div v-if="workbenchSubtitleSegments.length > 0" class="translate-preview translate-subtitle-list home-workbench-subtitle-preview">
-                    <article
-                      v-for="(segment, index) in workbenchSubtitleSegments"
-                      :key="segment.uid || `workbench-subtitle-${index}`"
-                      class="translate-subtitle-row"
-                    >
-                      <span class="translate-subtitle-index">{{ index + 1 }}</span>
-                      <span class="translate-subtitle-status" :class="`status-${normalizeSegmentStatus(segment.status)}`">
-                        {{ segmentStatusLabel(segment.status) }}
-                      </span>
-                      <span class="translate-subtitle-time translate-subtitle-start">{{ formatSegmentTime(segment.startTime) }}</span>
-                      <span class="translate-subtitle-time translate-subtitle-end">{{ formatSegmentTime(segment.endTime) }}</span>
-                      <p>{{ segment.text }}</p>
-                    </article>
-                  </div>
-                  <div v-else class="home-workbench-detail-file">
-                    <Captions :stroke-width="2.1" aria-hidden="true" />
+                  <!-- 模式：使用下载字幕 -->
+                  <div v-if="prepareSubtitleMode === 'downloaded'" class="home-workbench-detail-file">
+                    <CheckCircle2 :stroke-width="2.1" aria-hidden="true" />
                     <span class="home-workbench-artifact-copy">
-                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-title">等待准备字幕</span>
                       <span class="home-workbench-artifact-path">
-                        {{ readStringValue(selectedWorkbenchStageSnapshot.path) || '等待转录或添加下载字幕' }}
+                        {{ readStringValue(selectedWorkbenchStageSnapshot.path) || '字幕已添加到工作台' }}
                       </span>
                     </span>
                   </div>
+
+                  <!-- 模式：转录生成字幕 -->
+                  <template v-else>
+                    <div v-if="workbenchPrepareSubtitleSteps.length > 0" class="home-workbench-detail-steps">
+                      <div
+                        v-for="step in workbenchPrepareSubtitleSteps"
+                        :key="step.key"
+                        class="dubbing-media-step"
+                        :class="step.status"
+                      >
+                        <div class="dubbing-media-step-top">
+                          <span class="dubbing-stage-mark" :class="step.status" aria-hidden="true" />
+                          <span class="dubbing-media-step-title">{{ step.label }}</span>
+                          <span class="dubbing-media-step-status">{{ workbenchStageStatusLabel(step.status) }}</span>
+                        </div>
+                        <span class="dubbing-media-step-subtitle">{{ step.message }}</span>
+                        <div class="dubbing-media-step-progress">
+                          <span class="dubbing-media-step-track" role="progressbar" :aria-valuenow="step.progress" aria-valuemin="0" aria-valuemax="100" :aria-label="`${step.label}进度`">
+                            <span class="dubbing-media-step-bar" :style="{ width: `${step.progress}%` }" aria-hidden="true" />
+                          </span>
+                          <span class="dubbing-media-step-progress-value">{{ step.progress }}%</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div v-if="workbenchSubtitleSegments.length > 0" class="translate-preview translate-subtitle-list home-workbench-subtitle-preview">
+                      <article
+                        v-for="(segment, index) in workbenchSubtitleSegments"
+                        :key="segment.uid || `workbench-subtitle-${index}`"
+                        class="translate-subtitle-row"
+                      >
+                        <span class="translate-subtitle-index">{{ index + 1 }}</span>
+                        <span class="translate-subtitle-status" :class="`status-${normalizeSegmentStatus(segment.status)}`">
+                          {{ segmentStatusLabel(segment.status) }}
+                        </span>
+                        <span class="translate-subtitle-time translate-subtitle-start">{{ formatSegmentTime(segment.startTime) }}</span>
+                        <span class="translate-subtitle-time translate-subtitle-end">{{ formatSegmentTime(segment.endTime) }}</span>
+                        <p>{{ segment.text }}</p>
+                      </article>
+                    </div>
+                  </template>
                 </template>
 
                 <template v-else-if="selectedWorkbenchStage.key === 'translation'">
@@ -1838,19 +1843,15 @@ const workbenchRunLabel = computed(() => {
   return '开始执行'
 })
 
+const prepareSubtitleMode = computed(() => {
+  return readStringValue(selectedWorkbenchStageSnapshot.value.mode) || 'transcribe'
+})
+
 const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
   const snapshot = selectedWorkbenchStageSnapshot.value
   const mode = readStringValue(snapshot.mode)
   if (mode === 'downloaded') {
-    return [
-      {
-        key: 'downloaded-subtitle',
-        label: '下载字幕',
-        progress: 100,
-        status: 'done',
-        message: '已添加到工作台',
-      },
-    ]
+    return []
   }
   const stageProgress = readRecordValue(snapshot.stageProgress)
   return [
@@ -2334,7 +2335,7 @@ const registerHomeWorkbenchProgressListener = async () => {
   })
 }
 
-const setDownloadProgress = (payload: HomeVideoDownloadProgress, options: { reset?: boolean } = {}) => {
+const setDownloadProgress = (payload: HomeVideoDownloadProgress) => {
   const next = new Map(downloadProgressByKey.value)
   const key = downloadProgressKey(payload.taskId, payload.kind, payload.key)
   const incomingProgress = clampProgress(payload.progress)
@@ -2474,7 +2475,7 @@ const downloadSubtitle = async (option: HomeVideoSubtitleOption) => {
     message: '准备下载字幕',
     language: option.language,
     sourceKind: option.sourceKind,
-  }, { reset: true })
+  })
   clearTaskError(subtitleErrorsByTaskId, task.id)
 
   try {
@@ -2522,7 +2523,7 @@ const downloadVideo = async () => {
     progress: 2,
     status: 'active',
     message: isContinuing ? '准备继续下载视频' : '准备下载视频',
-  }, { reset: true })
+  })
   clearTaskError(videoErrorsByTaskId, taskId)
 
   try {
