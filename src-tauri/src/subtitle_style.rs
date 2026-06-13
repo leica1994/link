@@ -130,7 +130,7 @@ pub fn list_subtitle_styles(
                     rounded_letter_spacing,
                     created_at, updated_at
                 FROM subtitle_styles
-                ORDER BY is_default DESC, name ASC
+                ORDER BY is_default DESC, created_at ASC
                 ",
             )
             .map_err(|error| format!("无法查询字幕样式: {error}"))?;
