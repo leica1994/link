@@ -1178,7 +1178,7 @@ function stringifyError(error: unknown) {
 .subtitle-style-workspace {
   display: flex;
   flex-direction: column;
-  gap: 26px;
+  gap: 24px;
 }
 
 .subtitle-style-alert {
@@ -1187,37 +1187,50 @@ function stringifyError(error: unknown) {
 
 .subtitle-style-layout {
   display: grid;
-  grid-template-columns: minmax(300px, 0.44fr) minmax(560px, 1fr);
-  gap: 26px;
-  align-items: stretch;
+  grid-template-columns: minmax(320px, 0.42fr) minmax(580px, 1fr);
+  gap: 24px;
+  align-items: start;
 }
 
 .subtitle-style-sidebar {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 26px;
+  gap: 24px;
 }
 
 .subtitle-style-list-panel {
   display: flex;
   flex-direction: column;
-  min-height: 348px;
   padding: 14px;
 }
 
 .subtitle-style-list {
   min-height: 0;
+  max-height: 420px;
   overflow: auto;
   display: flex;
-  flex: 1;
   flex-direction: column;
   gap: 8px;
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent-soft) transparent;
 }
 
 .subtitle-style-list::-webkit-scrollbar {
-  display: none;
+  width: 6px;
+}
+
+.subtitle-style-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.subtitle-style-list::-webkit-scrollbar-thumb {
+  background: var(--accent-soft);
+  border-radius: 3px;
+}
+
+.subtitle-style-list::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent-soft) 80%, var(--accent));
 }
 
 .subtitle-style-item {
@@ -1348,7 +1361,7 @@ html[data-theme='dark'] .subtitle-style-danger-action {
 }
 
 .subtitle-preview-panel {
-  min-height: 470px;
+  min-height: 520px;
   display: flex;
   flex-direction: column;
   padding: 18px;
@@ -1410,7 +1423,7 @@ html[data-theme='dark'] .subtitle-preview-badge {
   width: 100%;
   min-height: min(48vw, 720px);
   border-radius: 14px;
-  background: #0f1115;
+  background: linear-gradient(135deg, #1a1d29 0%, #2d1b2e 50%, #1f2937 100%);
 }
 
 .subtitle-preview-stage {
@@ -1458,7 +1471,7 @@ html[data-theme='dark'] .subtitle-preview-badge {
 .subtitle-style-controls {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 26px;
+  gap: 24px;
   align-items: start;
 }
 
