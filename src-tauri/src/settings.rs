@@ -196,7 +196,7 @@ impl SettingsStore {
         operation(&connection)
     }
 
-    fn save(&self, settings: &AppSettings) -> Result<(), String> {
+    pub(crate) fn save(&self, settings: &AppSettings) -> Result<(), String> {
         let mut connection = self
             .connection
             .lock()

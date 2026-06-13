@@ -56,7 +56,7 @@ const ARTIFACT_DUBBED_SUBTITLE: &str = "dubbed-subtitle";
 const ARTIFACT_EXPORTED_VIDEO: &str = "exported-video";
 const ARTIFACT_EXPORTED_SUBTITLE: &str = "exported-subtitle";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HomeWorkbenchOptions {
     pub subtitle_source: String,
@@ -167,16 +167,21 @@ pub fn get_home_workbench(
 #[tauri::command]
 pub fn save_home_workbench_options(
     store: tauri::State<'_, SettingsStore>,
+    ai_service: tauri::State<'_, AiService>,
     request: SaveHomeWorkbenchOptionsRequest,
 ) -> Result<HomeWorkbenchSnapshot, String> {
-    let settings = store.load()?;
+    let mut settings = store.load()?;
+    let options = normalize_options(request.options, &settings);
+    store.with_connection(|connection| ensure_home_task_exists(connection, &request.task_id))?;
+    apply_workbench_options_to_settings(&mut settings, &options);
+    store.save(&settings)?;
+    ai_service.update_thread_count(settings.translation_thread_count)?;
+
     store.with_connection(|connection| {
-        ensure_home_task_exists(connection, &request.task_id)?;
         let now = Utc::now().to_rfc3339();
         let existing = read_workbench_record(connection, &request.task_id)?.unwrap_or_else(|| {
             default_workbench_record(&request.task_id, default_workbench_options(&settings), &now)
         });
-        let options = normalize_options(request.options, &settings);
         upsert_workbench_record(
             connection,
             &request.task_id,
@@ -211,8 +216,11 @@ async fn run_home_workbench(
     let store = app.state::<SettingsStore>();
     let ai_service = app.state::<AiService>();
     let app_logger = app.state::<AppLogger>();
-    let settings = store.load()?;
+    let mut settings = store.load()?;
     let mut options = normalize_options(request.options, &settings);
+    apply_workbench_options_to_settings(&mut settings, &options);
+    store.save(&settings)?;
+    ai_service.update_thread_count(settings.translation_thread_count)?;
     let task_id = request.task_id;
     initialize_run(&store, &task_id, &options)?;
 
@@ -287,7 +295,7 @@ async fn run_home_workbench_inner(
     )?;
 
     let final_subtitle_path = if options.translation_enabled {
-        set_stage_active(store, &app, task_id, STAGE_TRANSLATION, "翻译与优化字幕", 2)?;
+        set_stage_active(store, &app, task_id, STAGE_TRANSLATION, "翻译字幕", 2)?;
         let translated = translate_subtitle(
             app.clone(),
             store,
@@ -299,10 +307,10 @@ async fn run_home_workbench_inner(
             &subtitle_path,
         )
         .await?;
-        set_stage_done(store, &app, task_id, STAGE_TRANSLATION, "翻译与优化完成")?;
+        set_stage_done(store, &app, task_id, STAGE_TRANSLATION, "翻译完成")?;
         translated
     } else {
-        set_stage_skipped(store, &app, task_id, STAGE_TRANSLATION, "已跳过翻译与优化")?;
+        set_stage_skipped(store, &app, task_id, STAGE_TRANSLATION, "已跳过翻译")?;
         subtitle_path
     };
 
@@ -393,8 +401,7 @@ async fn prepare_subtitle(
     video: &HomeVideoDownload,
 ) -> Result<PathBuf, String> {
     if options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED {
-        if let Some(subtitle) =
-            selected_downloaded_subtitle(store, task_id, &options.subtitle_id)?
+        if let Some(subtitle) = selected_downloaded_subtitle(store, task_id, &options.subtitle_id)?
         {
             upsert_artifact_from_path(
                 store,
@@ -884,7 +891,24 @@ fn read_or_create_workbench_snapshot(
     }
     let mut record = read_workbench_record(connection, task_id)?
         .ok_or_else(|| "无法创建工作台任务".to_string())?;
+    let mut record_changed = false;
+    if record.status != WORKBENCH_STATUS_RUNNING {
+        let cascaded_options =
+            cascade_settings_into_workbench_options(record.options.clone(), settings);
+        if record.options != cascaded_options {
+            record.options = cascaded_options;
+            record_changed = true;
+        }
+        if record.status == WORKBENCH_STATUS_IDLE
+            && sync_option_dependent_stage_messages(&mut record)
+        {
+            record_changed = true;
+        }
+    }
     if sync_idle_workbench_stages(connection, task_id, &mut record)? {
+        record_changed = true;
+    }
+    if record_changed {
         let now = Utc::now().to_rfc3339();
         upsert_workbench_record(
             connection,
@@ -1040,6 +1064,36 @@ fn normalize_options(
     options
 }
 
+fn cascade_settings_into_workbench_options(
+    options: HomeWorkbenchOptions,
+    settings: &AppSettings,
+) -> HomeWorkbenchOptions {
+    let subtitle_source = if options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED {
+        SUBTITLE_SOURCE_DOWNLOADED.to_string()
+    } else {
+        SUBTITLE_SOURCE_TRANSCRIBE.to_string()
+    };
+    let subtitle_id = if subtitle_source == SUBTITLE_SOURCE_DOWNLOADED {
+        options.subtitle_id
+    } else {
+        String::new()
+    };
+    let mut next = default_workbench_options(settings);
+    next.subtitle_source = subtitle_source;
+    next.subtitle_id = subtitle_id;
+    normalize_options(next, settings)
+}
+
+fn apply_workbench_options_to_settings(settings: &mut AppSettings, options: &HomeWorkbenchOptions) {
+    settings.home_workbench_translation_enabled = options.translation_enabled;
+    settings.home_workbench_dubbing_enabled =
+        options.dubbing_enabled && options.translation_enabled;
+    settings.home_workbench_export_dir = options.export_dir.clone();
+    apply_transcription_options(settings, options);
+    apply_translation_options(settings, options);
+    apply_dubbing_options(settings, options);
+}
+
 fn apply_transcription_options(settings: &mut AppSettings, options: &HomeWorkbenchOptions) {
     settings.transcription_model = options.transcription_model.clone();
     settings.source_language = options.source_language.clone();
@@ -1065,15 +1119,24 @@ fn apply_translation_options(settings: &mut AppSettings, options: &HomeWorkbench
     settings.target_language = options.target_language.clone();
 }
 
+fn apply_dubbing_options(settings: &mut AppSettings, options: &HomeWorkbenchOptions) {
+    settings.dubbing_tts_interval_ms = options.dubbing_tts_interval_ms;
+    settings.dubbing_reference_audio_source = options.dubbing_reference_audio_source.clone();
+    settings.dubbing_custom_reference_audio_path =
+        options.dubbing_custom_reference_audio_path.clone();
+    settings.dubbing_is_background_music_enabled = options.dubbing_is_background_music_enabled;
+    settings.dubbing_background_music_volume = options.dubbing_background_music_volume;
+}
+
 fn initial_stages(options: &HomeWorkbenchOptions) -> Vec<HomeWorkbenchStage> {
     [
         (STAGE_DOWNLOAD_VIDEO, "下载视频", "等待下载视频"),
         (STAGE_PREPARE_SUBTITLE, "准备字幕", "等待准备字幕"),
         (
             STAGE_TRANSLATION,
-            "翻译与优化",
+            "翻译",
             if options.translation_enabled {
-                "等待翻译与优化"
+                "等待翻译"
             } else {
                 "已关闭"
             },
@@ -1098,6 +1161,46 @@ fn initial_stages(options: &HomeWorkbenchOptions) -> Vec<HomeWorkbenchStage> {
         message: message.to_string(),
     })
     .collect()
+}
+
+fn sync_option_dependent_stage_messages(record: &mut HomeWorkbenchRecord) -> bool {
+    let mut changed = false;
+    for stage in &mut record.stages {
+        if stage.key == STAGE_TRANSLATION && stage.label != "翻译" {
+            stage.label = "翻译".to_string();
+            changed = true;
+        }
+
+        if stage.status != STAGE_STATUS_PENDING {
+            continue;
+        }
+
+        let next_message = match stage.key.as_str() {
+            STAGE_TRANSLATION => {
+                if record.options.translation_enabled {
+                    Some("等待翻译")
+                } else {
+                    Some("已关闭")
+                }
+            }
+            STAGE_DUBBING => {
+                if record.options.dubbing_enabled {
+                    Some("等待配音")
+                } else {
+                    Some("已关闭")
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(next_message) = next_message {
+            if stage.message != next_message {
+                stage.message = next_message.to_string();
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 struct HomeWorkbenchRecord {

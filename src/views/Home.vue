@@ -434,12 +434,6 @@
                     <span class="translate-status-dot" :class="workbenchStatusDotClass" aria-hidden="true" />
                     <span>{{ workbenchMainMessage }}</span>
                   </div>
-                  <div class="home-workbench-progress" role="progressbar" aria-label="工作台总进度" :aria-valuenow="workbenchProgress" aria-valuemin="0" aria-valuemax="100">
-                    <div class="translate-progress-track">
-                      <span class="translate-progress-bar" :style="{ width: `${workbenchProgress}%` }" />
-                    </div>
-                    <span class="translate-progress-value">{{ workbenchProgress }}%</span>
-                  </div>
                 </div>
 
                 <button
@@ -464,6 +458,93 @@
                 </button>
               </div>
 
+              <div class="home-workbench-config-list" aria-label="工作台参数">
+                <button
+                  class="home-workbench-config-button"
+                  type="button"
+                  :aria-label="`配置字幕参数，当前 ${workbenchTranscriptionModelLabel}`"
+                  @click="openWorkbenchParameterPanel(WorkbenchParameterPanel.Subtitle)"
+                >
+                  <span class="home-workbench-config-icon">
+                    <Captions :stroke-width="2.1" aria-hidden="true" />
+                  </span>
+                  <span class="home-workbench-config-copy">
+                    <span class="home-workbench-config-title">字幕</span>
+                    <span class="home-workbench-config-subtitle">
+                      {{ workbenchTranscriptionModelLabel }} · {{ workbenchSourceLanguageLabel }}
+                    </span>
+                    <span class="home-workbench-config-meta">
+                      <span>输出 {{ workbenchTranscriptionFormatLabel }}</span>
+                      <span>断句 {{ workbenchOptions.isSmartSegmentationEnabled ? '开' : '关' }}</span>
+                    </span>
+                  </span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </button>
+
+                <button
+                  class="home-workbench-config-button"
+                  type="button"
+                  :aria-label="`配置翻译参数，当前 ${workbenchTargetLanguageLabel}`"
+                  @click="openWorkbenchParameterPanel(WorkbenchParameterPanel.Translation)"
+                >
+                  <span class="home-workbench-config-icon">
+                    <WandSparkles :stroke-width="2.1" aria-hidden="true" />
+                  </span>
+                  <span class="home-workbench-config-copy">
+                    <span class="home-workbench-config-title">翻译</span>
+                    <span class="home-workbench-config-subtitle">
+                      {{ workbenchVideoContentTypeLabel }} · {{ workbenchTargetLanguageLabel }}
+                    </span>
+                    <span class="home-workbench-config-meta">
+                      <span>{{ workbenchOutputModeLabel }}</span>
+                      <span>输出 {{ workbenchTranslationFormatLabel }}</span>
+                    </span>
+                  </span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </button>
+
+                <button
+                  class="home-workbench-config-button"
+                  type="button"
+                  :aria-label="`配置配音参数，当前 ${workbenchOptions.dubbingTtsIntervalMs} 毫秒`"
+                  @click="openWorkbenchParameterPanel(WorkbenchParameterPanel.Dubbing)"
+                >
+                  <span class="home-workbench-config-icon">
+                    <MicVocal :stroke-width="2.1" aria-hidden="true" />
+                  </span>
+                  <span class="home-workbench-config-copy">
+                    <span class="home-workbench-config-title">配音</span>
+                    <span class="home-workbench-config-subtitle">
+                      {{ workbenchReferenceAudioLabel }} · {{ workbenchOptions.dubbingTtsIntervalMs }} 毫秒
+                    </span>
+                    <span class="home-workbench-config-meta">
+                      <span>背景音乐 {{ workbenchOptions.dubbingIsBackgroundMusicEnabled ? '开' : '关' }}</span>
+                      <span>音量 {{ workbenchOptions.dubbingBackgroundMusicVolume.toFixed(1) }}</span>
+                    </span>
+                  </span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </button>
+
+                <button
+                  class="home-workbench-config-button"
+                  type="button"
+                  :aria-label="`配置导出参数，当前 ${workbenchExportDirLabel}`"
+                  @click="openWorkbenchParameterPanel(WorkbenchParameterPanel.Export)"
+                >
+                  <span class="home-workbench-config-icon">
+                    <FolderOpen :stroke-width="2.1" aria-hidden="true" />
+                  </span>
+                  <span class="home-workbench-config-copy">
+                    <span class="home-workbench-config-title">导出</span>
+                    <span class="home-workbench-config-subtitle">{{ workbenchExportDirLabel }}</span>
+                    <span class="home-workbench-config-meta">
+                      <span>视频与字幕最终产物</span>
+                    </span>
+                  </span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </button>
+              </div>
+
               <div class="home-workbench-stage-list" aria-label="工作台执行步骤">
                 <article
                   v-for="stage in workbenchStages"
@@ -480,315 +561,21 @@
                   <span class="home-workbench-stage-copy">
                     <span class="home-workbench-stage-title">{{ stage.label }}</span>
                     <span class="home-workbench-stage-message">{{ stage.message }}</span>
+                    <span
+                      class="home-workbench-stage-progress"
+                      role="progressbar"
+                      :aria-label="`${stage.label}进度`"
+                      :aria-valuenow="stage.progress"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                    >
+                      <span class="translate-progress-track">
+                        <span class="translate-progress-bar" :style="{ width: `${stage.progress}%` }" />
+                      </span>
+                    </span>
                   </span>
                   <span class="home-workbench-stage-value">{{ stage.progress }}%</span>
                 </article>
-              </div>
-
-              <div class="home-workbench-grid">
-                <section class="home-workbench-block" aria-label="字幕参数">
-                  <div class="home-workbench-block-title">
-                    <Captions :stroke-width="2.1" aria-hidden="true" />
-                    <span>字幕</span>
-                  </div>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.SubtitleSource)">
-                    <span class="setting-copy">
-                      <span class="setting-title">字幕来源</span>
-                      <span class="setting-subtitle">{{ workbenchSubtitleSourceSubtitle }}</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchSubtitleSourceLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || workbenchOptions.subtitleSource === 'downloaded'" @click="openWorkbenchDialog(WorkbenchDialog.TranscriptionModel)">
-                    <span class="setting-copy">
-                      <span class="setting-title">转录模型</span>
-                      <span class="setting-subtitle">自动转录时使用</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchTranscriptionModelLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.SourceLanguage)">
-                    <span class="setting-copy">
-                      <span class="setting-title">源语言</span>
-                      <span class="setting-subtitle">转录时使用</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchSourceLanguageLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.TranscriptionFormat)">
-                    <span class="setting-copy">
-                      <span class="setting-title">转录格式</span>
-                      <span class="setting-subtitle">自动转录字幕格式</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchTranscriptionFormatLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">智能断句</span>
-                      <span class="setting-subtitle">转录后优化字幕断句</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.isSmartSegmentationEnabled }" type="button" :aria-pressed="workbenchOptions.isSmartSegmentationEnabled" :disabled="isWorkbenchRunning" @click="updateWorkbenchOptions({ isSmartSegmentationEnabled: !workbenchOptions.isSmartSegmentationEnabled })">
-                      <span class="setting-toggle-label">{{ workbenchOptions.isSmartSegmentationEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">字幕校正</span>
-                      <span class="setting-subtitle">转录后校正字幕内容</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.isSubtitleCorrectionEnabled }" type="button" :aria-pressed="workbenchOptions.isSubtitleCorrectionEnabled" :disabled="isWorkbenchRunning || workbenchOptions.subtitleSource === 'downloaded'" @click="updateWorkbenchOptions({ isSubtitleCorrectionEnabled: !workbenchOptions.isSubtitleCorrectionEnabled })">
-                      <span class="setting-toggle-label">{{ workbenchOptions.isSubtitleCorrectionEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                </section>
-
-                <section class="home-workbench-block" aria-label="翻译参数">
-                  <div class="home-workbench-block-title">
-                    <Languages :stroke-width="2.1" aria-hidden="true" />
-                    <span>翻译</span>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">翻译与优化</span>
-                      <span class="setting-subtitle">开启后翻译字幕并生成最终字幕</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.translationEnabled }" type="button" :aria-pressed="workbenchOptions.translationEnabled" :disabled="isWorkbenchRunning" @click="toggleWorkbenchTranslation">
-                      <span class="setting-toggle-label">{{ workbenchOptions.translationEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="openWorkbenchDialog(WorkbenchDialog.TranslationService)">
-                    <span class="setting-copy">
-                      <span class="setting-title">翻译服务</span>
-                      <span class="setting-subtitle">字幕翻译使用的服务</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchTranslationServiceLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="openWorkbenchDialog(WorkbenchDialog.VideoContentType)">
-                    <span class="setting-copy">
-                      <span class="setting-title">视频类型</span>
-                      <span class="setting-subtitle">影响翻译提示词</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchVideoContentTypeLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="openWorkbenchDialog(WorkbenchDialog.TargetLanguage)">
-                    <span class="setting-copy">
-                      <span class="setting-title">目标语言</span>
-                      <span class="setting-subtitle">最终字幕语言</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchTargetLanguageLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="openWorkbenchDialog(WorkbenchDialog.OutputMode)">
-                    <span class="setting-copy">
-                      <span class="setting-title">输出模式</span>
-                      <span class="setting-subtitle">最终字幕呈现方式</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchOutputModeLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="openWorkbenchDialog(WorkbenchDialog.TranslationFormat)">
-                    <span class="setting-copy">
-                      <span class="setting-title">字幕格式</span>
-                      <span class="setting-subtitle">翻译后导出的字幕格式</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchTranslationFormatLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">字幕翻译</span>
-                      <span class="setting-subtitle">关闭后只保留优化处理</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.isSubtitleTranslationEnabled }" type="button" :aria-pressed="workbenchOptions.isSubtitleTranslationEnabled" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="updateWorkbenchOptions({ isSubtitleTranslationEnabled: !workbenchOptions.isSubtitleTranslationEnabled })">
-                      <span class="setting-toggle-label">{{ workbenchOptions.isSubtitleTranslationEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">译后优化</span>
-                      <span class="setting-subtitle">翻译后继续优化译文</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.isPostTranslationOptimizationEnabled }" type="button" :aria-pressed="workbenchOptions.isPostTranslationOptimizationEnabled" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="updateWorkbenchOptions({ isPostTranslationOptimizationEnabled: !workbenchOptions.isPostTranslationOptimizationEnabled })">
-                      <span class="setting-toggle-label">{{ workbenchOptions.isPostTranslationOptimizationEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">反思翻译</span>
-                      <span class="setting-subtitle">提升译文质量但会增加耗时</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.needsReflectionTranslation }" type="button" :aria-pressed="workbenchOptions.needsReflectionTranslation" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="updateWorkbenchOptions({ needsReflectionTranslation: !workbenchOptions.needsReflectionTranslation })">
-                      <span class="setting-toggle-label">{{ workbenchOptions.needsReflectionTranslation ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <div class="setting-row compact range">
-                    <span class="setting-copy">
-                      <span class="setting-title">批处理大小</span>
-                      <span class="setting-subtitle">每批处理字幕数量</span>
-                    </span>
-                    <div class="setting-range-control dubbing-range-control">
-                      <span class="setting-range-value dubbing-range-value">{{ workbenchOptions.translationBatchSize }}</span>
-                      <input
-                        class="setting-range"
-                        type="range"
-                        min="10"
-                        max="100"
-                        step="1"
-                        :value="workbenchOptions.translationBatchSize"
-                        :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled"
-                        aria-label="工作台翻译批处理大小"
-                        @change="updateWorkbenchBatchSize"
-                      />
-                    </div>
-                  </div>
-                  <div class="setting-row compact range">
-                    <span class="setting-copy">
-                      <span class="setting-title">线程数</span>
-                      <span class="setting-subtitle">AI 请求并行数量</span>
-                    </span>
-                    <div class="setting-range-control dubbing-range-control">
-                      <span class="setting-range-value dubbing-range-value">{{ workbenchOptions.translationThreadCount }}</span>
-                      <input
-                        class="setting-range"
-                        type="range"
-                        min="1"
-                        max="100"
-                        step="1"
-                        :value="workbenchOptions.translationThreadCount"
-                        :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled"
-                        aria-label="工作台翻译线程数"
-                        @change="updateWorkbenchThreadCount"
-                      />
-                    </div>
-                  </div>
-                </section>
-
-                <section class="home-workbench-block" aria-label="配音和导出参数">
-                  <div class="home-workbench-block-title">
-                    <MicVocal :stroke-width="2.1" aria-hidden="true" />
-                    <span>配音与导出</span>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">配音</span>
-                      <span class="setting-subtitle">开启后根据翻译字幕生成配音视频</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.dubbingEnabled }" type="button" :aria-pressed="workbenchOptions.dubbingEnabled" :disabled="isWorkbenchRunning || !workbenchOptions.translationEnabled" @click="toggleWorkbenchDubbing">
-                      <span class="setting-toggle-label">{{ workbenchOptions.dubbingEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <button class="setting-row setting-row-button compact" type="button" :disabled="isWorkbenchRunning || !workbenchOptions.dubbingEnabled" @click="openWorkbenchDialog(WorkbenchDialog.ReferenceAudio)">
-                    <span class="setting-copy">
-                      <span class="setting-title">参考音频</span>
-                      <span class="setting-subtitle">配音克隆来源</span>
-                    </span>
-                    <span class="setting-inline-action">
-                      <span class="setting-value">{{ workbenchReferenceAudioLabel }}</span>
-                      <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
-                    </span>
-                  </button>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">自定义音频</span>
-                      <span class="setting-subtitle">{{ workbenchCustomReferenceAudioLabel }}</span>
-                    </span>
-                    <button
-                      class="settings-action"
-                      type="button"
-                      :disabled="isWorkbenchRunning || !workbenchOptions.dubbingEnabled || workbenchOptions.dubbingReferenceAudioSource !== ReferenceAudioSource.CustomAudioFile"
-                      @click="selectWorkbenchCustomReferenceAudio"
-                    >
-                      选择音频
-                    </button>
-                  </div>
-                  <div class="setting-row compact range">
-                    <span class="setting-copy">
-                      <span class="setting-title">TTS 间隔</span>
-                      <span class="setting-subtitle">分段语音停顿时长</span>
-                    </span>
-                    <div class="setting-range-control dubbing-range-control">
-                      <span class="setting-range-value dubbing-range-value">{{ workbenchOptions.dubbingTtsIntervalMs }} 毫秒</span>
-                      <input
-                        class="setting-range"
-                        type="range"
-                        min="0"
-                        max="1000"
-                        step="10"
-                        :value="workbenchOptions.dubbingTtsIntervalMs"
-                        :disabled="isWorkbenchRunning || !workbenchOptions.dubbingEnabled"
-                        aria-label="工作台 TTS 间隔"
-                        @change="updateWorkbenchTtsInterval"
-                      />
-                    </div>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">背景音乐</span>
-                      <span class="setting-subtitle">保留并混入源视频伴奏</span>
-                    </span>
-                    <button class="setting-toggle" :class="{ active: workbenchOptions.dubbingIsBackgroundMusicEnabled }" type="button" :aria-pressed="workbenchOptions.dubbingIsBackgroundMusicEnabled" :disabled="isWorkbenchRunning || !workbenchOptions.dubbingEnabled" @click="updateWorkbenchOptions({ dubbingIsBackgroundMusicEnabled: !workbenchOptions.dubbingIsBackgroundMusicEnabled })">
-                      <span class="setting-toggle-label">{{ workbenchOptions.dubbingIsBackgroundMusicEnabled ? '开' : '关' }}</span>
-                      <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
-                    </button>
-                  </div>
-                  <div class="setting-row compact range">
-                    <span class="setting-copy">
-                      <span class="setting-title">背景音量</span>
-                      <span class="setting-subtitle">最终视频背景音乐音量</span>
-                    </span>
-                    <div class="setting-range-control dubbing-range-control">
-                      <span class="setting-range-value dubbing-range-value">{{ workbenchOptions.dubbingBackgroundMusicVolume.toFixed(1) }}</span>
-                      <input
-                        class="setting-range"
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.1"
-                        :value="workbenchOptions.dubbingBackgroundMusicVolume"
-                        :disabled="isWorkbenchRunning || !workbenchOptions.dubbingEnabled || !workbenchOptions.dubbingIsBackgroundMusicEnabled"
-                        aria-label="工作台背景音乐音量"
-                        @change="updateWorkbenchBackgroundMusicVolume"
-                      />
-                    </div>
-                  </div>
-                  <div class="setting-row compact">
-                    <span class="setting-copy">
-                      <span class="setting-title">导出目录</span>
-                      <span class="setting-subtitle">{{ workbenchExportDirLabel }}</span>
-                    </span>
-                    <button class="settings-action" type="button" :disabled="isWorkbenchRunning" @click="selectWorkbenchExportDir">
-                      选择目录
-                    </button>
-                  </div>
-                </section>
               </div>
 
               <div v-if="workbenchSnapshot?.errorMessage" class="translate-alert home-workbench-alert" role="alert">
@@ -893,6 +680,234 @@
         </section>
       </div>
 
+      <div
+        v-if="activeWorkbenchParameterPanel"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeWorkbenchParameterPanel"
+      >
+        <section
+          class="settings-dialog home-workbench-parameter-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="home-workbench-parameter-dialog-title"
+        >
+          <h2 id="home-workbench-parameter-dialog-title" class="dialog-title">
+            {{ workbenchParameterPanelTitle }}
+          </h2>
+
+          <div class="home-workbench-parameter-body">
+            <div
+              v-if="activeWorkbenchParameterPanel === WorkbenchParameterPanel.Subtitle"
+              class="home-workbench-dialog-rows"
+              aria-label="字幕参数"
+            >
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.TranscriptionModel)">
+                <Bot class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">转录模型</span>
+                  <span class="setting-subtitle">选择用于语音识别的模型</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchTranscriptionModelLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.SourceLanguage)">
+                <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">源语言</span>
+                  <span class="setting-subtitle">视频语音语言</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchSourceLanguageLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.TranscriptionFormat)">
+                <Captions class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">输出格式</span>
+                  <span class="setting-subtitle">手动导出时使用的字幕格式</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchTranscriptionFormatLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <div class="setting-row">
+                <Scissors class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">智能断句</div>
+                  <div class="setting-subtitle">开启后转录完成会用 AI 优化字幕断句</div>
+                </div>
+                <button
+                  class="setting-toggle"
+                  :class="{ active: workbenchOptions.isSmartSegmentationEnabled }"
+                  type="button"
+                  :aria-pressed="workbenchOptions.isSmartSegmentationEnabled"
+                  :disabled="isWorkbenchRunning"
+                  @click="updateWorkbenchOptions({ isSmartSegmentationEnabled: !workbenchOptions.isSmartSegmentationEnabled })"
+                >
+                  <span class="setting-toggle-label">{{ workbenchOptions.isSmartSegmentationEnabled ? '开' : '关' }}</span>
+                  <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
+                </button>
+              </div>
+            </div>
+
+            <div
+              v-else-if="activeWorkbenchParameterPanel === WorkbenchParameterPanel.Translation"
+              class="home-workbench-dialog-rows"
+              aria-label="翻译参数"
+            >
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.VideoContentType)">
+                <Film class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">视频类型</span>
+                  <span class="setting-subtitle">选择视频内容类型</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchVideoContentTypeLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.TargetLanguage)">
+                <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">目标语言</span>
+                  <span class="setting-subtitle">翻译字幕的目标语言</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchTargetLanguageLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.OutputMode)">
+                <PanelTop class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">输出模式</span>
+                  <span class="setting-subtitle">选择最终字幕的呈现方式</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchOutputModeLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.TranslationFormat)">
+                <Captions class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">输出格式</span>
+                  <span class="setting-subtitle">处理后导出的字幕格式</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchTranslationFormatLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+            </div>
+
+            <div
+              v-else-if="activeWorkbenchParameterPanel === WorkbenchParameterPanel.Dubbing"
+              class="home-workbench-dialog-rows"
+              aria-label="配音参数"
+            >
+              <div class="setting-row">
+                <Timer class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">TTS 间隔</div>
+                  <div class="setting-subtitle">分段语音停顿时长</div>
+                </div>
+                <div class="setting-range-control home-workbench-dialog-range tts">
+                  <span class="setting-range-value">{{ workbenchOptions.dubbingTtsIntervalMs }} 毫秒</span>
+                  <input
+                    class="setting-range"
+                    type="range"
+                    min="0"
+                    max="1000"
+                    step="10"
+                    :value="workbenchOptions.dubbingTtsIntervalMs"
+                    :disabled="isWorkbenchRunning"
+                    aria-label="工作台 TTS 间隔"
+                    @change="updateWorkbenchTtsInterval"
+                  />
+                </div>
+              </div>
+
+              <button class="setting-row setting-row-button" type="button" :disabled="isWorkbenchRunning" @click="openWorkbenchDialog(WorkbenchDialog.ReferenceAudio)">
+                <FileMusic class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <span class="setting-copy">
+                  <span class="setting-title">参考音频</span>
+                  <span class="setting-subtitle">选择参考音频来源</span>
+                </span>
+                <span class="setting-inline-action">
+                  <span class="setting-value">{{ workbenchReferenceAudioLabel }}</span>
+                  <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+                </span>
+              </button>
+
+              <div class="setting-row">
+                <Music class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">背景音乐</div>
+                  <div class="setting-subtitle">开启后分离源视频伴奏并跟随变速同步混入最终视频</div>
+                </div>
+                <button class="setting-toggle" :class="{ active: workbenchOptions.dubbingIsBackgroundMusicEnabled }" type="button" :aria-pressed="workbenchOptions.dubbingIsBackgroundMusicEnabled" :disabled="isWorkbenchRunning" @click="updateWorkbenchOptions({ dubbingIsBackgroundMusicEnabled: !workbenchOptions.dubbingIsBackgroundMusicEnabled })">
+                  <span class="setting-toggle-label">{{ workbenchOptions.dubbingIsBackgroundMusicEnabled ? '开' : '关' }}</span>
+                  <span class="setting-toggle-track" aria-hidden="true"><span class="setting-toggle-thumb" /></span>
+                </button>
+              </div>
+
+              <div class="setting-row">
+                <Volume2 class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">背景音乐音量</div>
+                  <div class="setting-subtitle">背景音乐混入音量</div>
+                </div>
+                <div class="setting-range-control home-workbench-dialog-range">
+                  <span class="setting-range-value">{{ workbenchOptions.dubbingBackgroundMusicVolume.toFixed(1) }}</span>
+                  <input
+                    class="setting-range"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    :value="workbenchOptions.dubbingBackgroundMusicVolume"
+                    :disabled="isWorkbenchRunning || !workbenchOptions.dubbingIsBackgroundMusicEnabled"
+                    aria-label="工作台背景音乐音量"
+                    @change="updateWorkbenchBackgroundMusicVolume"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div v-else class="home-workbench-dialog-rows" aria-label="导出参数">
+              <div class="setting-row">
+                <FolderOpen class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+                <div class="setting-copy">
+                  <div class="setting-title">导出目录</div>
+                  <div class="setting-subtitle">{{ workbenchExportDirLabel }}</div>
+                </div>
+                <button class="settings-action" type="button" :disabled="isWorkbenchRunning" @click="selectWorkbenchExportDir">
+                  选择目录
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="youtube-dialog-actions">
+            <button class="settings-action youtube-monitor-action primary" type="button" @click="closeWorkbenchParameterPanel">
+              完成
+            </button>
+          </div>
+        </section>
+      </div>
+
       <div v-if="activeWorkbenchDialog" class="dialog-backdrop" role="presentation" @click.self="closeWorkbenchDialog">
         <section
           class="settings-dialog"
@@ -943,13 +958,16 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import {
   ArrowLeft,
   BadgeInfo,
+  Bot,
   Captions,
   CheckCircle2,
   ChevronRight,
   CircleAlert,
   Clock,
   Download,
+  FileMusic,
   FileCheck2,
+  Film,
   FolderOpen,
   Link2,
   ListTodo,
@@ -957,12 +975,18 @@ import {
   LoaderCircle,
   Languages,
   MicVocal,
+  Music,
+  PanelTop,
   Play,
   Plus,
   RefreshCw,
+  Scissors,
   Search,
+  Timer,
   Trash2,
   Video,
+  Volume2,
+  WandSparkles,
   Workflow,
 } from 'lucide-vue-next'
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
@@ -1010,6 +1034,13 @@ enum WorkbenchDialog {
   OutputMode = 'workbench-output-mode',
   TranslationFormat = 'workbench-translation-format',
   ReferenceAudio = 'workbench-reference-audio',
+}
+
+enum WorkbenchParameterPanel {
+  Subtitle = 'subtitle',
+  Translation = 'translation',
+  Dubbing = 'dubbing',
+  Export = 'export',
 }
 
 type DialogOption = {
@@ -1228,6 +1259,7 @@ const workbenchOptions = ref<HomeWorkbenchOptions>({
 const isWorkbenchLoading = ref(false)
 const isWorkbenchStarting = ref(false)
 const activeWorkbenchDialog = ref<WorkbenchDialog | null>(null)
+const activeWorkbenchParameterPanel = ref<WorkbenchParameterPanel | null>(null)
 const workbenchDialogSearch = ref('')
 let unlistenHomeDownloadProgress: UnlistenFn | undefined
 let unlistenHomeWorkbenchProgress: UnlistenFn | undefined
@@ -1244,7 +1276,6 @@ const taskFilterOptions: { value: TaskStatusFilter; label: string }[] = [
 
 const workbenchTranscribeOption: DialogOption = { value: 'transcribe', label: '自动转录' }
 const workbenchDownloadedSubtitleOption: DialogOption = { value: 'downloaded', label: '使用最新已下载字幕' }
-const referenceAudioExtensions = ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma']
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 
@@ -1419,8 +1450,6 @@ const deleteTargetLabel = computed(() => {
 
 const isWorkbenchRunning = computed(() => isWorkbenchStarting.value || workbenchSnapshot.value?.status === 'running')
 
-const workbenchProgress = computed(() => clampProgress(workbenchSnapshot.value?.progress ?? 0))
-
 const workbenchStages = computed(() => {
   return workbenchSnapshot.value?.stages?.length ? workbenchSnapshot.value.stages : createDefaultWorkbenchStages()
 })
@@ -1467,38 +1496,12 @@ const canStartWorkbench = computed(() => {
   return Boolean(activeTask.value && ytdlpStatus.value.isAvailable && !isWorkbenchRunning.value && !isWorkbenchLoading.value)
 })
 
-const workbenchSubtitleSourceLabel = computed(() => {
-  if (workbenchOptions.value.subtitleSource === 'downloaded') {
-    const subtitle = selectedWorkbenchSubtitle.value
-    return subtitle ? subtitleSubtitleLabel(subtitle) : '已下载字幕'
-  }
-  return '自动转录'
-})
-
-const workbenchSubtitleSourceSubtitle = computed(() => {
-  if (workbenchOptions.value.subtitleSource === 'downloaded') {
-    return selectedWorkbenchSubtitle.value?.filePath || '使用任务中已下载的字幕'
-  }
-  return '未选择字幕时从视频自动转录'
-})
-
-const selectedWorkbenchSubtitle = computed(() => {
-  const task = activeTask.value
-  if (!task) {
-    return null
-  }
-  return task.downloadedSubtitles.find((subtitle) => subtitle.id === workbenchOptions.value.subtitleId) ?? null
-})
-
 const workbenchTranscriptionModelLabel = computed(() =>
   getOptionLabel(transcriptionModelOptions, workbenchOptions.value.transcriptionModel),
 )
 const workbenchSourceLanguageLabel = computed(() => getLanguageLabel(workbenchOptions.value.sourceLanguage))
 const workbenchTranscriptionFormatLabel = computed(() =>
   getOptionLabel(subtitleFormatOptions, workbenchOptions.value.transcriptionFormat),
-)
-const workbenchTranslationServiceLabel = computed(() =>
-  getOptionLabel(translationServiceOptions, workbenchOptions.value.translationService),
 )
 const workbenchVideoContentTypeLabel = computed(() =>
   getOptionLabel(videoContentTypeOptions, workbenchOptions.value.videoContentType),
@@ -1511,14 +1514,6 @@ const workbenchTranslationFormatLabel = computed(() =>
 const workbenchReferenceAudioLabel = computed(() =>
   getOptionLabel(referenceAudioSourceOptions, workbenchOptions.value.dubbingReferenceAudioSource),
 )
-const workbenchCustomReferenceAudioLabel = computed(() => {
-  if (workbenchOptions.value.dubbingReferenceAudioSource !== ReferenceAudioSource.CustomAudioFile) {
-    return '参考音频来源为自定义时使用'
-  }
-  return workbenchOptions.value.dubbingCustomReferenceAudioPath
-    ? fileNameFromPath(workbenchOptions.value.dubbingCustomReferenceAudioPath)
-    : '未选择音频'
-})
 const workbenchExportDirLabel = computed(() => workbenchOptions.value.exportDir || '使用设置中的默认导出目录')
 
 const exportedArtifacts = computed(() => {
@@ -1532,6 +1527,21 @@ const isWorkbenchLanguageDialog = computed(() => {
     activeWorkbenchDialog.value === WorkbenchDialog.SourceLanguage ||
     activeWorkbenchDialog.value === WorkbenchDialog.TargetLanguage
   )
+})
+
+const workbenchParameterPanelTitle = computed(() => {
+  switch (activeWorkbenchParameterPanel.value) {
+    case WorkbenchParameterPanel.Subtitle:
+      return '字幕参数'
+    case WorkbenchParameterPanel.Translation:
+      return '翻译参数'
+    case WorkbenchParameterPanel.Dubbing:
+      return '配音参数'
+    case WorkbenchParameterPanel.Export:
+      return '导出参数'
+    default:
+      return ''
+  }
 })
 
 const workbenchDialogTitle = computed(() => {
@@ -2119,33 +2129,9 @@ const updateWorkbenchOptions = (patch: Partial<HomeWorkbenchOptions>) => {
   void saveWorkbenchOptions()
 }
 
-const toggleWorkbenchTranslation = () => {
-  updateWorkbenchOptions({
-    translationEnabled: !workbenchOptions.value.translationEnabled,
-    dubbingEnabled: workbenchOptions.value.translationEnabled ? false : workbenchOptions.value.dubbingEnabled,
-  })
-}
-
-const toggleWorkbenchDubbing = () => {
-  if (!workbenchOptions.value.translationEnabled) {
-    return
-  }
-  updateWorkbenchOptions({ dubbingEnabled: !workbenchOptions.value.dubbingEnabled })
-}
-
 const updateWorkbenchTtsInterval = (event: Event) => {
   const value = Number((event.target as HTMLInputElement | null)?.value)
   updateWorkbenchOptions({ dubbingTtsIntervalMs: Number.isFinite(value) ? value : workbenchOptions.value.dubbingTtsIntervalMs })
-}
-
-const updateWorkbenchBatchSize = (event: Event) => {
-  const value = Number((event.target as HTMLInputElement | null)?.value)
-  updateWorkbenchOptions({ translationBatchSize: Number.isFinite(value) ? value : workbenchOptions.value.translationBatchSize })
-}
-
-const updateWorkbenchThreadCount = (event: Event) => {
-  const value = Number((event.target as HTMLInputElement | null)?.value)
-  updateWorkbenchOptions({ translationThreadCount: Number.isFinite(value) ? value : workbenchOptions.value.translationThreadCount })
 }
 
 const updateWorkbenchBackgroundMusicVolume = (event: Event) => {
@@ -2153,6 +2139,15 @@ const updateWorkbenchBackgroundMusicVolume = (event: Event) => {
   updateWorkbenchOptions({
     dubbingBackgroundMusicVolume: Number.isFinite(value) ? value : workbenchOptions.value.dubbingBackgroundMusicVolume,
   })
+}
+
+const openWorkbenchParameterPanel = (panel: WorkbenchParameterPanel) => {
+  activeWorkbenchParameterPanel.value = panel
+}
+
+const closeWorkbenchParameterPanel = () => {
+  activeWorkbenchParameterPanel.value = null
+  closeWorkbenchDialog()
 }
 
 const openWorkbenchDialog = (dialog: WorkbenchDialog) => {
@@ -2229,30 +2224,6 @@ const selectWorkbenchExportDir = async () => {
 
   if (typeof selected === 'string') {
     updateWorkbenchOptions({ exportDir: selected })
-  }
-}
-
-const selectWorkbenchCustomReferenceAudio = async () => {
-  if (!isTauriRuntime() || isWorkbenchRunning.value) {
-    return
-  }
-
-  const selected = await open({
-    title: '选择工作台参考音频',
-    multiple: false,
-    filters: [
-      {
-        name: '音频文件',
-        extensions: referenceAudioExtensions,
-      },
-    ],
-  })
-
-  if (typeof selected === 'string') {
-    updateWorkbenchOptions({
-      dubbingReferenceAudioSource: ReferenceAudioSource.CustomAudioFile,
-      dubbingCustomReferenceAudioPath: selected,
-    })
   }
 }
 
@@ -2376,11 +2347,22 @@ const closeDeleteDialog = () => {
 }
 
 const handleKeydown = (event: KeyboardEvent) => {
-  if (event.key === 'Escape') {
-    closeAddDialog()
-    closeDeleteDialog()
-    closeWorkbenchDialog()
+  if (event.key !== 'Escape') {
+    return
   }
+
+  if (activeWorkbenchDialog.value) {
+    closeWorkbenchDialog()
+    return
+  }
+
+  if (activeWorkbenchParameterPanel.value) {
+    closeWorkbenchParameterPanel()
+    return
+  }
+
+  closeAddDialog()
+  closeDeleteDialog()
 }
 
 const normalizedTaskStatus = (task: HomeVideoTask) => task.detailStatus || 'pending'
@@ -2451,7 +2433,7 @@ const normalizeWorkbenchOptions = (options: HomeWorkbenchOptions): HomeWorkbench
 const createDefaultWorkbenchStages = (): HomeWorkbenchStage[] => [
   { key: 'download-video', label: '下载视频', progress: 0, status: 'pending', message: '等待下载视频' },
   { key: 'prepare-subtitle', label: '准备字幕', progress: 0, status: 'pending', message: '等待准备字幕' },
-  { key: 'translation', label: '翻译与优化', progress: 0, status: 'pending', message: '等待翻译与优化' },
+  { key: 'translation', label: '翻译', progress: 0, status: 'pending', message: '等待翻译' },
   { key: 'dubbing', label: '配音', progress: 0, status: 'pending', message: '等待配音' },
   { key: 'export', label: '导出', progress: 0, status: 'pending', message: '等待导出' },
 ]
@@ -2474,11 +2456,6 @@ const artifactLabel = (kind: string) => {
 const subtitleSubtitleLabel = (subtitle: HomeVideoSubtitle) => {
   const name = subtitle.languageName || subtitle.language || '字幕'
   return `${name} · ${subtitleSourceLabel(subtitle.sourceKind)}`
-}
-
-const fileNameFromPath = (path: string) => {
-  const normalized = path.replace(/\\/g, '/')
-  return normalized.split('/').filter(Boolean).pop() ?? path
 }
 
 const clampNumber = (value: number, min: number, max: number) => {
