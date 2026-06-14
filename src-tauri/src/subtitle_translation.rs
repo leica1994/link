@@ -1500,7 +1500,7 @@ fn build_output_segments(
     }
 }
 
-fn load_subtitle_segments(path: &Path) -> Result<Vec<TranscriptionSegment>, String> {
+pub(crate) fn load_subtitle_segments(path: &Path) -> Result<Vec<TranscriptionSegment>, String> {
     if !path.is_file() {
         return Err("字幕文件不存在".to_string());
     }

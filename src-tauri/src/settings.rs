@@ -627,6 +627,22 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS content_copy_records (
+                id TEXT PRIMARY KEY NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'bilibili',
+                subtitle_path TEXT NOT NULL,
+                subtitle_file_name TEXT NOT NULL DEFAULT '',
+                subtitle_format TEXT NOT NULL DEFAULT '',
+                segment_count INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                extra_context TEXT NOT NULL DEFAULT '',
+                options TEXT NOT NULL DEFAULT '{}',
+                result TEXT NOT NULL DEFAULT '{}',
+                log_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS subtitle_styles (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL UNIQUE,
@@ -684,6 +700,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON home_workbench_tasks(updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_workbench_artifacts_task
                 ON home_workbench_artifacts(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_content_copy_records_updated_at
+                ON content_copy_records(updated_at);
             CREATE INDEX IF NOT EXISTS idx_subtitle_styles_name
                 ON subtitle_styles(name);
             ",

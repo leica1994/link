@@ -2,6 +2,7 @@ mod ai;
 mod app_log;
 mod app_paths;
 mod command_utils;
+mod content_copy;
 mod dubbing;
 mod dubbing_alignment;
 mod dubbing_compose;
@@ -19,6 +20,10 @@ mod youtube_monitor;
 
 use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
+use content_copy::{
+    delete_content_copy_record, generate_content_copy, get_content_copy_record,
+    list_content_copy_records,
+};
 use dubbing::{
     add_dubbing_model, cleanup_dubbing_task_cache, delete_dubbing_model, list_dubbing_models,
     list_dubbing_voices, load_dubbing_reference_audio, prepare_dubbing_material,
@@ -118,6 +123,10 @@ pub fn run() {
             save_settings,
             check_llm_connection,
             open_log_directory,
+            generate_content_copy,
+            list_content_copy_records,
+            get_content_copy_record,
+            delete_content_copy_record,
             start_transcription,
             cleanup_transcription_temp_cache,
             save_transcription_file,

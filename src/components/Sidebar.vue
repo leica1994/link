@@ -20,6 +20,10 @@
       <Flame class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
       <span>烧录</span>
     </RouterLink>
+    <RouterLink to="/copywriting" class="nav-item" :class="{ active: route.path === '/copywriting' }">
+      <SquarePen class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
+      <span>文案</span>
+    </RouterLink>
     <RouterLink
       to="/youtube-monitor"
       class="nav-item"
@@ -36,7 +40,7 @@
 </template>
 
 <script setup lang="ts">
-import { Flame, House, Languages, MicVocal, Radar, Settings, Type } from 'lucide-vue-next'
+import { Flame, House, Languages, MicVocal, Radar, Settings, SquarePen, Type } from 'lucide-vue-next'
 import { useRoute, RouterLink } from 'vue-router'
 
 const route = useRoute()
