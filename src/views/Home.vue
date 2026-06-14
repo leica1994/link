@@ -467,9 +467,12 @@
                 <span>任务工作台</span>
               </div>
 
-              <div class="home-info-strip inline" :class="workbenchMessageClass">
+              <div
+                v-if="!workbenchSnapshot?.errorMessage"
+                class="home-info-strip inline"
+                :class="workbenchMessageClass"
+              >
                 <LoaderCircle v-if="isWorkbenchRunning" class="spinning" :stroke-width="2.1" aria-hidden="true" />
-                <CircleAlert v-else-if="workbenchSnapshot?.errorMessage" :stroke-width="2.1" aria-hidden="true" />
                 <CheckCircle2 v-else :stroke-width="2.1" aria-hidden="true" />
                 <span>{{ workbenchStatusText }}</span>
               </div>
@@ -611,7 +614,7 @@
                   </span>
                   <span class="home-workbench-stage-copy">
                     <span class="home-workbench-stage-title">{{ stage.label }}</span>
-                    <span class="home-workbench-stage-message">{{ stage.message }}</span>
+                    <span class="home-workbench-stage-message">{{ workbenchStageMessage(stage) }}</span>
                     <span
                       class="home-workbench-stage-progress"
                       role="progressbar"
@@ -641,7 +644,7 @@
                   <FileCheck2 :stroke-width="2.1" aria-hidden="true" />
                   <span class="home-workbench-artifact-copy">
                     <span class="home-workbench-artifact-title">
-                      {{ isVideoAddedToWorkbench ? '工作台视频已就绪' : selectedWorkbenchStage.message }}
+                      {{ isVideoAddedToWorkbench ? '工作台视频已就绪' : workbenchStageMessage(selectedWorkbenchStage) }}
                     </span>
                     <span class="home-workbench-artifact-path">
                       {{ readStringValue(selectedWorkbenchStageSnapshot.path) || activeTask.downloadedVideo?.filePath || '等待视频下载或添加到工作台' }}
@@ -743,7 +746,7 @@
                   <div v-else class="home-workbench-detail-file">
                     <WandSparkles :stroke-width="2.1" aria-hidden="true" />
                     <span class="home-workbench-artifact-copy">
-                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-title">{{ workbenchStageMessage(selectedWorkbenchStage) }}</span>
                       <span class="home-workbench-artifact-path">{{ readStringValue(selectedWorkbenchStageSnapshot.path) || '等待字幕翻译' }}</span>
                     </span>
                   </div>
@@ -774,7 +777,7 @@
                   <div v-else class="home-workbench-detail-file">
                     <MicVocal :stroke-width="2.1" aria-hidden="true" />
                     <span class="home-workbench-artifact-copy">
-                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-title">{{ workbenchStageMessage(selectedWorkbenchStage) }}</span>
                       <span class="home-workbench-artifact-path">
                         {{ readStringValue(selectedWorkbenchStageSnapshot.dubbingTaskId) || '等待配音流程' }}
                       </span>
@@ -949,7 +952,7 @@
                   <div v-else class="home-workbench-detail-file">
                     <WandSparkles :stroke-width="2.1" aria-hidden="true" />
                     <span class="home-workbench-artifact-copy">
-                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-title">{{ workbenchStageMessage(selectedWorkbenchStage) }}</span>
                       <span class="home-workbench-artifact-path">
                         {{ readStringValue(selectedWorkbenchStageSnapshot.subtitlePath) || '等待生成发布文案' }}
                       </span>
@@ -970,7 +973,7 @@
                   <div v-else class="home-workbench-detail-file">
                     <FolderOpen :stroke-width="2.1" aria-hidden="true" />
                     <span class="home-workbench-artifact-copy">
-                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-title">{{ workbenchStageMessage(selectedWorkbenchStage) }}</span>
                       <span class="home-workbench-artifact-path">等待导出最终产物</span>
                     </span>
                   </div>
@@ -2948,8 +2951,7 @@ const startWorkbench = async () => {
     })
     applyWorkbenchSnapshot(snapshot)
     await reloadTask(taskId)
-  } catch (error) {
-    pageError.value = stringifyError(error, '工作台执行失败')
+  } catch {
     await loadWorkbenchSnapshot()
     await reloadTask(taskId)
   } finally {
@@ -3472,6 +3474,13 @@ const workbenchStageStatusLabel = (status: WorkbenchDetailStageStatus | string) 
     default:
       return '等待'
   }
+}
+
+const workbenchStageMessage = (stage: HomeWorkbenchStage) => {
+  if (stage.status === 'failed' && workbenchSnapshot.value?.errorMessage) {
+    return '执行失败，查看下方错误详情'
+  }
+  return stage.message
 }
 
 const subtitleSubtitleLabel = (subtitle: HomeVideoSubtitle) => {

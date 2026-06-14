@@ -29,7 +29,11 @@ pub struct YtdlpStatus {
     pub config_policy: String,
 }
 
-const YOUTUBE_CLIENT_STRATEGIES: [YoutubeClientStrategy; 3] = [
+const YOUTUBE_CLIENT_STRATEGIES: [YoutubeClientStrategy; 4] = [
+    YoutubeClientStrategy {
+        label: "default",
+        extractor_args: "youtube:lang=zh-CN",
+    },
     YoutubeClientStrategy {
         label: "web_safari+ios",
         extractor_args: "youtube:lang=zh-CN;player-client=web_safari,ios",
@@ -319,11 +323,13 @@ mod tests {
     fn youtube_client_strategies_are_explicit_and_ordered() {
         let strategies = youtube_client_strategies();
 
-        assert_eq!(strategies[0].label, "web_safari+ios");
-        assert_eq!(strategies[1].label, "ios+web");
-        assert_eq!(strategies[2].label, "mweb+web");
+        assert_eq!(strategies[0].label, "default");
+        assert_eq!(strategies[1].label, "web_safari+ios");
+        assert_eq!(strategies[2].label, "ios+web");
+        assert_eq!(strategies[3].label, "mweb+web");
         assert!(strategies
             .iter()
+            .skip(1)
             .all(|strategy| strategy.extractor_args.contains("player-client=")));
         assert!(strategies
             .iter()

@@ -37,6 +37,8 @@ const DOWNLOAD_PROGRESS_ACTIVE: &str = "active";
 const DOWNLOAD_PROGRESS_DONE: &str = "done";
 const DOWNLOAD_PROGRESS_FAILED: &str = "failed";
 const YTDLP_PROGRESS_PREFIX: &str = "LINK_YTDLP_PROGRESS";
+const YTDLP_VIDEO_FORMAT_SELECTOR: &str = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
+const YTDLP_VIDEO_MERGE_OUTPUT_FORMATS: &str = "mp4/mkv";
 const YTDLP_DOWNLOAD_PROGRESS_TEMPLATE: &str =
     "download:LINK_YTDLP_PROGRESS\tdownload\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress._percent_str)s";
 const YTDLP_POSTPROCESS_PROGRESS_TEMPLATE: &str =
@@ -1354,10 +1356,11 @@ fn download_video_file(
             command.args([
                 "--no-playlist",
                 "--no-warnings",
+                "--check-formats",
                 "-f",
-                "bv*+ba/best",
+                YTDLP_VIDEO_FORMAT_SELECTOR,
                 "--merge-output-format",
-                "mp4",
+                YTDLP_VIDEO_MERGE_OUTPUT_FORMATS,
                 "-o",
                 &output_template,
             ]);

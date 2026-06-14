@@ -1470,7 +1470,7 @@ fn mark_workbench_failed(
             .find(|stage| stage.status == STAGE_STATUS_ACTIVE)
         {
             stage.status = STAGE_STATUS_FAILED.to_string();
-            stage.message = compact_error(error);
+            stage.message = "执行失败，查看下方错误详情".to_string();
         }
         let now = Utc::now().to_rfc3339();
         upsert_workbench_record(
