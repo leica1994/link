@@ -1,6 +1,7 @@
 use crate::ai::AiService;
 use crate::app_log::AppLogger;
 use crate::app_paths;
+use crate::content_copy::{generate_content_copy_record, GenerateContentCopyRequest};
 use crate::dubbing::{
     prepare_dubbing_material_internal, start_dubbing_task_internal, DubbingTaskArtifact,
     DubbingTaskOptions, DubbingTaskSnapshot, PrepareDubbingMaterialRequest,
@@ -40,6 +41,7 @@ const STAGE_DOWNLOAD_VIDEO: &str = "download-video";
 const STAGE_PREPARE_SUBTITLE: &str = "prepare-subtitle";
 const STAGE_TRANSLATION: &str = "translation";
 const STAGE_DUBBING: &str = "dubbing";
+const STAGE_CONTENT_COPY: &str = "content-copy";
 const STAGE_EXPORT: &str = "export";
 
 const STAGE_STATUS_PENDING: &str = "pending";
@@ -595,6 +597,16 @@ async fn run_home_workbench_inner(
         (PathBuf::from(&video.file_path), final_subtitle_path)
     };
 
+    generate_workbench_content_copy(
+        app.clone(),
+        store,
+        ai_service,
+        app_logger,
+        task_id,
+        &final_video_path.1,
+    )
+    .await?;
+
     let exported = if let Some(exported) = reusable_exported_artifacts(store, task_id)? {
         update_stage_snapshot_from_app(
             &app,
@@ -1020,6 +1032,149 @@ async fn run_dubbing(
         }),
     )?;
     Ok((video_path, subtitle_path))
+}
+
+async fn generate_workbench_content_copy(
+    app: AppHandle,
+    store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    task_id: &str,
+    subtitle_path: &Path,
+) -> Result<(), String> {
+    if let Some(mut snapshot) = reusable_content_copy_snapshot(store, task_id)? {
+        if let Some(snapshot_object) = snapshot.as_object_mut() {
+            snapshot_object.insert("message".to_string(), json!("复用已生成文案"));
+        }
+        set_stage_done_with_snapshot(
+            store,
+            &app,
+            task_id,
+            STAGE_CONTENT_COPY,
+            "复用已生成文案",
+            WORKBENCH_STATUS_RUNNING,
+            snapshot,
+        )?;
+        return Ok(());
+    }
+
+    set_stage_active(store, &app, task_id, STAGE_CONTENT_COPY, "准备生成文案", 5)?;
+    let subtitle_path_text = subtitle_path.to_string_lossy().to_string();
+    update_stage_snapshot_from_app(
+        &app,
+        task_id,
+        STAGE_CONTENT_COPY,
+        12,
+        "正在生成文案",
+        json!({
+            "mode": "content-copy",
+            "subtitlePath": &subtitle_path_text,
+            "message": "正在生成文案",
+        }),
+    )?;
+
+    let task =
+        store.with_connection(|connection| read_home_video_task_by_id(connection, task_id))?;
+    let record = generate_content_copy_record(
+        store,
+        ai_service,
+        app_logger,
+        GenerateContentCopyRequest {
+            subtitle_path: subtitle_path_text.clone(),
+            extra_context: build_workbench_content_copy_context(&task),
+            platform: None,
+        },
+    )
+    .await?;
+
+    set_stage_done_with_snapshot(
+        store,
+        &app,
+        task_id,
+        STAGE_CONTENT_COPY,
+        "文案已生成",
+        WORKBENCH_STATUS_RUNNING,
+        json!({
+            "mode": "content-copy",
+            "subtitlePath": &subtitle_path_text,
+            "recordId": &record.id,
+            "record": &record,
+            "message": "文案已生成",
+        }),
+    )?;
+
+    Ok(())
+}
+
+fn reusable_content_copy_snapshot(
+    store: &SettingsStore,
+    task_id: &str,
+) -> Result<Option<Value>, String> {
+    store.with_connection(|connection| {
+        Ok(
+            read_workbench_record(connection, task_id)?.and_then(|record| {
+                record
+                    .stages
+                    .into_iter()
+                    .find(|stage| stage.key == STAGE_CONTENT_COPY)
+                    .and_then(|stage| {
+                        let record_id = stage
+                            .snapshot
+                            .get("recordId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if stage.status == STAGE_STATUS_DONE && !record_id.trim().is_empty() {
+                            Some(stage.snapshot)
+                        } else {
+                            None
+                        }
+                    })
+            }),
+        )
+    })
+}
+
+fn build_workbench_content_copy_context(task: &HomeVideoTask) -> String {
+    let mut lines = Vec::new();
+    push_context_line(&mut lines, "视频标题", &task.title);
+    push_context_line(&mut lines, "频道", &task.channel_title);
+    push_context_line(&mut lines, "视频地址", &task.webpage_url);
+    if task.webpage_url.trim() != task.url.trim() {
+        push_context_line(&mut lines, "原始地址", &task.url);
+    }
+    let description = task
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !description.trim().is_empty() {
+        lines.push(format!(
+            "视频简介：{}",
+            truncate_context_text(&description, 1200)
+        ));
+    }
+    if lines.is_empty() {
+        "来源：主页任务工作台".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn push_context_line(lines: &mut Vec<String>, label: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        lines.push(format!("{label}：{value}"));
+    }
+}
+
+fn truncate_context_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn artifact_path(snapshot: &DubbingTaskSnapshot, kind: &str) -> Option<PathBuf> {
@@ -1784,6 +1939,7 @@ fn initial_stages(options: &HomeWorkbenchOptions) -> Vec<HomeWorkbenchStage> {
                 "已关闭"
             },
         ),
+        (STAGE_CONTENT_COPY, "文案", "等待生成文案"),
         (STAGE_EXPORT, "导出", "等待导出"),
     ]
     .into_iter()
@@ -1800,6 +1956,10 @@ fn initial_stages(options: &HomeWorkbenchOptions) -> Vec<HomeWorkbenchStage> {
 
 fn merge_workbench_stages(stages: &mut Vec<HomeWorkbenchStage>, options: &HomeWorkbenchOptions) {
     let defaults = initial_stages(options);
+    let default_order = defaults
+        .iter()
+        .map(|stage| stage.key.clone())
+        .collect::<Vec<_>>();
     if stages.is_empty() {
         *stages = defaults;
         return;
@@ -1821,6 +1981,12 @@ fn merge_workbench_stages(stages: &mut Vec<HomeWorkbenchStage>, options: &HomeWo
             stages.push(default_stage);
         }
     }
+    stages.sort_by_key(|stage| {
+        default_order
+            .iter()
+            .position(|key| key == &stage.key)
+            .unwrap_or(default_order.len())
+    });
 }
 
 fn sync_option_dependent_stage_messages(record: &mut HomeWorkbenchRecord) -> bool {

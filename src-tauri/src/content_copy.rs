@@ -147,6 +147,21 @@ pub async fn generate_content_copy(
     app_logger: tauri::State<'_, AppLogger>,
     request: GenerateContentCopyRequest,
 ) -> Result<ContentCopyRecord, String> {
+    generate_content_copy_record(
+        settings_store.inner(),
+        ai_service.inner(),
+        app_logger.inner(),
+        request,
+    )
+    .await
+}
+
+pub(crate) async fn generate_content_copy_record(
+    settings_store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: GenerateContentCopyRequest,
+) -> Result<ContentCopyRecord, String> {
     let settings = settings_store.load()?;
     let log_session = app_logger.start_session("content_copy")?;
     let subtitle_path = PathBuf::from(request.subtitle_path.trim());

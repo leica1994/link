@@ -782,6 +782,171 @@
                   </div>
                 </template>
 
+                <template v-else-if="selectedWorkbenchStage.key === 'content-copy'">
+                  <div v-if="workbenchContentCopyRecord" class="home-workbench-copy-detail">
+                    <div class="home-workbench-copy-toolbar">
+                      <span class="home-workbench-copy-source">
+                        {{ workbenchContentCopyRecord.subtitleFileName || '工作台字幕' }} · {{ workbenchContentCopyRecord.segmentCount }} 段
+                      </span>
+                      <button
+                        class="settings-action home-workbench-copy-action"
+                        :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Full) }"
+                        type="button"
+                        @click="copyWorkbenchContentCopyFull"
+                      >
+                        <Check v-if="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Full)" :stroke-width="2.1" aria-hidden="true" />
+                        <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                        <span>{{ isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Full) ? '已复制' : '复制全部' }}</span>
+                      </button>
+                    </div>
+
+                    <div class="home-workbench-copy-overview">
+                      <div>
+                        <span class="home-workbench-copy-label">内容摘要</span>
+                        <p>{{ workbenchContentCopyRecord.result.summary }}</p>
+                      </div>
+                      <div>
+                        <span class="home-workbench-copy-label">目标观众</span>
+                        <p>{{ workbenchContentCopyRecord.result.audience }}</p>
+                      </div>
+                      <div>
+                        <span class="home-workbench-copy-label">推荐分类</span>
+                        <p>{{ workbenchContentCopyCategoryText(workbenchContentCopyRecord) }}</p>
+                      </div>
+                    </div>
+
+                    <section class="home-workbench-copy-block" aria-labelledby="home-workbench-copy-titles">
+                      <div class="home-workbench-copy-heading">
+                        <h3 id="home-workbench-copy-titles">标题候选</h3>
+                      </div>
+                      <div class="home-workbench-copy-title-list">
+                        <article
+                          v-for="(title, index) in workbenchContentCopyTitles"
+                          :key="`${title.title}-${index}`"
+                          class="home-workbench-copy-title-item"
+                        >
+                          <span class="home-workbench-copy-index">{{ index + 1 }}</span>
+                          <span class="home-workbench-copy-title-body">
+                            <strong>{{ title.title }}</strong>
+                            <span>{{ title.hook }} · {{ title.reason }}</span>
+                          </span>
+                          <button
+                            class="home-workbench-copy-button"
+                            :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(workbenchTitleCopyTarget(index)) }"
+                            type="button"
+                            :aria-label="isWorkbenchCopyTargetCopied(workbenchTitleCopyTarget(index)) ? `标题 ${index + 1} 已复制` : `复制标题 ${index + 1}`"
+                            @click="copyWorkbenchContentCopyTitle(title, index)"
+                          >
+                            <Check v-if="isWorkbenchCopyTargetCopied(workbenchTitleCopyTarget(index))" :stroke-width="2.1" aria-hidden="true" />
+                            <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                            <span>{{ isWorkbenchCopyTargetCopied(workbenchTitleCopyTarget(index)) ? '已复制' : '复制' }}</span>
+                          </button>
+                        </article>
+                      </div>
+                    </section>
+
+                    <section class="home-workbench-copy-block" aria-labelledby="home-workbench-copy-cover">
+                      <div class="home-workbench-copy-heading">
+                        <h3 id="home-workbench-copy-cover">封面字</h3>
+                      </div>
+                      <div class="home-workbench-copy-cover-list">
+                        <article
+                          v-for="(cover, index) in workbenchContentCopyCoverTexts"
+                          :key="`${cover.lines.join('-')}-${index}`"
+                          class="home-workbench-copy-cover-item"
+                        >
+                          <span class="home-workbench-copy-cover-lines">
+                            <strong v-for="line in cover.lines" :key="line">{{ line }}</strong>
+                          </span>
+                          <span class="home-workbench-copy-cover-reason">{{ cover.reason }}</span>
+                          <button
+                            class="home-workbench-copy-button"
+                            :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(workbenchCoverCopyTarget(index)) }"
+                            type="button"
+                            :aria-label="isWorkbenchCopyTargetCopied(workbenchCoverCopyTarget(index)) ? `封面字 ${index + 1} 已复制` : `复制封面字 ${index + 1}`"
+                            @click="copyWorkbenchContentCopyCover(cover, index)"
+                          >
+                            <Check v-if="isWorkbenchCopyTargetCopied(workbenchCoverCopyTarget(index))" :stroke-width="2.1" aria-hidden="true" />
+                            <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                            <span>{{ isWorkbenchCopyTargetCopied(workbenchCoverCopyTarget(index)) ? '已复制' : '复制' }}</span>
+                          </button>
+                        </article>
+                      </div>
+                    </section>
+
+                    <section class="home-workbench-copy-block" aria-labelledby="home-workbench-copy-description">
+                      <div class="home-workbench-copy-heading">
+                        <h3 id="home-workbench-copy-description">内容简介</h3>
+                        <button
+                          class="home-workbench-copy-icon-button"
+                          :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Description) }"
+                          type="button"
+                          :aria-label="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Description) ? '简介已复制' : '复制简介'"
+                          @click="copyWorkbenchContentCopyDescription"
+                        >
+                          <Check v-if="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Description)" :stroke-width="2.1" aria-hidden="true" />
+                          <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                        </button>
+                      </div>
+                      <div class="home-workbench-copy-description">
+                        <p>{{ workbenchContentCopyRecord.result.description.intro }}</p>
+                        <div v-if="workbenchContentCopyTimeline.length" class="home-workbench-copy-timeline">
+                          <div v-for="item in workbenchContentCopyTimeline" :key="`${item.time}-${item.text}`">
+                            <span>{{ item.time }}</span>
+                            <p>{{ item.text }}</p>
+                          </div>
+                        </div>
+                        <p>{{ workbenchContentCopyRecord.result.description.callToAction }}</p>
+                      </div>
+                    </section>
+
+                    <section class="home-workbench-copy-block" aria-labelledby="home-workbench-copy-tags">
+                      <div class="home-workbench-copy-heading">
+                        <h3 id="home-workbench-copy-tags">标签组合</h3>
+                        <button
+                          class="home-workbench-copy-icon-button"
+                          :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Tags) }"
+                          type="button"
+                          :aria-label="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Tags) ? '标签已复制' : '复制标签'"
+                          @click="copyWorkbenchContentCopyTags"
+                        >
+                          <Check v-if="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Tags)" :stroke-width="2.1" aria-hidden="true" />
+                          <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                        </button>
+                      </div>
+                      <div class="home-workbench-copy-tags">
+                        <span v-for="tag in workbenchContentCopyTags" :key="tag">{{ tag }}</span>
+                      </div>
+                    </section>
+
+                    <section class="home-workbench-copy-block" aria-labelledby="home-workbench-copy-comment">
+                      <div class="home-workbench-copy-heading">
+                        <h3 id="home-workbench-copy-comment">互动评论</h3>
+                        <button
+                          class="home-workbench-copy-icon-button"
+                          :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Comment) }"
+                          type="button"
+                          :aria-label="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Comment) ? '互动评论已复制' : '复制互动评论'"
+                          @click="copyWorkbenchContentCopyComment"
+                        >
+                          <Check v-if="isWorkbenchCopyTargetCopied(WorkbenchCopyTarget.Comment)" :stroke-width="2.1" aria-hidden="true" />
+                          <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                        </button>
+                      </div>
+                      <p class="home-workbench-copy-comment">{{ workbenchContentCopyRecord.result.pinnedComment }}</p>
+                    </section>
+                  </div>
+                  <div v-else class="home-workbench-detail-file">
+                    <WandSparkles :stroke-width="2.1" aria-hidden="true" />
+                    <span class="home-workbench-artifact-copy">
+                      <span class="home-workbench-artifact-title">{{ selectedWorkbenchStage.message }}</span>
+                      <span class="home-workbench-artifact-path">
+                        {{ readStringValue(selectedWorkbenchStageSnapshot.subtitlePath) || '等待生成发布文案' }}
+                      </span>
+                    </span>
+                  </div>
+                </template>
+
                 <template v-else-if="selectedWorkbenchStage.key === 'export'">
                   <div v-if="workbenchExportRows.length > 0" class="home-workbench-artifacts inline">
                     <article v-for="row in workbenchExportRows" :key="row.kind" class="home-workbench-artifact">
@@ -1174,10 +1339,12 @@ import {
   BadgeInfo,
   Bot,
   Captions,
+  Check,
   CheckCircle2,
   ChevronRight,
   CircleAlert,
   Clock,
+  Copy,
   Download,
   FileMusic,
   FileCheck2,
@@ -1437,6 +1604,84 @@ type WorkbenchTranslationRow = {
   status: string
 }
 
+type ContentCopyCategory = {
+  primary: string
+  secondary: string
+  reason: string
+}
+
+type ContentCopyTitle = {
+  title: string
+  hook: string
+  reason: string
+}
+
+type ContentCopyCoverText = {
+  lines: string[]
+  reason: string
+}
+
+type ContentCopyTimelineItem = {
+  time: string
+  text: string
+}
+
+type ContentCopyDescription = {
+  intro: string
+  timeline: ContentCopyTimelineItem[]
+  callToAction: string
+}
+
+type ContentCopyTags = {
+  core: string[]
+  category: string[]
+  longTail: string[]
+}
+
+type ContentCopyResult = {
+  summary: string
+  audience: string
+  category: ContentCopyCategory
+  titles: ContentCopyTitle[]
+  coverTexts: ContentCopyCoverText[]
+  description: ContentCopyDescription
+  tags: ContentCopyTags
+  pinnedComment: string
+}
+
+type ContentCopyOptions = {
+  platform: string
+  titleCount: number
+  coverTextCount: number
+}
+
+type ContentCopyRecord = {
+  id: string
+  platform: string
+  subtitlePath: string
+  subtitleFileName: string
+  subtitleFormat: string
+  segmentCount: number
+  durationMs: number
+  extraContext: string
+  options: ContentCopyOptions
+  result: ContentCopyResult
+  logPath: string
+  createdAt: string
+  updatedAt: string
+}
+
+enum WorkbenchCopyTarget {
+  Full = 'workbench-copy-full',
+  Description = 'workbench-copy-description',
+  Tags = 'workbench-copy-tags',
+  Comment = 'workbench-copy-comment',
+}
+
+type WorkbenchTitleCopyTarget = `workbench-copy-title-${number}`
+type WorkbenchCoverCopyTarget = `workbench-copy-cover-${number}`
+type WorkbenchCopyFeedbackTarget = WorkbenchCopyTarget | WorkbenchTitleCopyTarget | WorkbenchCoverCopyTarget
+
 const route = useRoute()
 const router = useRouter()
 
@@ -1509,10 +1754,12 @@ const activeWorkbenchParameterPanel = ref<WorkbenchParameterPanel | null>(null)
 const selectedWorkbenchStageKey = ref('')
 const isWorkbenchStageSelectionPinned = ref(false)
 const workbenchDialogSearch = ref('')
+const workbenchCopiedTarget = ref<WorkbenchCopyFeedbackTarget | null>(null)
 let unlistenHomeDownloadProgress: UnlistenFn | undefined
 let unlistenHomeWorkbenchProgress: UnlistenFn | undefined
 let videoLayoutObserver: ResizeObserver | undefined
 let videoLayoutFrame = 0
+let workbenchCopiedTimer: ReturnType<typeof window.setTimeout> | undefined
 let hasCompletedInitialLoad = false
 
 const taskFilterOptions: { value: TaskStatusFilter; label: string }[] = [
@@ -1919,6 +2166,22 @@ const workbenchDubbingSteps = computed<WorkbenchDetailStep[]>(() => {
     .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
 })
 
+const workbenchContentCopyRecord = computed<ContentCopyRecord | null>(() => {
+  const record = selectedWorkbenchStageSnapshot.value.record
+  return record && typeof record === 'object' && !Array.isArray(record) ? (record as ContentCopyRecord) : null
+})
+
+const workbenchContentCopyTitles = computed(() => workbenchContentCopyRecord.value?.result?.titles ?? [])
+
+const workbenchContentCopyCoverTexts = computed(() => workbenchContentCopyRecord.value?.result?.coverTexts ?? [])
+
+const workbenchContentCopyTimeline = computed(() => workbenchContentCopyRecord.value?.result?.description?.timeline ?? [])
+
+const workbenchContentCopyTags = computed(() => {
+  const tags = workbenchContentCopyRecord.value?.result?.tags
+  return [...(tags?.core ?? []), ...(tags?.category ?? []), ...(tags?.longTail ?? [])]
+})
+
 const workbenchExportRows = computed(() => {
   const snapshot = selectedWorkbenchStageSnapshot.value
   return [
@@ -2077,6 +2340,10 @@ watch(workbenchStages, () => {
   syncSelectedWorkbenchStage()
 })
 
+watch(selectedWorkbenchStageKey, () => {
+  clearWorkbenchCopyFeedback()
+})
+
 onMounted(async () => {
   window.addEventListener('keydown', handleKeydown)
   window.addEventListener('resize', scheduleVideoDescriptionMeasure)
@@ -2101,6 +2368,7 @@ onBeforeUnmount(() => {
   unlistenHomeDownloadProgress?.()
   unlistenHomeWorkbenchProgress?.()
   videoLayoutObserver?.disconnect()
+  clearWorkbenchCopyFeedback()
   if (videoLayoutFrame) {
     window.cancelAnimationFrame(videoLayoutFrame)
   }
@@ -2852,6 +3120,110 @@ const workbenchArtifactByKind = (kind: string) => {
   return workbenchSnapshot.value?.artifacts.find((artifact) => artifact.kind === kind && artifact.path) ?? null
 }
 
+const workbenchTitleCopyTarget = (index: number): WorkbenchTitleCopyTarget => `workbench-copy-title-${index}`
+
+const workbenchCoverCopyTarget = (index: number): WorkbenchCoverCopyTarget => `workbench-copy-cover-${index}`
+
+const isWorkbenchCopyTargetCopied = (target: WorkbenchCopyFeedbackTarget) => workbenchCopiedTarget.value === target
+
+const copyWorkbenchContentCopyFull = () => {
+  const record = workbenchContentCopyRecord.value
+  if (record) {
+    void copyWorkbenchText(formatWorkbenchContentCopyRecord(record), WorkbenchCopyTarget.Full)
+  }
+}
+
+const copyWorkbenchContentCopyTitle = (title: ContentCopyTitle, index: number) => {
+  void copyWorkbenchText(title.title, workbenchTitleCopyTarget(index))
+}
+
+const copyWorkbenchContentCopyCover = (cover: ContentCopyCoverText, index: number) => {
+  void copyWorkbenchText(cover.lines.join('\n'), workbenchCoverCopyTarget(index))
+}
+
+const copyWorkbenchContentCopyDescription = () => {
+  const record = workbenchContentCopyRecord.value
+  if (!record) {
+    return
+  }
+  const description = record.result.description
+  const timeline = description.timeline.map((item) => `${item.time} ${item.text}`).join('\n')
+  void copyWorkbenchText(
+    [description.intro, timeline, description.callToAction].filter(Boolean).join('\n\n'),
+    WorkbenchCopyTarget.Description,
+  )
+}
+
+const copyWorkbenchContentCopyTags = () => {
+  if (workbenchContentCopyTags.value.length > 0) {
+    void copyWorkbenchText(workbenchContentCopyTags.value.join(' '), WorkbenchCopyTarget.Tags)
+  }
+}
+
+const copyWorkbenchContentCopyComment = () => {
+  const record = workbenchContentCopyRecord.value
+  if (record) {
+    void copyWorkbenchText(record.result.pinnedComment, WorkbenchCopyTarget.Comment)
+  }
+}
+
+const copyWorkbenchText = async (text: string, target: WorkbenchCopyFeedbackTarget) => {
+  const value = text.trim()
+  if (!value) {
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(value)
+    workbenchCopiedTarget.value = target
+    if (workbenchCopiedTimer !== undefined) {
+      window.clearTimeout(workbenchCopiedTimer)
+    }
+    workbenchCopiedTimer = window.setTimeout(() => {
+      workbenchCopiedTarget.value = null
+      workbenchCopiedTimer = undefined
+    }, 1300)
+  } catch (error) {
+    pageError.value = stringifyError(error, '复制文案失败')
+  }
+}
+
+const clearWorkbenchCopyFeedback = () => {
+  workbenchCopiedTarget.value = null
+  if (workbenchCopiedTimer !== undefined) {
+    window.clearTimeout(workbenchCopiedTimer)
+    workbenchCopiedTimer = undefined
+  }
+}
+
+const formatWorkbenchContentCopyRecord = (record: ContentCopyRecord) => {
+  const titles = record.result.titles.map((title, index) => `${index + 1}. ${title.title}`).join('\n')
+  const coverTexts = record.result.coverTexts.map((cover, index) => `${index + 1}. ${cover.lines.join(' / ')}`).join('\n')
+  const timeline = record.result.description.timeline.map((item) => `${item.time} ${item.text}`).join('\n')
+  return [
+    `内容摘要：${record.result.summary}`,
+    `目标观众：${record.result.audience}`,
+    `推荐分类：${workbenchContentCopyCategoryText(record)}`,
+    `标题候选：\n${titles}`,
+    `封面字：\n${coverTexts}`,
+    `内容简介：\n${record.result.description.intro}`,
+    timeline ? `时间轴：\n${timeline}` : '',
+    record.result.description.callToAction,
+    `标签组合：${workbenchAllContentCopyTags(record).join(' ')}`,
+    `互动评论：${record.result.pinnedComment}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+const workbenchContentCopyCategoryText = (record: ContentCopyRecord) => {
+  const category = record.result.category
+  return [category.primary, category.secondary].filter(Boolean).join(' / ') || category.reason || '暂无分类'
+}
+
+const workbenchAllContentCopyTags = (record: ContentCopyRecord) => {
+  return [...record.result.tags.core, ...record.result.tags.category, ...record.result.tags.longTail]
+}
+
 const readRecordValue = (value: unknown): Record<string, unknown> => {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 }
@@ -3045,6 +3417,7 @@ function createDefaultWorkbenchStages(): HomeWorkbenchStage[] {
     { key: 'prepare-subtitle', label: '准备字幕', progress: 0, status: 'pending', message: '等待准备字幕' },
     { key: 'translation', label: '翻译', progress: 0, status: 'pending', message: '等待翻译' },
     { key: 'dubbing', label: '配音', progress: 0, status: 'pending', message: '等待配音' },
+    { key: 'content-copy', label: '文案', progress: 0, status: 'pending', message: '等待生成文案' },
     { key: 'export', label: '导出', progress: 0, status: 'pending', message: '等待导出' },
   ]
 }
