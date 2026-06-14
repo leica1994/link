@@ -680,6 +680,17 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS home_video_task_download_states (
+                task_id TEXT PRIMARY KEY NOT NULL,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER,
+                progress INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS home_workbench_tasks (
                 task_id TEXT PRIMARY KEY NOT NULL,
                 status TEXT NOT NULL DEFAULT 'idle',
@@ -779,6 +790,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON home_video_task_subtitles(task_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_task_videos_task
                 ON home_video_task_videos(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_video_task_download_states_updated_at
+                ON home_video_task_download_states(updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_workbench_tasks_updated_at
                 ON home_workbench_tasks(updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_workbench_artifacts_task

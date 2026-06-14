@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use rusqlite::{params, OptionalExtension, Row};
@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -70,6 +70,7 @@ pub struct HomeVideoTask {
     pub detail_checked_at: Option<String>,
     pub downloaded_subtitles: Vec<HomeVideoSubtitle>,
     pub downloaded_video: Option<HomeVideoDownload>,
+    pub partial_video: Option<HomeVideoPartialDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +109,15 @@ pub struct HomeVideoDownload {
     pub file_size: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeVideoPartialDownload {
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub progress: Option<u8>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +173,13 @@ struct VideoDownloadOutput {
     file_size: i64,
 }
 
+#[derive(Debug, Clone)]
+struct HomeVideoDownloadState {
+    total_bytes: Option<u64>,
+    progress: Option<u8>,
+    updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HomeVideoDownloadProgress {
@@ -186,6 +203,7 @@ struct DownloadProgressEmitter {
     key: String,
     language: Option<String>,
     source_kind: Option<String>,
+    latest: Arc<Mutex<Option<DownloadProgressSnapshot>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +212,12 @@ struct YtdlpProgressLine {
     status: String,
     progress: Option<u8>,
     downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadProgressSnapshot {
+    progress: u8,
     total_bytes: Option<u64>,
 }
 
@@ -206,6 +230,7 @@ impl DownloadProgressEmitter {
             key: DOWNLOAD_KIND_VIDEO.to_string(),
             language: None,
             source_kind: None,
+            latest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -217,6 +242,7 @@ impl DownloadProgressEmitter {
             key: subtitle_key(option),
             language: Some(option.language.clone()),
             source_kind: Some(option.source_kind.clone()),
+            latest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -228,6 +254,7 @@ impl DownloadProgressEmitter {
         downloaded_bytes: Option<u64>,
         total_bytes: Option<u64>,
     ) {
+        self.remember_progress(progress, downloaded_bytes, total_bytes);
         let _ = self.app.emit(
             HOME_VIDEO_DOWNLOAD_PROGRESS_EVENT,
             HomeVideoDownloadProgress {
@@ -243,6 +270,41 @@ impl DownloadProgressEmitter {
                 source_kind: self.source_kind.clone(),
             },
         );
+    }
+
+    fn latest_progress(&self) -> Option<DownloadProgressSnapshot> {
+        self.latest.lock().ok().and_then(|latest| latest.clone())
+    }
+
+    fn remember_progress(
+        &self,
+        progress: u8,
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    ) {
+        if self.kind != DOWNLOAD_KIND_VIDEO {
+            return;
+        }
+
+        if progress == 0 && downloaded_bytes.is_none() && total_bytes.is_none() {
+            return;
+        }
+
+        let has_transfer_progress = downloaded_bytes.is_some() || total_bytes.is_some();
+        if let Ok(mut latest) = self.latest.lock() {
+            if !has_transfer_progress {
+                if let Some(existing) = latest.as_ref() {
+                    if existing.total_bytes.is_some() || existing.progress >= progress {
+                        return;
+                    }
+                }
+            }
+
+            *latest = Some(DownloadProgressSnapshot {
+                progress: progress.min(100),
+                total_bytes,
+            });
+        }
     }
 
     fn emit_active(&self, progress: u8, message: &str) {
@@ -422,6 +484,12 @@ pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> 
                 params![request.task_id],
             )
             .map_err(|error| format!("无法删除视频记录: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM home_video_task_download_states WHERE task_id = ?1",
+                params![request.task_id],
+            )
+            .map_err(|error| format!("无法删除视频下载状态: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM home_workbench_artifacts WHERE task_id = ?1",
@@ -710,12 +778,14 @@ pub(crate) fn download_home_video_task_video_internal(
     ) {
         Ok(output) => output,
         Err(error) => {
+            persist_interrupted_video_download_state(&store, &task.id, &progress, &error);
             progress.emit_failed(&error);
             return Err(error);
         }
     };
     let now = Utc::now().to_rfc3339();
     let updated_task = match store.with_connection(|connection| {
+        delete_home_video_download_state(connection, &task.id)?;
         upsert_home_video_download(connection, &task.id, output, &now)?;
         read_home_video_task_by_id(connection, &task.id)
     }) {
@@ -727,6 +797,24 @@ pub(crate) fn download_home_video_task_video_internal(
     };
     progress.emit_done("视频下载完成");
     Ok(updated_task)
+}
+
+fn persist_interrupted_video_download_state(
+    store: &SettingsStore,
+    task_id: &str,
+    progress: &DownloadProgressEmitter,
+    message: &str,
+) {
+    let state =
+        partial_download_from_files_and_progress(task_id, progress.latest_progress().as_ref());
+    let Some(state) = state else {
+        return;
+    };
+
+    let now = Utc::now().to_rfc3339();
+    let _ = store.with_connection(|connection| {
+        upsert_home_video_download_state(connection, task_id, &state, "interrupted", message, &now)
+    });
 }
 
 fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVideoTask>, String> {
@@ -751,6 +839,8 @@ fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVi
         let mut task = row.map_err(|error| format!("无法解析待办任务: {error}"))?;
         task.downloaded_subtitles = read_home_video_subtitles(connection, &task.id)?;
         task.downloaded_video = read_home_video_download(connection, &task.id)?;
+        task.partial_video =
+            read_home_video_partial_download(connection, &task.id, task.downloaded_video.as_ref())?;
         tasks.push(task);
     }
 
@@ -780,6 +870,8 @@ pub(crate) fn read_home_video_task_by_id(
         .ok_or_else(|| "未找到待办任务".to_string())?;
     task.downloaded_subtitles = read_home_video_subtitles(connection, &task.id)?;
     task.downloaded_video = read_home_video_download(connection, &task.id)?;
+    task.partial_video =
+        read_home_video_partial_download(connection, &task.id, task.downloaded_video.as_ref())?;
     Ok(task)
 }
 
@@ -907,6 +999,7 @@ fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {
         detail_checked_at: row.get(22)?,
         downloaded_subtitles: Vec::new(),
         downloaded_video: None,
+        partial_video: None,
     })
 }
 
@@ -977,6 +1070,107 @@ fn read_home_video_download(
         )
         .optional()
         .map_err(|error| format!("无法读取视频下载记录: {error}"))
+}
+
+fn read_home_video_partial_download(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    downloaded_video: Option<&HomeVideoDownload>,
+) -> Result<Option<HomeVideoPartialDownload>, String> {
+    if downloaded_video.is_some() {
+        return Ok(None);
+    }
+
+    let state = read_home_video_download_state(connection, task_id)?;
+    Ok(partial_download_from_files(task_id, state.as_ref()))
+}
+
+fn read_home_video_download_state(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Option<HomeVideoDownloadState>, String> {
+    connection
+        .query_row(
+            "
+            SELECT total_bytes, progress, updated_at
+            FROM home_video_task_download_states
+            WHERE task_id = ?1
+            ",
+            params![task_id],
+            |row| {
+                let total_bytes = row.get::<_, Option<i64>>(0)?.and_then(|value| {
+                    if value > 0 {
+                        Some(value as u64)
+                    } else {
+                        None
+                    }
+                });
+                let progress = row.get::<_, i64>(1)?.clamp(0, 99) as u8;
+                Ok(HomeVideoDownloadState {
+                    total_bytes,
+                    progress: (progress > 0).then_some(progress),
+                    updated_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("无法读取视频下载状态: {error}"))
+}
+
+fn upsert_home_video_download_state(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    snapshot: &HomeVideoPartialDownload,
+    status: &str,
+    message: &str,
+    now: &str,
+) -> Result<(), String> {
+    let downloaded_bytes = i64::try_from(snapshot.downloaded_bytes).unwrap_or(i64::MAX);
+    let total_bytes = snapshot
+        .total_bytes
+        .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
+    let progress = i64::from(snapshot.progress.unwrap_or(0).min(99));
+
+    connection
+        .execute(
+            "
+            INSERT INTO home_video_task_download_states (
+                task_id, downloaded_bytes, total_bytes, progress, status, message, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(task_id) DO UPDATE SET
+                downloaded_bytes = excluded.downloaded_bytes,
+                total_bytes = excluded.total_bytes,
+                progress = excluded.progress,
+                status = excluded.status,
+                message = excluded.message,
+                updated_at = excluded.updated_at
+            ",
+            params![
+                task_id,
+                downloaded_bytes,
+                total_bytes,
+                progress,
+                status,
+                message,
+                now
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法保存视频下载状态: {error}"))
+}
+
+fn delete_home_video_download_state(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM home_video_task_download_states WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法清理视频下载状态: {error}"))
 }
 
 fn upsert_home_video_subtitle(
@@ -1914,6 +2108,215 @@ fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     matches
         .pop()
         .ok_or_else(|| "yt-dlp 未生成视频文件".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct PartialVideoFiles {
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    updated_at: Option<String>,
+}
+
+fn partial_download_from_files(
+    task_id: &str,
+    state: Option<&HomeVideoDownloadState>,
+) -> Option<HomeVideoPartialDownload> {
+    let files = scan_partial_video_files(task_id)?;
+    if files.downloaded_bytes == 0 {
+        return None;
+    }
+
+    let total_bytes = state
+        .and_then(|state| state.total_bytes)
+        .or(files.total_bytes)
+        .filter(|total| *total >= files.downloaded_bytes);
+    let progress = partial_download_progress(files.downloaded_bytes, total_bytes)
+        .or_else(|| state.and_then(|state| state.progress));
+    let updated_at = files
+        .updated_at
+        .or_else(|| state.map(|state| state.updated_at.clone()));
+
+    Some(HomeVideoPartialDownload {
+        downloaded_bytes: files.downloaded_bytes,
+        total_bytes,
+        progress,
+        updated_at,
+    })
+}
+
+fn partial_download_from_files_and_progress(
+    task_id: &str,
+    progress: Option<&DownloadProgressSnapshot>,
+) -> Option<HomeVideoPartialDownload> {
+    let files = scan_partial_video_files(task_id)?;
+    if files.downloaded_bytes == 0 {
+        return None;
+    }
+
+    let total_bytes = progress
+        .and_then(|progress| progress.total_bytes)
+        .or(files.total_bytes)
+        .filter(|total| *total >= files.downloaded_bytes);
+    let progress_value =
+        partial_download_progress(files.downloaded_bytes, total_bytes).or_else(|| {
+            progress
+                .map(|progress| progress.progress.min(99))
+                .filter(|value| *value > 0)
+        });
+
+    Some(HomeVideoPartialDownload {
+        downloaded_bytes: files.downloaded_bytes,
+        total_bytes,
+        progress: progress_value,
+        updated_at: files.updated_at,
+    })
+}
+
+fn scan_partial_video_files(task_id: &str) -> Option<PartialVideoFiles> {
+    let videos_dir = app_paths::existing_youtube_task_dir(task_id)
+        .ok()?
+        .join("videos");
+    if !videos_dir.is_dir() {
+        return None;
+    }
+
+    let prefix = home_video_prefix(task_id);
+    let mut downloaded_bytes = 0_u64;
+    let mut total_bytes = None;
+    let mut latest_modified = None;
+
+    for entry in fs::read_dir(videos_dir).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name().and_then(|value| value.to_str())?;
+        if !name.starts_with(&prefix) || !path.is_file() {
+            continue;
+        }
+
+        if is_ytdl_state_path(&path) {
+            total_bytes = total_bytes.or_else(|| read_ytdl_total_bytes(&path));
+            latest_modified = latest_modified.max(file_modified_at(&path));
+            continue;
+        }
+
+        if !is_partial_video_data_path(&path, &prefix) {
+            continue;
+        }
+
+        let metadata = fs::metadata(&path).ok()?;
+        downloaded_bytes = downloaded_bytes.saturating_add(metadata.len());
+        latest_modified = latest_modified.max(metadata.modified().ok().map(format_system_time));
+    }
+
+    (downloaded_bytes > 0).then_some(PartialVideoFiles {
+        downloaded_bytes,
+        total_bytes,
+        updated_at: latest_modified,
+    })
+}
+
+fn is_partial_video_data_path(path: &Path, prefix: &str) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if name.contains(".part") {
+        return true;
+    }
+
+    if !name.starts_with(&format!("{prefix}.")) {
+        return false;
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if stem == prefix {
+        return false;
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "mp4" | "m4a" | "mkv" | "webm" | "mov" | "m4v" | "opus" | "ogg" | "aac" | "wav"
+    )
+}
+
+fn is_ytdl_state_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ytdl"))
+}
+
+fn read_ytdl_total_bytes(path: &Path) -> Option<u64> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > 2 * 1024 * 1024 {
+        return None;
+    }
+
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    ytdl_total_bytes_from_value(&value)
+}
+
+fn ytdl_total_bytes_from_value(value: &Value) -> Option<u64> {
+    field_u64(value, "total_bytes")
+        .or_else(|| field_u64(value, "total_bytes_estimate"))
+        .or_else(|| {
+            value
+                .get("info_dict")
+                .and_then(requested_formats_total_bytes)
+        })
+        .or_else(|| value.get("info_dict").and_then(single_format_total_bytes))
+        .or_else(|| requested_formats_total_bytes(value))
+        .or_else(|| single_format_total_bytes(value))
+}
+
+fn requested_formats_total_bytes(value: &Value) -> Option<u64> {
+    let formats = value.get("requested_formats")?.as_array()?;
+    if formats.is_empty() {
+        return None;
+    }
+
+    let mut total = 0_u64;
+    for format in formats {
+        total = total.saturating_add(single_format_total_bytes(format)?);
+    }
+
+    (total > 0).then_some(total)
+}
+
+fn single_format_total_bytes(value: &Value) -> Option<u64> {
+    field_u64(value, "filesize").or_else(|| field_u64(value, "filesize_approx"))
+}
+
+fn field_u64(value: &Value, key: &str) -> Option<u64> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+}
+
+fn partial_download_progress(downloaded_bytes: u64, total_bytes: Option<u64>) -> Option<u8> {
+    let total_bytes = total_bytes.filter(|total| *total > 0 && *total >= downloaded_bytes)?;
+    let progress = ((downloaded_bytes as f64 / total_bytes as f64) * 100.0).round();
+    Some((progress as u8).clamp(1, 99))
+}
+
+fn file_modified_at(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(format_system_time)
+}
+
+fn format_system_time(value: std::time::SystemTime) -> String {
+    DateTime::<Utc>::from(value).to_rfc3339()
 }
 
 fn remove_other_matching_outputs(dir: &Path, prefix: &str, keep_path: &Path) -> Result<(), String> {

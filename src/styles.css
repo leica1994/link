@@ -2526,6 +2526,10 @@ html[data-theme='dark'] .home-video-cover {
   color: #2f8a55;
 }
 
+.home-video-download-strip.partial .home-video-download-title svg {
+  color: var(--accent);
+}
+
 html[data-theme='dark'] .home-video-download-strip.downloaded .home-video-download-title svg {
   color: #8ed0a8;
 }

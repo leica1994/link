@@ -272,13 +272,16 @@
                 class="home-video-download-strip"
                 :class="{
                   downloaded: Boolean(activeTask.downloadedVideo),
+                  partial: hasActivePartialVideo,
                 }"
               >
                 <span class="home-video-download-copy">
                   <span class="home-video-download-title">
                     <Video :stroke-width="2.1" aria-hidden="true" />
                     <span>视频文件</span>
-                    <span v-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
+                    <span v-if="isActiveTaskDownloadingVideo" class="youtube-video-status checking">下载中</span>
+                    <span v-else-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
+                    <span v-else-if="hasActivePartialVideo" class="youtube-video-status checking">可继续</span>
                   </span>
                   <span v-if="videoDownloadMeta" class="home-video-download-meta">
                     {{ videoDownloadMeta }}
@@ -299,6 +302,7 @@
                       aria-hidden="true"
                     />
                     <CheckCircle2 v-else-if="activeTask.downloadedVideo" :stroke-width="2.1" aria-hidden="true" />
+                    <Play v-else-if="hasActivePartialVideo" :stroke-width="2.1" aria-hidden="true" />
                     <Download v-else :stroke-width="2.1" aria-hidden="true" />
                     <span>{{ videoActionLabel }}</span>
                   </button>
@@ -325,7 +329,7 @@
               </div>
 
               <div
-                v-if="isActiveTaskDownloadingVideo"
+                v-if="shouldShowVideoDownloadProgress"
                 class="home-download-progress"
                 role="progressbar"
                 aria-label="视频下载进度"
@@ -342,7 +346,7 @@
                 <div class="translate-progress-track">
                   <span class="translate-progress-bar" :style="{ width: `${videoDownloadProgressValue}%` }" />
                 </div>
-                <span class="translate-progress-value">{{ videoDownloadProgressValue }}%</span>
+                <span class="translate-progress-value">{{ videoDownloadProgressLabel }}</span>
               </div>
 
               <div v-if="videoError" class="translate-alert compact home-download-alert" role="alert">
@@ -1481,6 +1485,13 @@ type HomeVideoDownload = {
   updatedAt: string
 }
 
+type HomeVideoPartialDownload = {
+  downloadedBytes: number
+  totalBytes?: number | null
+  progress?: number | null
+  updatedAt?: string | null
+}
+
 type HomeVideoDownloadProgress = {
   taskId: string
   kind: DownloadProgressKind
@@ -1520,6 +1531,7 @@ type HomeVideoTask = {
   detailCheckedAt?: string | null
   downloadedSubtitles: HomeVideoSubtitle[]
   downloadedVideo?: HomeVideoDownload | null
+  partialVideo?: HomeVideoPartialDownload | null
 }
 
 type HomeWorkbenchOptions = {
@@ -1874,10 +1886,32 @@ const subtitleEmptyText = computed(() => {
   return '读取视频详情后会显示可下载字幕'
 })
 
+const activePartialVideo = computed(() => {
+  const task = activeTask.value
+  if (!task || task.downloadedVideo) {
+    return null
+  }
+
+  return task.partialVideo ?? null
+})
+
+const hasActivePartialVideo = computed(() => Boolean(activePartialVideo.value))
+
 const videoDownloadMeta = computed(() => {
   const video = activeTask.value?.downloadedVideo
   if (!video) {
-    return isActiveTaskDownloadingVideo.value ? '' : '尚未下载'
+    if (isActiveTaskDownloadingVideo.value) {
+      return ''
+    }
+    const partial = activePartialVideo.value
+    if (partial) {
+      const pieces = [
+        `已下载 ${formatPartialVideoSize(partial)}`,
+        partial.updatedAt ? `上次中断 ${formatDateTime(partial.updatedAt)}` : '等待继续下载',
+      ].filter(Boolean)
+      return pieces.join(' · ')
+    }
+    return '尚未下载'
   }
 
   const pieces = [
@@ -1899,6 +1933,9 @@ const videoActionLabel = computed(() => {
   }
   if (activeTask.value?.downloadedVideo) {
     return '重新下载'
+  }
+  if (hasActivePartialVideo.value) {
+    return '继续下载'
   }
   return '下载视频'
 })
@@ -1923,16 +1960,69 @@ const videoDownloadProgress = computed(() => {
   return downloadProgressByKey.value.get(downloadProgressKey(activeTask.value.id, 'video', 'video')) ?? null
 })
 
+const videoDownloadProgressBytes = computed(() => {
+  const progress = videoDownloadProgress.value
+  const partial = activePartialVideo.value
+  const progressBytes = {
+    downloadedBytes: normalizeByteCount(progress?.downloadedBytes),
+    totalBytes: normalizeByteCount(progress?.totalBytes),
+  }
+  const partialBytes = {
+    downloadedBytes: normalizeByteCount(partial?.downloadedBytes),
+    totalBytes: normalizeByteCount(partial?.totalBytes),
+  }
+  if (isActiveTaskDownloadingVideo.value) {
+    return {
+      downloadedBytes: progressBytes.downloadedBytes || partialBytes.downloadedBytes,
+      totalBytes: progressBytes.totalBytes || partialBytes.totalBytes,
+    }
+  }
+
+  return {
+    downloadedBytes: partialBytes.downloadedBytes || progressBytes.downloadedBytes,
+    totalBytes: partialBytes.totalBytes || progressBytes.totalBytes,
+  }
+})
+
+const shouldShowVideoDownloadProgress = computed(() => {
+  return (
+    isActiveTaskDownloadingVideo.value ||
+    hasActivePartialVideo.value ||
+    Boolean(videoDownloadProgress.value?.status === 'failed' && videoDownloadProgressBytes.value.downloadedBytes > 0)
+  )
+})
+
 const videoDownloadProgressValue = computed(() => {
-  return clampProgress(videoDownloadProgress.value?.progress ?? (isActiveTaskDownloadingVideo.value ? 2 : 0))
+  const progress = videoDownloadProgress.value
+  const partial = activePartialVideo.value
+  const progressValue = progress && progress.progress > 0 ? progress.progress : undefined
+  const value =
+    progressValue ??
+    partial?.progress ??
+    byteProgress(videoDownloadProgressBytes.value.downloadedBytes, videoDownloadProgressBytes.value.totalBytes) ??
+    (isActiveTaskDownloadingVideo.value ? 2 : 0)
+  return clampProgress(value)
+})
+
+const videoDownloadProgressLabel = computed(() => {
+  if (videoDownloadProgressValue.value > 0 || videoDownloadProgressBytes.value.totalBytes > 0) {
+    return `${videoDownloadProgressValue.value}%`
+  }
+  return '--'
 })
 
 const videoDownloadProgressMessage = computed(() => {
-  return videoDownloadProgress.value?.message || (isActiveTaskDownloadingVideo.value ? '视频下载中' : '')
+  if (isActiveTaskDownloadingVideo.value) {
+    return videoDownloadProgress.value?.message || '视频下载中'
+  }
+  if (hasActivePartialVideo.value) {
+    return '下载已中断，可继续'
+  }
+  return videoDownloadProgress.value?.message || ''
 })
 
 const videoDownloadProgressSize = computed(() => {
-  return formatDownloadSizeProgress(videoDownloadProgress.value)
+  return formatDownloadSizeProgress(videoDownloadProgressBytes.value)
 })
 
 const subtitleError = computed(() => activeTaskScopedError(subtitleErrorsByTaskId))
@@ -2781,14 +2871,17 @@ const downloadVideo = async () => {
   }
 
   const taskId = task.id
+  const partial = task.partialVideo
   setVideoTaskDownloading(taskId, true)
   setDownloadProgress({
     taskId,
     kind: 'video',
     key: 'video',
-    progress: 2,
+    progress: partial?.progress ?? 2,
     status: 'active',
-    message: '准备下载视频',
+    message: partial ? '准备继续下载视频' : '准备下载视频',
+    downloadedBytes: partial?.downloadedBytes,
+    totalBytes: partial?.totalBytes,
   })
   clearTaskError(videoErrorsByTaskId, taskId)
 
@@ -2802,14 +2895,17 @@ const downloadVideo = async () => {
     await loadWorkbenchSnapshot()
   } catch (error) {
     const message = stringifyError(error, '下载视频失败')
+    const previousProgress = downloadProgressByKey.value.get(downloadProgressKey(taskId, 'video', 'video'))
     setTaskError(videoErrorsByTaskId, taskId, message)
     setDownloadProgress({
       taskId,
       kind: 'video',
       key: 'video',
-      progress: 100,
+      progress: previousProgress?.progress ?? 0,
       status: 'failed',
       message,
+      downloadedBytes: previousProgress?.downloadedBytes,
+      totalBytes: previousProgress?.totalBytes,
     })
     await reloadTask(taskId)
   } finally {
@@ -3737,9 +3833,24 @@ const formatDownloadByteSize = (value: number) => {
   return safeValue > 0 ? formatFileSize(safeValue) : '0 B'
 }
 
-const formatDownloadSizeProgress = (progress: HomeVideoDownloadProgress | null) => {
-  const downloaded = normalizeByteCount(progress?.downloadedBytes)
-  const total = normalizeByteCount(progress?.totalBytes)
+const byteProgress = (downloaded: number, total: number) => {
+  if (downloaded <= 0 || total <= 0 || downloaded > total) {
+    return null
+  }
+  return clampProgress((downloaded / total) * 100)
+}
+
+const formatPartialVideoSize = (partial: HomeVideoPartialDownload) => {
+  const downloaded = normalizeByteCount(partial.downloadedBytes)
+  const total = normalizeByteCount(partial.totalBytes)
+  return total > 0
+    ? `${formatDownloadByteSize(downloaded)} / ${formatDownloadByteSize(total)}`
+    : formatDownloadByteSize(downloaded)
+}
+
+const formatDownloadSizeProgress = (size: { downloadedBytes?: number | null; totalBytes?: number | null }) => {
+  const downloaded = normalizeByteCount(size.downloadedBytes)
+  const total = normalizeByteCount(size.totalBytes)
 
   if (downloaded <= 0 && total <= 0) {
     return ''
