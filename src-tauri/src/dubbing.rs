@@ -239,6 +239,12 @@ pub struct StartDubbingTaskRequest {
     pub progress_source: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupDubbingTaskCacheRequest {
+    pub task_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DubbingTaskOptions {
@@ -932,6 +938,33 @@ pub async fn start_dubbing_task(
 ) -> Result<DubbingTaskSnapshot, String> {
     request.progress_source = "dubbing-page".to_string();
     start_dubbing_task_internal(app, request).await
+}
+
+#[tauri::command]
+pub fn cleanup_dubbing_task_cache(
+    app: AppHandle,
+    request: CleanupDubbingTaskCacheRequest,
+) -> Result<Option<DubbingTaskSnapshot>, String> {
+    let store = app.state::<SettingsStore>();
+    let snapshot = store.with_connection(|connection| {
+        read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+    })?;
+
+    if snapshot.status == DUBBING_STATUS_RUNNING {
+        return Err("配音任务执行中，无法清理缓存".to_string());
+    }
+
+    if has_final_dubbing_outputs(&snapshot) {
+        cleanup_dubbing_intermediate_cache(&store, &snapshot)?;
+        store
+            .with_connection(|connection| {
+                read_dubbing_task_snapshot_by_id(connection, &request.task_id)
+            })
+            .map(Some)
+    } else {
+        delete_dubbing_task_internal(&store, &snapshot.id)?;
+        Ok(None)
+    }
 }
 
 pub(crate) async fn start_dubbing_task_internal(
@@ -3150,6 +3183,196 @@ fn read_dubbing_artifacts(
     }
 
     Ok(artifacts)
+}
+
+pub(crate) fn delete_dubbing_task_by_id(
+    store: &SettingsStore,
+    task_id: &str,
+) -> Result<(), String> {
+    let snapshot =
+        match store.with_connection(|connection| read_dubbing_task_snapshot_by_id(connection, task_id))
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) if error == "未找到配音任务" => return Ok(()),
+            Err(error) => return Err(error),
+        };
+    if snapshot.status == DUBBING_STATUS_RUNNING {
+        return Err("配音任务执行中，无法删除缓存".to_string());
+    }
+
+    delete_dubbing_task_internal(store, &snapshot.id)
+}
+
+fn delete_dubbing_task_internal(store: &SettingsStore, task_id: &str) -> Result<(), String> {
+    let work_dir = store.with_connection(|connection| {
+        let record = read_dubbing_task_record_by_id(connection, task_id)?;
+        connection
+            .execute("DELETE FROM dubbing_tasks WHERE id = ?1", params![task_id])
+            .map_err(|error| format!("无法删除配音任务: {error}"))?;
+        Ok(PathBuf::from(record.work_dir))
+    })?;
+
+    remove_dubbing_work_dir(&work_dir)
+}
+
+fn cleanup_dubbing_intermediate_cache(
+    store: &SettingsStore,
+    snapshot: &DubbingTaskSnapshot,
+) -> Result<(), String> {
+    let work_dir = PathBuf::from(&snapshot.work_dir);
+    remove_dubbing_child_dir(&work_dir, "source")?;
+    remove_dubbing_child_dir(&work_dir, "subtitle_preprocess")?;
+    remove_dubbing_child_dir(&work_dir, "media_separation")?;
+    remove_dubbing_child_dir(&work_dir, "reference_audio")?;
+    remove_dubbing_child_dir(&work_dir, "tts_synthesis")?;
+    remove_dubbing_child_dir(&work_dir, "audio_video_alignment")?;
+
+    let now = Utc::now().to_rfc3339();
+    store.with_connection(|connection| {
+        connection
+            .execute(
+                "
+                DELETE FROM dubbing_task_artifacts
+                WHERE task_id = ?1
+                  AND kind NOT IN (?2, ?3, ?4)
+                ",
+                params![
+                    snapshot.id,
+                    DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO,
+                    DUBBING_ARTIFACT_FINAL_SUBTITLE,
+                    DUBBING_ARTIFACT_VIDEO_COMPOSE_MANIFEST,
+                ],
+            )
+            .map_err(|error| format!("无法清理配音中间文件记录: {error}"))?;
+        connection
+            .execute(
+                "DELETE FROM dubbing_alignment_segments WHERE task_id = ?1",
+                params![snapshot.id],
+            )
+            .map_err(|error| format!("无法清理音视频对齐段落: {error}"))?;
+
+        reset_dubbing_stage(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_MATERIAL,
+            "素材缓存已清理",
+            &now,
+        )?;
+        reset_dubbing_stage(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_SUBTITLE_PREPROCESS,
+            "字幕预处理缓存已清理",
+            &now,
+        )?;
+        reset_dubbing_stage(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_MEDIA_SEPARATION,
+            "音视频分离缓存已清理",
+            &now,
+        )?;
+        reset_dubbing_stage(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_REFERENCE_AUDIO,
+            "参考音频缓存已清理",
+            &now,
+        )?;
+        reset_dubbing_stage(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_TTS_SYNTHESIS,
+            "TTS 缓存已清理",
+            &now,
+        )?;
+        reset_dubbing_stage(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_AUDIO_VIDEO_ALIGNMENT,
+            "音视频对齐缓存已清理",
+            &now,
+        )?;
+
+        update_dubbing_task_state(
+            connection,
+            &snapshot.id,
+            DUBBING_STAGE_VIDEO_COMPOSE,
+            DUBBING_STATUS_DONE,
+            100,
+            "已清理中间缓存，最终产物已保留",
+            "",
+            None,
+            &now,
+        )?;
+        Ok(())
+    })
+}
+
+fn has_final_dubbing_outputs(snapshot: &DubbingTaskSnapshot) -> bool {
+    snapshot.artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.kind.as_str(),
+            DUBBING_ARTIFACT_FINAL_DUBBED_VIDEO | DUBBING_ARTIFACT_FINAL_SUBTITLE
+        ) && Path::new(&artifact.path).is_file()
+    })
+}
+
+fn reset_dubbing_stage(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+    stage_key: &str,
+    message: &str,
+    updated_at: &str,
+) -> Result<(), String> {
+    upsert_dubbing_stage(
+        connection,
+        task_id,
+        stage_key,
+        0,
+        message,
+        "pending",
+        json!({ "cacheCleared": true }),
+        updated_at,
+    )
+}
+
+fn remove_dubbing_child_dir(work_dir: &Path, child: &str) -> Result<(), String> {
+    let path = work_dir.join(child);
+    if path.exists() {
+        remove_dubbing_path(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_dubbing_work_dir(work_dir: &Path) -> Result<(), String> {
+    if work_dir.exists() {
+        remove_dubbing_path(work_dir)?;
+    }
+    Ok(())
+}
+
+fn remove_dubbing_path(path: &Path) -> Result<(), String> {
+    let dubbing_dir = app_paths::existing_dubbing_dir()?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let canonical_root =
+        fs::canonicalize(&dubbing_dir).map_err(|error| format!("无法校验配音缓存目录: {error}"))?;
+    let canonical_path =
+        fs::canonicalize(path).map_err(|error| format!("无法校验配音缓存路径: {error}"))?;
+    if !canonical_path.starts_with(&canonical_root) || canonical_path == canonical_root {
+        return Err("拒绝清理应用配音缓存目录之外的路径".to_string());
+    }
+
+    if canonical_path.is_dir() {
+        fs::remove_dir_all(path).map_err(|error| format!("无法清理配音缓存目录: {error}"))?;
+    } else {
+        fs::remove_file(path).map_err(|error| format!("无法清理配音缓存文件: {error}"))?;
+    }
+
+    Ok(())
 }
 
 fn upsert_dubbing_stage(

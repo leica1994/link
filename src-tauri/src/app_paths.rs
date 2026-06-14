@@ -51,6 +51,22 @@ pub fn temp_dir() -> Result<PathBuf, String> {
     Ok(temp_dir)
 }
 
+pub fn existing_temp_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join(TEMP_DIR_NAME))
+}
+
+pub fn existing_dubbing_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join(DUBBING_DIR_NAME))
+}
+
+pub fn existing_youtube_tasks_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join(YOUTUBE_TASKS_DIR_NAME))
+}
+
+pub fn existing_youtube_task_dir(task_id: &str) -> Result<PathBuf, String> {
+    Ok(existing_youtube_tasks_dir()?.join(task_id))
+}
+
 pub fn htdemucs_model_dir() -> Result<PathBuf, String> {
     let cache_dir = ensure_app_data_dir()?
         .join(MODELS_DIR_NAME)

@@ -180,6 +180,15 @@
                 >
                   打开结果目录
                 </button>
+                <button
+                  class="settings-action dubbing-danger-action"
+                  type="button"
+                  :disabled="!canCleanupDubbingCache"
+                  @click="openDubbingCacheCleanupDialog"
+                >
+                  <Trash2 :stroke-width="2.1" aria-hidden="true" />
+                  <span>清理缓存</span>
+                </button>
               </div>
             </div>
 
@@ -751,6 +760,56 @@
           </footer>
         </section>
       </div>
+
+      <div
+        v-if="isCacheCleanupDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeDubbingCacheCleanupDialog"
+      >
+        <section
+          class="settings-dialog dubbing-confirm-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="dubbing-cache-cleanup-title"
+        >
+          <header class="dubbing-dialog-header">
+            <h2 id="dubbing-cache-cleanup-title" class="dialog-title">清理配音缓存</h2>
+            <button
+              class="dubbing-icon-button"
+              type="button"
+              aria-label="关闭清理确认"
+              @click="closeDubbingCacheCleanupDialog"
+            >
+              <X :stroke-width="2.1" aria-hidden="true" />
+            </button>
+          </header>
+
+          <p class="dubbing-confirm-copy">
+            <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+            <span>{{ dubbingCacheCleanupCopy }}</span>
+          </p>
+
+          <div v-if="cacheCleanupError" class="translate-alert" role="alert">
+            <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+            <span>{{ cacheCleanupError }}</span>
+          </div>
+
+          <footer class="dubbing-dialog-actions">
+            <button class="settings-action" type="button" :disabled="isCleaningDubbingCache" @click="closeDubbingCacheCleanupDialog">
+              取消
+            </button>
+            <button
+              class="settings-action dubbing-danger-action"
+              type="button"
+              :disabled="isCleaningDubbingCache"
+              @click="confirmDubbingCacheCleanup"
+            >
+              {{ isCleaningDubbingCache ? '清理中' : '清理' }}
+            </button>
+          </footer>
+        </section>
+      </div>
     </Teleport>
   </div>
 </template>
@@ -1099,6 +1158,9 @@ const activeDubbingTask = ref<DubbingTaskSnapshot | null>(null)
 const isPreparingMaterial = ref(false)
 const isDubbingRunning = ref(false)
 const dubbingError = ref('')
+const isCleaningDubbingCache = ref(false)
+const isCacheCleanupDialogOpen = ref(false)
+const cacheCleanupError = ref('')
 const lastDubbingRevision = ref(0)
 const activeDubbingRunId = ref('')
 const selectedVoiceKey = ref('')
@@ -1441,6 +1503,14 @@ const finalVideoFileName = computed(() => (finalVideoPath.value ? fileNameFromPa
 const dubbingOutputPath = computed(() => finalVideoPath.value || finalSubtitlePath.value)
 
 const canOpenDubbingOutput = computed(() => Boolean(dubbingOutputPath.value) && isTauriRuntime())
+const canCleanupDubbingCache = computed(() => Boolean(activeDubbingTask.value) && !isPreparingMaterial.value && !isDubbingRunning.value && !isCleaningDubbingCache.value)
+const dubbingCacheCleanupCopy = computed(() => {
+  if (finalVideoPath.value || finalSubtitlePath.value) {
+    return '将删除素材、音视频分离、参考音频、TTS、对齐等中间缓存，保留最终配音视频和字幕。'
+  }
+
+  return '当前任务还没有最终产物，将删除该配音任务的所有内部缓存和记录。'
+})
 
 const hasEnteredVideoCompose = computed(() => {
   const task = activeDubbingTask.value
@@ -2093,6 +2163,57 @@ const openDubbingOutput = async () => {
     await revealItemInDir(dubbingOutputPath.value)
   } catch (error) {
     dubbingError.value = stringifyError(error, '打开结果目录失败')
+  }
+}
+
+const openDubbingCacheCleanupDialog = () => {
+  if (!activeDubbingTask.value || isDubbingRunning.value || isPreparingMaterial.value) {
+    return
+  }
+
+  cacheCleanupError.value = ''
+  isCacheCleanupDialogOpen.value = true
+}
+
+const closeDubbingCacheCleanupDialog = () => {
+  if (isCleaningDubbingCache.value) {
+    return
+  }
+
+  isCacheCleanupDialogOpen.value = false
+  cacheCleanupError.value = ''
+}
+
+const confirmDubbingCacheCleanup = async () => {
+  const task = activeDubbingTask.value
+  if (!task || isCleaningDubbingCache.value || isDubbingRunning.value || isPreparingMaterial.value) {
+    return
+  }
+
+  if (!isTauriRuntime()) {
+    cacheCleanupError.value = '请在桌面应用中清理缓存'
+    return
+  }
+
+  isCleaningDubbingCache.value = true
+  cacheCleanupError.value = ''
+
+  try {
+    const snapshot = await invoke<DubbingTaskSnapshot | null>('cleanup_dubbing_task_cache', {
+      request: { taskId: task.id },
+    })
+
+    if (snapshot) {
+      applyDubbingTaskSnapshot(snapshot)
+      dubbingError.value = ''
+    } else {
+      resetDubbingTaskState()
+    }
+    isCacheCleanupDialogOpen.value = false
+  } catch (error) {
+    cacheCleanupError.value = stringifyError(error, '清理配音缓存失败')
+  } finally {
+    isCleaningDubbingCache.value = false
   }
 }
 
@@ -3338,6 +3459,7 @@ const handleKeydown = (event: KeyboardEvent) => {
     closeReferenceAudioDialog()
     closeAddModelDialog()
     closeDeleteConfirmDialog()
+    closeDubbingCacheCleanupDialog()
   }
 }
 

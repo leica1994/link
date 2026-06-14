@@ -34,7 +34,7 @@
         <button
           class="settings-action youtube-monitor-action danger"
           type="button"
-          :disabled="isDeletingTask"
+          :disabled="isDeletingTask || isWorkbenchRunning"
           @click="openDeleteDialog(activeTask)"
         >
           <LoaderCircle v-if="isDeletingTask" class="spinning" :stroke-width="2.1" aria-hidden="true" />
@@ -870,7 +870,7 @@
           aria-labelledby="home-delete-dialog-title"
         >
           <h2 id="home-delete-dialog-title" class="dialog-title">移除待办任务</h2>
-          <p class="youtube-dialog-copy">移除后会从待办队列删除该任务，并清理已下载的字幕文件。</p>
+          <p class="youtube-dialog-copy">移除后会删除该任务记录、下载缓存和转录、翻译、配音等中间缓存，已导出的最终产物会保留。</p>
           <p class="home-delete-target">{{ deleteTargetLabel }}</p>
 
           <div v-if="deleteError" class="translate-alert" role="alert">
@@ -883,7 +883,7 @@
             <button
               class="settings-action youtube-monitor-action danger"
               type="button"
-              :disabled="isDeletingTask"
+              :disabled="isDeletingTask || isWorkbenchRunning"
               @click="deleteTask"
             >
               <LoaderCircle v-if="isDeletingTask" class="spinning" :stroke-width="2.1" aria-hidden="true" />

@@ -20,9 +20,9 @@ mod youtube_monitor;
 use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
 use dubbing::{
-    add_dubbing_model, delete_dubbing_model, list_dubbing_models, list_dubbing_voices,
-    load_dubbing_reference_audio, prepare_dubbing_material, preview_dubbing_voice,
-    set_dubbing_model_enabled, start_dubbing_task, DubbingTtsScheduler,
+    add_dubbing_model, cleanup_dubbing_task_cache, delete_dubbing_model, list_dubbing_models,
+    list_dubbing_voices, load_dubbing_reference_audio, prepare_dubbing_material,
+    preview_dubbing_voice, set_dubbing_model_enabled, start_dubbing_task, DubbingTtsScheduler,
 };
 use home_tasks::{
     add_home_video_task, delete_home_video_task, download_home_video_task_subtitle,
@@ -44,7 +44,10 @@ use subtitle_translation::{
     load_subtitle_preview, save_subtitle_translation_file, start_subtitle_translation,
 };
 use tauri::{Manager, WebviewWindowBuilder};
-use transcription::{save_subtitle_segments_file, save_transcription_file, start_transcription};
+use transcription::{
+    cleanup_transcription_temp_cache, save_subtitle_segments_file, save_transcription_file,
+    start_transcription,
+};
 use youtube_monitor::{
     add_youtube_channel, delete_youtube_channel, get_ytdlp_status, list_youtube_channels,
     list_youtube_videos, mark_youtube_channel_seen, refresh_youtube_channel, YoutubeMonitorService,
@@ -116,6 +119,7 @@ pub fn run() {
             check_llm_connection,
             open_log_directory,
             start_transcription,
+            cleanup_transcription_temp_cache,
             save_transcription_file,
             save_subtitle_segments_file,
             load_subtitle_preview,
@@ -137,6 +141,7 @@ pub fn run() {
             load_dubbing_reference_audio,
             prepare_dubbing_material,
             start_dubbing_task,
+            cleanup_dubbing_task_cache,
             list_home_video_tasks,
             add_home_video_task,
             get_home_video_task,

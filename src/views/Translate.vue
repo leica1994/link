@@ -161,6 +161,15 @@
                 >
                   导出字幕
                 </button>
+                <button
+                  class="settings-action danger"
+                  type="button"
+                  :disabled="!canClearTranscriptionCache"
+                  @click="openCleanupDialog(CleanupTarget.Transcription)"
+                >
+                  <Trash2 :stroke-width="2.1" aria-hidden="true" />
+                  <span>清理缓存</span>
+                </button>
               </div>
             </div>
 
@@ -335,6 +344,15 @@
                 >
                   导出结果
                 </button>
+                <button
+                  class="settings-action danger"
+                  type="button"
+                  :disabled="!canClearTranslationCache"
+                  @click="openCleanupDialog(CleanupTarget.Translation)"
+                >
+                  <Trash2 :stroke-width="2.1" aria-hidden="true" />
+                  <span>清理缓存</span>
+                </button>
               </div>
             </div>
 
@@ -460,6 +478,43 @@
           </div>
         </section>
       </div>
+
+      <div
+        v-if="cleanupTarget"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeCleanupDialog"
+      >
+        <section
+          class="settings-dialog cleanup-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="translate-cleanup-dialog-title"
+        >
+          <h2 id="translate-cleanup-dialog-title" class="dialog-title">{{ cleanupDialogTitle }}</h2>
+          <p class="youtube-dialog-copy">{{ cleanupDialogCopy }}</p>
+
+          <div v-if="cleanupError" class="translate-alert" role="alert">
+            <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+            <span>{{ cleanupError }}</span>
+          </div>
+
+          <div class="youtube-dialog-actions">
+            <button class="settings-action" type="button" :disabled="isCleaningCache" @click="closeCleanupDialog">
+              取消
+            </button>
+            <button
+              class="settings-action danger"
+              type="button"
+              :disabled="isCleaningCache"
+              @click="confirmCleanup"
+            >
+              <Trash2 :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ isCleaningCache ? '清理中' : '清理' }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
     </Teleport>
   </div>
 </template>
@@ -486,6 +541,7 @@ import {
   Scissors,
   Search,
   SlidersHorizontal,
+  Trash2,
   UploadCloud,
   Video,
   WandSparkles,
@@ -526,6 +582,11 @@ enum TranslateDialog {
 enum FileInputTarget {
   Video = 'video',
   Subtitle = 'subtitle',
+}
+
+enum CleanupTarget {
+  Transcription = 'transcription',
+  Translation = 'translation',
 }
 
 type DialogOption = {
@@ -653,6 +714,7 @@ const translateTabs = [
 
 const activeTab = ref<TranslateTab>(TranslateTab.Transcription)
 const activeDialog = ref<TranslateDialog | null>(null)
+const cleanupTarget = ref<CleanupTarget | null>(null)
 const currentSettings = ref<AppSettings>(normalizeSettings({}))
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
 const selectedSourceLanguage = ref('auto')
@@ -693,6 +755,8 @@ const translatedSubtitleSegments = ref<TranscriptionSegment[]>([])
 const translationText = ref('')
 const lastTranslationRevision = ref(0)
 const activeTranslationRunId = ref('')
+const isCleaningCache = ref(false)
+const cleanupError = ref('')
 let isApplyingStoredSettings = false
 let hasLoadedOnce = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
@@ -736,6 +800,35 @@ const canExportTranscription = computed(() => {
 const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value && !isTranslationProcessing.value)
 const canExportTranslation = computed(() => {
   return sourceSubtitleSegments.value.length > 0 && translatedSubtitleSegments.value.length > 0 && !isTranslationProcessing.value
+})
+const hasTranscriptionCache = computed(() => {
+  return (
+    transcriptionSegments.value.length > 0 ||
+    Boolean(transcriptionText.value) ||
+    Boolean(transcriptionError.value) ||
+    Boolean(suggestedTranscriptionExportPath.value) ||
+    transcriptionProgress.value > 0
+  )
+})
+const hasTranslationCache = computed(() => {
+  return (
+    sourceSubtitleSegments.value.length > 0 ||
+    translatedSubtitleSegments.value.length > 0 ||
+    Boolean(translationText.value) ||
+    Boolean(translationError.value) ||
+    Boolean(subtitleInputError.value) ||
+    translationProgress.value > 0
+  )
+})
+const canClearTranscriptionCache = computed(() => hasTranscriptionCache.value && !isTranscribing.value && !isCleaningCache.value)
+const canClearTranslationCache = computed(() => hasTranslationCache.value && !isTranslationProcessing.value && !isCleaningCache.value)
+const cleanupDialogTitle = computed(() => (cleanupTarget.value === CleanupTarget.Transcription ? '清理转录缓存' : '清理翻译缓存'))
+const cleanupDialogCopy = computed(() => {
+  if (cleanupTarget.value === CleanupTarget.Transcription) {
+    return '将清空当前转录结果、进度和临时音频缓存。已导出的字幕文件会保留。'
+  }
+
+  return '将清空当前字幕预览、译文结果和处理进度。已导出的字幕文件会保留。'
 })
 const translationRows = computed<TranslationResultRow[]>(() => {
   const total = Math.max(sourceSubtitleSegments.value.length, translatedSubtitleSegments.value.length)
@@ -1501,6 +1594,80 @@ const closeDialog = () => {
   activeDialog.value = null
 }
 
+const openCleanupDialog = (target: CleanupTarget) => {
+  cleanupTarget.value = target
+  cleanupError.value = ''
+}
+
+const closeCleanupDialog = () => {
+  if (isCleaningCache.value) {
+    return
+  }
+
+  cleanupTarget.value = null
+  cleanupError.value = ''
+}
+
+const confirmCleanup = async () => {
+  if (!cleanupTarget.value || isCleaningCache.value) {
+    return
+  }
+
+  if (cleanupTarget.value === CleanupTarget.Transcription && isTranscribing.value) {
+    cleanupError.value = '转录运行中，无法清理缓存'
+    return
+  }
+  if (cleanupTarget.value === CleanupTarget.Translation && isTranslationProcessing.value) {
+    cleanupError.value = '翻译运行中，无法清理缓存'
+    return
+  }
+
+  isCleaningCache.value = true
+  cleanupError.value = ''
+  try {
+    if (cleanupTarget.value === CleanupTarget.Transcription) {
+      if (isTauriRuntime()) {
+        await invoke('cleanup_transcription_temp_cache')
+      }
+      clearTranscriptionCache()
+    } else {
+      clearTranslationCache()
+    }
+    cleanupTarget.value = null
+  } catch (error) {
+    cleanupError.value = stringifyError(error) || '清理缓存失败'
+  } finally {
+    isCleaningCache.value = false
+  }
+}
+
+const clearTranscriptionCache = () => {
+  transcriptionProgress.value = 0
+  transcriptionStageProgress.value = {}
+  transcriptionMessage.value = selectedVideoPath.value ? '已选择视频' : '等待选择视频'
+  transcriptionError.value = ''
+  transcriptionWarnings.value = []
+  transcriptionSegments.value = []
+  transcriptionText.value = ''
+  lastTranscriptionRevision.value = 0
+  activeTranscriptionRunId.value = ''
+  suggestedTranscriptionExportPath.value = ''
+}
+
+const clearTranslationCache = () => {
+  subtitleInputError.value = ''
+  translationError.value = ''
+  translationMessage.value = activeSubtitlePath.value ? '已选择字幕' : '等待选择字幕'
+  translationProgress.value = 0
+  translationStageProgress.value = {}
+  translationWarnings.value = []
+  sourceSubtitleSegments.value = []
+  translatedSubtitleSegments.value = []
+  translationText.value = ''
+  lastTranslationRevision.value = 0
+  activeTranslationRunId.value = ''
+}
+
 const selectDialogValue = (value: string) => {
   switch (activeDialog.value) {
     case TranslateDialog.TranscriptionModel:
@@ -1531,6 +1698,7 @@ const selectDialogValue = (value: string) => {
 
 const handleKeydown = (event: KeyboardEvent) => {
   if (event.key === 'Escape') {
+    closeCleanupDialog()
     closeDialog()
   }
 }

@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::app_paths;
 use crate::command_utils::create_command;
+use crate::dubbing::delete_dubbing_task_by_id;
 use crate::settings::SettingsStore;
 
 const YTDLP_COMMAND: &str = "yt-dlp";
@@ -384,7 +385,41 @@ pub fn get_home_video_task(
 #[tauri::command]
 pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> Result<(), String> {
     let store = app.state::<SettingsStore>();
-    let deleted = store.with_connection(|connection| {
+    let task_id = request.task_id.clone();
+    let dubbing_task_ids = store.with_connection(|connection| {
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM home_video_tasks WHERE id = ?1 LIMIT 1",
+                params![task_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取待办任务: {error}"))?
+            .is_some();
+        if !exists {
+            return Err("未找到待办任务".to_string());
+        }
+
+        let workbench_status = connection
+            .query_row(
+                "SELECT status FROM home_workbench_tasks WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取工作台状态: {error}"))?;
+        if workbench_status.as_deref() == Some("running") {
+            return Err("工作台执行中，无法移除待办任务".to_string());
+        }
+
+        collect_home_workbench_dubbing_task_ids(connection, &task_id)
+    })?;
+
+    for dubbing_task_id in &dubbing_task_ids {
+        delete_dubbing_task_by_id(&store, dubbing_task_id)?;
+    }
+
+    store.with_connection(|connection| {
         let transaction = connection
             .unchecked_transaction()
             .map_err(|error| format!("无法删除待办任务: {error}"))?;
@@ -394,7 +429,25 @@ pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> 
                 params![request.task_id],
             )
             .map_err(|error| format!("无法删除字幕记录: {error}"))?;
-        let changed = transaction
+        transaction
+            .execute(
+                "DELETE FROM home_video_task_videos WHERE task_id = ?1",
+                params![request.task_id],
+            )
+            .map_err(|error| format!("无法删除视频记录: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM home_workbench_artifacts WHERE task_id = ?1",
+                params![request.task_id],
+            )
+            .map_err(|error| format!("无法删除工作台产物记录: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM home_workbench_tasks WHERE task_id = ?1",
+                params![request.task_id],
+            )
+            .map_err(|error| format!("无法删除工作台记录: {error}"))?;
+        transaction
             .execute(
                 "DELETE FROM home_video_tasks WHERE id = ?1",
                 params![request.task_id],
@@ -403,18 +456,10 @@ pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> 
         transaction
             .commit()
             .map_err(|error| format!("无法提交删除操作: {error}"))?;
-        Ok(changed)
+        Ok(())
     })?;
 
-    if deleted == 0 {
-        return Err("未找到待办任务".to_string());
-    }
-
-    if let Ok(task_dir) = app_paths::youtube_task_dir(&request.task_id) {
-        if task_dir.exists() {
-            let _ = fs::remove_dir_all(task_dir);
-        }
-    }
+    remove_home_task_dir(&request.task_id)?;
 
     Ok(())
 }
@@ -725,6 +770,95 @@ pub(crate) fn read_home_video_task_by_id(
     task.partial_video_download =
         read_home_partial_video_download(&task.id, task.downloaded_video.as_ref())?;
     Ok(task)
+}
+
+fn collect_home_workbench_dubbing_task_ids(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut ids = HashSet::new();
+    let mut artifact_statement = connection
+        .prepare(
+            "
+            SELECT metadata
+            FROM home_workbench_artifacts
+            WHERE task_id = ?1
+            ",
+        )
+        .map_err(|error| format!("无法读取工作台产物: {error}"))?;
+    let artifact_rows = artifact_statement
+        .query_map(params![task_id], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("无法读取工作台产物: {error}"))?;
+    for row in artifact_rows {
+        if let Ok(value) = row
+            .map_err(|error| format!("无法解析工作台产物: {error}"))
+            .and_then(|text| {
+                serde_json::from_str::<Value>(&text)
+                    .map_err(|error| format!("无法解析工作台产物信息: {error}"))
+            })
+        {
+            collect_dubbing_task_ids_from_value(&value, &mut ids);
+        }
+    }
+
+    let stages_text = connection
+        .query_row(
+            "
+            SELECT stages
+            FROM home_workbench_tasks
+            WHERE task_id = ?1
+            ",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取工作台阶段: {error}"))?;
+    if let Some(stages_text) = stages_text {
+        if let Ok(value) = serde_json::from_str::<Value>(&stages_text) {
+            collect_dubbing_task_ids_from_value(&value, &mut ids);
+        }
+    }
+
+    Ok(ids.into_iter().collect())
+}
+
+fn collect_dubbing_task_ids_from_value(value: &Value, ids: &mut HashSet<String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(id) = object.get("dubbingTaskId").and_then(Value::as_str) {
+                if !id.trim().is_empty() {
+                    ids.insert(id.to_string());
+                }
+            }
+            for value in object.values() {
+                collect_dubbing_task_ids_from_value(value, ids);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_dubbing_task_ids_from_value(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_home_task_dir(task_id: &str) -> Result<(), String> {
+    let task_dir = app_paths::existing_youtube_task_dir(task_id)?;
+    if !task_dir.exists() {
+        return Ok(());
+    }
+
+    let tasks_dir = app_paths::existing_youtube_tasks_dir()?;
+    let canonical_root =
+        fs::canonicalize(&tasks_dir).map_err(|error| format!("无法校验待办缓存目录: {error}"))?;
+    let canonical_task_dir =
+        fs::canonicalize(&task_dir).map_err(|error| format!("无法校验待办缓存路径: {error}"))?;
+    if !canonical_task_dir.starts_with(&canonical_root) || canonical_task_dir == canonical_root {
+        return Err("拒绝清理应用待办缓存目录之外的路径".to_string());
+    }
+
+    fs::remove_dir_all(&task_dir).map_err(|error| format!("无法清理待办缓存目录: {error}"))
 }
 
 fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {

@@ -133,6 +133,13 @@ pub struct TranscriptionResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupResult {
+    pub deleted_files: u64,
+    pub deleted_dirs: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct UploadCreateResponse {
     data: UploadCreateData,
@@ -978,6 +985,50 @@ pub fn save_transcription_file(path: String, content: String) -> Result<(), Stri
     }
 
     fs::write(&output_path, content).map_err(|error| format!("无法保存字幕文件: {error}"))
+}
+
+#[tauri::command]
+pub fn cleanup_transcription_temp_cache() -> Result<CleanupResult, String> {
+    let temp_dir = app_paths::existing_temp_dir()?;
+    cleanup_directory_contents(&temp_dir)
+}
+
+fn cleanup_directory_contents(dir: &Path) -> Result<CleanupResult, String> {
+    if !dir.exists() {
+        return Ok(CleanupResult::default());
+    }
+
+    let canonical_dir =
+        fs::canonicalize(dir).map_err(|error| format!("无法读取临时目录: {error}"))?;
+    let mut result = CleanupResult::default();
+    let entries = fs::read_dir(dir).map_err(|error| format!("无法读取临时目录: {error}"))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法读取临时缓存: {error}"))?;
+        let path = entry.path();
+        if !path.exists() {
+            continue;
+        }
+
+        let canonical_path =
+            fs::canonicalize(&path).map_err(|error| format!("无法校验临时缓存路径: {error}"))?;
+        if !canonical_path.starts_with(&canonical_dir) {
+            return Err("拒绝清理应用临时目录之外的路径".to_string());
+        }
+
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("无法读取临时缓存信息: {error}"))?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path).map_err(|error| format!("无法清理临时目录: {error}"))?;
+            result.deleted_dirs += 1;
+        } else {
+            fs::remove_file(&path).map_err(|error| format!("无法清理临时文件: {error}"))?;
+            result.deleted_files += 1;
+        }
+    }
+
+    Ok(result)
 }
 
 #[tauri::command]
