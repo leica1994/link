@@ -2553,23 +2553,58 @@ html[data-theme='dark'] .home-video-download-strip.downloaded .home-video-downlo
 }
 
 .home-download-progress {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 42px;
+  display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   padding: 0 16px 16px;
 }
 
-.home-download-progress-message,
 .home-download-progress-copy {
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: min(44%, 460px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
   overflow: hidden;
+}
+
+.home-download-progress-label {
+  flex: 0 0 auto;
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 750;
   line-height: 1.25;
+  white-space: nowrap;
+}
+
+.home-download-progress-size {
+  min-width: 0;
+  overflow: hidden;
+  padding: 3px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: rgba(138, 98, 0, 0.08);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-theme='dark'] .home-download-progress-size {
+  background: rgba(215, 173, 61, 0.12);
+}
+
+.home-download-progress .translate-progress-track {
+  flex: 1 1 180px;
+  min-width: 140px;
+}
+
+.home-download-progress .translate-progress-value {
+  flex: 0 0 42px;
 }
 
 .home-download-alert {
@@ -2718,7 +2753,6 @@ html[data-theme='dark'] .home-info-strip.error {
 
 .home-subtitle-progress {
   grid-column: 1 / -1;
-  grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr) 42px;
   padding: 0;
 }
 
@@ -4664,13 +4698,18 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
     white-space: normal;
   }
 
-  .home-subtitle-progress {
-    grid-template-columns: minmax(0, 1fr) 42px;
+  .home-download-progress {
+    flex-wrap: wrap;
   }
 
-  .home-subtitle-progress .home-download-progress-copy {
-    grid-column: 1 / -1;
-    white-space: normal;
+  .home-download-progress-copy {
+    flex: 1 1 100%;
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .home-download-progress .translate-progress-track {
+    flex-basis: calc(100% - 54px);
   }
 
   .home-detail-stats {
