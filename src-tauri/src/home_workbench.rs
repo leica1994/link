@@ -1083,6 +1083,7 @@ async fn generate_workbench_content_copy(
             subtitle_path: subtitle_path_text.clone(),
             extra_context: build_workbench_content_copy_context(&task),
             platform: None,
+            source: Some("workbench".to_string()),
         },
     )
     .await?;

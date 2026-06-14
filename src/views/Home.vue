@@ -915,7 +915,17 @@
                         </button>
                       </div>
                       <div class="home-workbench-copy-tags">
-                        <span v-for="tag in workbenchContentCopyTags" :key="tag">{{ tag }}</span>
+                        <button
+                          v-for="(tag, index) in workbenchContentCopyTags"
+                          :key="`${tag}-${index}`"
+                          class="home-workbench-copy-tag-button"
+                          :class="{ 'copy-confirmed': isWorkbenchCopyTargetCopied(workbenchTagCopyTarget(index)) }"
+                          type="button"
+                          :aria-label="isWorkbenchCopyTargetCopied(workbenchTagCopyTarget(index)) ? `标签 ${tag} 已复制` : `复制标签 ${tag}`"
+                          @click="copyWorkbenchContentCopyTag(tag, index)"
+                        >
+                          {{ tag }}
+                        </button>
                       </div>
                     </section>
 
@@ -1657,6 +1667,7 @@ type ContentCopyOptions = {
 
 type ContentCopyRecord = {
   id: string
+  source?: string
   platform: string
   subtitlePath: string
   subtitleFileName: string
@@ -1680,7 +1691,12 @@ enum WorkbenchCopyTarget {
 
 type WorkbenchTitleCopyTarget = `workbench-copy-title-${number}`
 type WorkbenchCoverCopyTarget = `workbench-copy-cover-${number}`
-type WorkbenchCopyFeedbackTarget = WorkbenchCopyTarget | WorkbenchTitleCopyTarget | WorkbenchCoverCopyTarget
+type WorkbenchTagCopyTarget = `workbench-copy-tag-${number}`
+type WorkbenchCopyFeedbackTarget =
+  | WorkbenchCopyTarget
+  | WorkbenchTitleCopyTarget
+  | WorkbenchCoverCopyTarget
+  | WorkbenchTagCopyTarget
 
 const route = useRoute()
 const router = useRouter()
@@ -3124,6 +3140,8 @@ const workbenchTitleCopyTarget = (index: number): WorkbenchTitleCopyTarget => `w
 
 const workbenchCoverCopyTarget = (index: number): WorkbenchCoverCopyTarget => `workbench-copy-cover-${index}`
 
+const workbenchTagCopyTarget = (index: number): WorkbenchTagCopyTarget => `workbench-copy-tag-${index}`
+
 const isWorkbenchCopyTargetCopied = (target: WorkbenchCopyFeedbackTarget) => workbenchCopiedTarget.value === target
 
 const copyWorkbenchContentCopyFull = () => {
@@ -3139,6 +3157,10 @@ const copyWorkbenchContentCopyTitle = (title: ContentCopyTitle, index: number) =
 
 const copyWorkbenchContentCopyCover = (cover: ContentCopyCoverText, index: number) => {
   void copyWorkbenchText(cover.lines.join('\n'), workbenchCoverCopyTarget(index))
+}
+
+const copyWorkbenchContentCopyTag = (tag: string, index: number) => {
+  void copyWorkbenchText(tag, workbenchTagCopyTarget(index))
 }
 
 const copyWorkbenchContentCopyDescription = () => {

@@ -244,7 +244,17 @@
                   </button>
                 </div>
                 <div class="content-copy-tags">
-                  <span v-for="tag in allTags(currentRecord)" :key="tag">{{ tag }}</span>
+                  <button
+                    v-for="(tag, index) in allTags(currentRecord)"
+                    :key="`${tag}-${index}`"
+                    class="content-copy-tag-button"
+                    :class="{ 'copy-confirmed': isCopied(tagCopyTarget(index)) }"
+                    type="button"
+                    :aria-label="isCopied(tagCopyTarget(index)) ? `标签 ${tag} 已复制` : `复制标签 ${tag}`"
+                    @click="copyTag(tag, index)"
+                  >
+                    {{ tag }}
+                  </button>
                 </div>
               </section>
 
@@ -309,7 +319,8 @@ enum CopyTarget {
 
 type TitleCopyTarget = `title-${number}`
 type CoverCopyTarget = `cover-${number}`
-type CopyFeedbackTarget = CopyTarget | TitleCopyTarget | CoverCopyTarget
+type TagCopyTarget = `tag-${number}`
+type CopyFeedbackTarget = CopyTarget | TitleCopyTarget | CoverCopyTarget | TagCopyTarget
 
 type ContentCopyCategory = {
   primary: string
@@ -364,6 +375,7 @@ type ContentCopyOptions = {
 
 type ContentCopyRecord = {
   id: string
+  source: string
   platform: string
   subtitlePath: string
   subtitleFileName: string
@@ -477,6 +489,7 @@ const generateCopy = async () => {
       request: {
         subtitlePath: selectedSubtitlePath.value,
         extraContext: extraContext.value,
+        source: 'copywriting',
       },
     })
     currentRecord.value = record
@@ -495,7 +508,7 @@ const loadRecords = async () => {
 
   try {
     const result = await invoke<ContentCopyRecord[]>('list_content_copy_records', {
-      request: { limit: 30 },
+      request: { limit: 30, source: 'copywriting' },
     })
     records.value = result
     if (!currentRecord.value && result.length) {
@@ -599,6 +612,7 @@ const copyFullRecord = () => {
 
 const titleCopyTarget = (index: number): TitleCopyTarget => `title-${index}`
 const coverCopyTarget = (index: number): CoverCopyTarget => `cover-${index}`
+const tagCopyTarget = (index: number): TagCopyTarget => `tag-${index}`
 
 const isCopied = (target: CopyFeedbackTarget) => copiedLabel.value === target
 
@@ -608,6 +622,10 @@ const copyTitle = (title: ContentCopyTitle, index: number) => {
 
 const copyCoverText = (cover: ContentCopyCoverText, index: number) => {
   void copyText(cover.lines.join('\n'), coverCopyTarget(index))
+}
+
+const copyTag = (tag: string, index: number) => {
+  void copyText(tag, tagCopyTarget(index))
 }
 
 const copyDescription = () => {
@@ -1031,10 +1049,16 @@ html[data-theme='dark'] .content-copy-icon-button {
 }
 
 .content-copy-icon-button.copy-confirmed,
-.content-copy-copy-button.copy-confirmed {
+.content-copy-copy-button.copy-confirmed,
+.content-copy-tag-button.copy-confirmed {
   border-color: color-mix(in srgb, var(--accent) 46%, var(--hairline));
   background: color-mix(in srgb, var(--accent-soft) 68%, var(--bg-surface));
   color: var(--accent-strong);
+}
+
+.content-copy-tag-button.copy-confirmed {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+  transform: translateY(-1px);
 }
 
 .content-copy-icon-button svg {
@@ -1237,18 +1261,44 @@ html[data-theme='dark'] .content-copy-description {
   margin-top: 10px;
 }
 
-.content-copy-tags span {
+.content-copy-tag-button {
+  appearance: none;
   min-height: 28px;
   border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--hairline));
   border-radius: 999px;
   background: color-mix(in srgb, var(--accent-soft) 46%, transparent);
   color: var(--text);
+  cursor: pointer;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   padding: 0 11px;
+  font-family: inherit;
   font-size: 12px;
   font-weight: 850;
   line-height: 1;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+
+.content-copy-tag-button:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline));
+  background: var(--bg-surface-hover);
+  color: var(--accent-strong);
+}
+
+.content-copy-tag-button:active {
+  transform: translateY(1px);
+}
+
+.content-copy-tag-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 44%, transparent);
+  outline-offset: 2px;
+}
+
+.content-copy-tag-button.copy-confirmed:hover {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-soft) 68%, var(--bg-surface));
+  color: var(--accent-strong);
 }
 
 .content-copy-comment {

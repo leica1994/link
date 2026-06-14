@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const DEFAULT_PLATFORM: &str = "bilibili";
+const SOURCE_COPYWRITING: &str = "copywriting";
+const SOURCE_WORKBENCH: &str = "workbench";
 const MAX_GENERATION_ATTEMPTS: usize = 3;
 const MAX_SUMMARY_ATTEMPTS: usize = 2;
 const DIRECT_TRANSCRIPT_CHAR_LIMIT: usize = 14_000;
@@ -25,6 +27,8 @@ pub struct GenerateContentCopyRequest {
     pub extra_context: String,
     #[serde(default)]
     pub platform: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +102,7 @@ pub struct ContentCopyResult {
 #[serde(rename_all = "camelCase")]
 pub struct ContentCopyRecord {
     pub id: String,
+    pub source: String,
     pub platform: String,
     pub subtitle_path: String,
     pub subtitle_file_name: String,
@@ -129,6 +134,8 @@ pub struct DeleteContentCopyRecordRequest {
 pub struct ListContentCopyRecordsRequest {
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +177,7 @@ pub(crate) async fn generate_content_copy_record(
         title_count: 6,
         cover_text_count: 4,
     };
+    let source = normalize_source(request.source.as_deref());
 
     log_session.info(
         "request_received",
@@ -177,6 +185,7 @@ pub(crate) async fn generate_content_copy_record(
         json!({
             "subtitlePath": subtitle_path.to_string_lossy(),
             "platform": &options.platform,
+            "source": &source,
         }),
     );
 
@@ -197,6 +206,7 @@ pub(crate) async fn generate_content_copy_record(
     let now = Utc::now().to_rfc3339();
     let record = ContentCopyRecord {
         id: Uuid::new_v4().to_string(),
+        source,
         platform: options.platform.clone(),
         subtitle_path: subtitle_path.to_string_lossy().to_string(),
         subtitle_file_name: file_name(&subtitle_path),
@@ -231,7 +241,8 @@ pub fn list_content_copy_records(
     request: ListContentCopyRecordsRequest,
 ) -> Result<Vec<ContentCopyRecord>, String> {
     let limit = request.limit.unwrap_or(30);
-    settings_store.with_connection(|connection| read_content_copy_records(connection, limit))
+    let source = normalize_source(request.source.as_deref());
+    settings_store.with_connection(|connection| read_content_copy_records(connection, limit, &source))
 }
 
 #[tauri::command]
@@ -672,14 +683,15 @@ fn insert_content_copy_record(
         .execute(
             "
             INSERT INTO content_copy_records (
-                id, platform, subtitle_path, subtitle_file_name, subtitle_format,
+                id, source, platform, subtitle_path, subtitle_file_name, subtitle_format,
                 segment_count, duration_ms, extra_context, options, result,
                 log_path, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ",
             params![
                 &record.id,
+                &record.source,
                 &record.platform,
                 &record.subtitle_path,
                 &record.subtitle_file_name,
@@ -701,22 +713,24 @@ fn insert_content_copy_record(
 fn read_content_copy_records(
     connection: &rusqlite::Connection,
     limit: u32,
+    source: &str,
 ) -> Result<Vec<ContentCopyRecord>, String> {
     let normalized_limit = limit.clamp(1, 100);
     let mut statement = connection
         .prepare(
             "
-            SELECT id, platform, subtitle_path, subtitle_file_name, subtitle_format,
+            SELECT id, source, platform, subtitle_path, subtitle_file_name, subtitle_format,
                    segment_count, duration_ms, extra_context, options, result,
                    log_path, created_at, updated_at
             FROM content_copy_records
+            WHERE source = ?1
             ORDER BY datetime(updated_at) DESC
-            LIMIT ?1
+            LIMIT ?2
             ",
         )
         .map_err(|error| format!("无法读取文案历史: {error}"))?;
     let rows = statement
-        .query_map(params![normalized_limit as i64], map_content_copy_record)
+        .query_map(params![source, normalized_limit as i64], map_content_copy_record)
         .map_err(|error| format!("无法读取文案历史: {error}"))?;
     let mut records = Vec::new();
     for row in rows {
@@ -732,7 +746,7 @@ fn read_content_copy_record(
     connection
         .query_row(
             "
-            SELECT id, platform, subtitle_path, subtitle_file_name, subtitle_format,
+            SELECT id, source, platform, subtitle_path, subtitle_file_name, subtitle_format,
                    segment_count, duration_ms, extra_context, options, result,
                    log_path, created_at, updated_at
             FROM content_copy_records
@@ -747,29 +761,30 @@ fn read_content_copy_record(
 }
 
 fn map_content_copy_record(row: &Row<'_>) -> rusqlite::Result<ContentCopyRecord> {
-    let segment_count: i64 = row.get(5)?;
-    let duration_ms: i64 = row.get(6)?;
-    let options_text: String = row.get(8)?;
-    let result_text: String = row.get(9)?;
+    let segment_count: i64 = row.get(6)?;
+    let duration_ms: i64 = row.get(7)?;
+    let options_text: String = row.get(9)?;
+    let result_text: String = row.get(10)?;
 
     Ok(ContentCopyRecord {
         id: row.get(0)?,
-        platform: row.get(1)?,
-        subtitle_path: row.get(2)?,
-        subtitle_file_name: row.get(3)?,
-        subtitle_format: row.get(4)?,
+        source: row.get(1)?,
+        platform: row.get(2)?,
+        subtitle_path: row.get(3)?,
+        subtitle_file_name: row.get(4)?,
+        subtitle_format: row.get(5)?,
         segment_count: segment_count.max(0).min(u32::MAX as i64) as u32,
         duration_ms: duration_ms.max(0) as u64,
-        extra_context: row.get(7)?,
+        extra_context: row.get(8)?,
         options: serde_json::from_str(&options_text).unwrap_or_else(|_| ContentCopyOptions {
             platform: DEFAULT_PLATFORM.to_string(),
             title_count: 6,
             cover_text_count: 4,
         }),
         result: serde_json::from_str(&result_text).unwrap_or_else(|_| empty_result()),
-        log_path: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        log_path: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -802,6 +817,13 @@ fn normalize_platform(platform: Option<&str>) -> String {
     match platform.map(str::trim).filter(|value| !value.is_empty()) {
         Some("bilibili") => "bilibili".to_string(),
         _ => DEFAULT_PLATFORM.to_string(),
+    }
+}
+
+fn normalize_source(source: Option<&str>) -> String {
+    match source.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(SOURCE_WORKBENCH) => SOURCE_WORKBENCH.to_string(),
+        _ => SOURCE_COPYWRITING.to_string(),
     }
 }
 

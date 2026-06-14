@@ -3090,10 +3090,16 @@ html[data-theme='dark'] .home-workbench-detail {
 
 .home-workbench-copy-action.copy-confirmed,
 .home-workbench-copy-button.copy-confirmed,
-.home-workbench-copy-icon-button.copy-confirmed {
+.home-workbench-copy-icon-button.copy-confirmed,
+.home-workbench-copy-tag-button.copy-confirmed {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--hairline));
   background: color-mix(in srgb, var(--accent-soft) 68%, var(--bg-surface));
   color: var(--accent-strong);
+}
+
+.home-workbench-copy-tag-button.copy-confirmed {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+  transform: translateY(-1px);
 }
 
 .home-workbench-copy-overview {
@@ -3335,18 +3341,44 @@ html[data-theme='dark'] .home-workbench-copy-icon-button {
   margin-top: 8px;
 }
 
-.home-workbench-copy-tags span {
+.home-workbench-copy-tag-button {
+  appearance: none;
   min-height: 26px;
   border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--hairline));
   border-radius: 999px;
   background: color-mix(in srgb, var(--accent-soft) 44%, transparent);
   color: var(--text);
+  cursor: pointer;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   padding: 0 10px;
+  font-family: inherit;
   font-size: 12px;
   font-weight: 850;
   line-height: 1;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+
+.home-workbench-copy-tag-button:hover {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--hairline));
+  background: var(--bg-surface-hover);
+  color: var(--accent-strong);
+}
+
+.home-workbench-copy-tag-button:active {
+  transform: translateY(1px);
+}
+
+.home-workbench-copy-tag-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: 2px;
+}
+
+.home-workbench-copy-tag-button.copy-confirmed:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-soft) 68%, var(--bg-surface));
+  color: var(--accent-strong);
 }
 
 .home-workbench-subtitle-preview {

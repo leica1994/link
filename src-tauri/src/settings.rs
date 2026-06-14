@@ -629,6 +629,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
 
             CREATE TABLE IF NOT EXISTS content_copy_records (
                 id TEXT PRIMARY KEY NOT NULL,
+                source TEXT NOT NULL DEFAULT 'copywriting',
                 platform TEXT NOT NULL DEFAULT 'bilibili',
                 subtitle_path TEXT NOT NULL,
                 subtitle_file_name TEXT NOT NULL DEFAULT '',
@@ -858,6 +859,22 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         "rounded_letter_spacing",
         "ALTER TABLE subtitle_styles ADD COLUMN rounded_letter_spacing INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        connection,
+        "content_copy_records",
+        "source",
+        "ALTER TABLE content_copy_records ADD COLUMN source TEXT NOT NULL DEFAULT 'copywriting'",
+    )?;
+    connection
+        .execute(
+            "
+            CREATE INDEX IF NOT EXISTS idx_content_copy_records_source_updated_at
+                ON content_copy_records(source, updated_at)
+            ",
+            [],
+        )
+        .map_err(|error| format!("无法初始化文案历史来源索引: {error}"))?;
+    mark_workbench_content_copy_records(connection)?;
 
     for service in LLM_SERVICES {
         connection
@@ -1131,6 +1148,25 @@ fn ensure_column(
         .execute(alter_sql, [])
         .map(|_| ())
         .map_err(|error| format!("无法迁移数据库字段 {table}.{column}: {error}"))
+}
+
+fn mark_workbench_content_copy_records(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute(
+            "
+            UPDATE content_copy_records
+            SET source = 'workbench'
+            WHERE source = 'copywriting'
+              AND EXISTS (
+                  SELECT 1
+                  FROM home_workbench_tasks
+                  WHERE home_workbench_tasks.stages LIKE '%' || content_copy_records.id || '%'
+              )
+            ",
+            [],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法迁移工作台文案历史: {error}"))
 }
 
 fn read_settings_map(connection: &Connection) -> Result<HashMap<String, String>, String> {
