@@ -90,7 +90,8 @@ export type AppSettings = {
   homeWorkbenchTranslationEnabled: boolean
   homeWorkbenchDubbingEnabled: boolean
   homeWorkbenchExportDir: string
-  youtubeMonitorProxy: string
+  ytdlpProxy: string
+  ytdlpCookiesPath: string
 }
 
 export const transcriptionModelOptions = [
@@ -527,7 +528,8 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
       : false,
   homeWorkbenchExportDir:
     typeof settings.homeWorkbenchExportDir === 'string' ? settings.homeWorkbenchExportDir : '',
-  youtubeMonitorProxy: typeof settings.youtubeMonitorProxy === 'string' ? settings.youtubeMonitorProxy : '',
+  ytdlpProxy: typeof settings.ytdlpProxy === 'string' ? settings.ytdlpProxy : '',
+  ytdlpCookiesPath: typeof settings.ytdlpCookiesPath === 'string' ? settings.ytdlpCookiesPath : '',
 })
 
 export const getOptionLabel = <T extends string>(

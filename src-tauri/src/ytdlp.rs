@@ -29,6 +29,21 @@ pub struct YtdlpStatus {
     pub config_policy: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct YtdlpConfig {
+    pub proxy: String,
+    pub cookies_path: String,
+}
+
+impl YtdlpConfig {
+    pub fn new(proxy: impl Into<String>, cookies_path: impl Into<String>) -> Self {
+        Self {
+            proxy: proxy.into(),
+            cookies_path: cookies_path.into(),
+        }
+    }
+}
+
 const YOUTUBE_CLIENT_STRATEGIES: [YoutubeClientStrategy; 4] = [
     YoutubeClientStrategy {
         label: "default",
@@ -56,16 +71,27 @@ pub fn add_youtube_extractor_args(command: &mut Command, strategy: &YoutubeClien
     command.args(["--extractor-args", strategy.extractor_args]);
 }
 
-pub fn command(proxy: &str) -> Command {
+pub fn command(config: &YtdlpConfig) -> Command {
     let mut command = create_command(YTDLP_COMMAND);
     command.arg("--ignore-config");
 
-    let proxy = proxy.trim();
+    let proxy = config.proxy.trim();
     if !proxy.is_empty() {
         command.args(["--proxy", proxy]);
     }
 
+    let cookies_path = config.cookies_path.trim();
+    if !cookies_path.is_empty() && Path::new(cookies_path).is_file() {
+        command.args(["--cookies", cookies_path]);
+    }
+
     command.args([
+        "--js-runtimes",
+        "node",
+        "--js-runtimes",
+        "bun",
+        "--js-runtimes",
+        "quickjs",
         "--add-headers",
         YOUTUBE_ACCEPT_LANGUAGE,
         "--socket-timeout",
@@ -185,7 +211,7 @@ pub fn format_attempt_errors(fallback: &str, errors: &[(String, String)]) -> Str
     if attempted.is_empty() {
         compact
     } else {
-        format!("{compact}（已尝试 YouTube 兼容模式：{attempted}）")
+        format!("{compact}")
     }
 }
 
@@ -311,12 +337,51 @@ mod tests {
 
     #[test]
     fn base_command_ignores_global_config() {
-        let command = command("");
+        let command = command(&YtdlpConfig::default());
         let args = command_args(&command);
 
         assert!(args.iter().any(|arg| arg == "--ignore-config"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--js-runtimes" && pair[1] == "node"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--js-runtimes" && pair[1] == "bun"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--js-runtimes" && pair[1] == "quickjs"));
         assert!(args.iter().any(|arg| arg == "--socket-timeout"));
         assert!(args.iter().any(|arg| arg == "--extractor-retries"));
+    }
+
+    #[test]
+    fn base_command_adds_proxy_when_configured() {
+        let command = command(&YtdlpConfig::new("http://127.0.0.1:7890", ""));
+        let args = command_args(&command);
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--proxy" && pair[1] == "http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn base_command_adds_cookies_when_cached_file_exists() {
+        let cookies_file = tempfile::NamedTempFile::new().expect("create cookies file");
+        let cookies_path = cookies_file.path().to_string_lossy().to_string();
+        let command = command(&YtdlpConfig::new("", &cookies_path));
+        let args = command_args(&command);
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--cookies" && pair[1] == cookies_path.as_str()));
+    }
+
+    #[test]
+    fn base_command_skips_missing_cookies_file() {
+        let command = command(&YtdlpConfig::new("", "missing-cookies.txt"));
+        let args = command_args(&command);
+
+        assert!(!args.iter().any(|arg| arg == "--cookies"));
     }
 
     #[test]

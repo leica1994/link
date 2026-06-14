@@ -12,6 +12,7 @@ const TEMP_DIR_NAME: &str = "temp";
 const WEBVIEW_DIR_NAME: &str = "webview";
 const EXPORTS_DIR_NAME: &str = "exports";
 const YOUTUBE_TASKS_DIR_NAME: &str = "youtube_tasks";
+const YTDLP_DIR_NAME: &str = "yt-dlp";
 
 pub fn app_data_dir() -> Result<PathBuf, String> {
     let install_dir = env::current_exe()
@@ -104,4 +105,14 @@ pub fn youtube_task_dir(task_id: &str) -> Result<PathBuf, String> {
     let task_dir = tasks_dir.join(task_id);
     fs::create_dir_all(&task_dir).map_err(|error| format!("无法创建视频任务目录: {error}"))?;
     Ok(task_dir)
+}
+
+pub fn ytdlp_dir() -> Result<PathBuf, String> {
+    let ytdlp_dir = ensure_app_data_dir()?.join(YTDLP_DIR_NAME);
+    fs::create_dir_all(&ytdlp_dir).map_err(|error| format!("无法创建 yt-dlp 缓存目录: {error}"))?;
+    Ok(ytdlp_dir)
+}
+
+pub fn ytdlp_cookies_path() -> Result<PathBuf, String> {
+    Ok(ytdlp_dir()?.join("cookies.txt"))
 }

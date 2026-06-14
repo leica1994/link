@@ -514,7 +514,11 @@ fn refresh_home_video_task_detail_blocking(
     let store = app.state::<SettingsStore>();
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
-    let proxy = store.load()?.youtube_monitor_proxy;
+    let settings = store.load()?;
+    let ytdlp_config = ytdlp::YtdlpConfig::new(
+        settings.ytdlp_proxy.clone(),
+        settings.ytdlp_cookies_path.clone(),
+    );
     let now = Utc::now().to_rfc3339();
     store.with_connection(|connection| {
         connection
@@ -533,7 +537,7 @@ fn refresh_home_video_task_detail_blocking(
     })?;
 
     let log_session = ytdlp::start_log_session(&app, "home_video_detail");
-    match fetch_video_detail(&task.url, &proxy, log_session.as_ref()) {
+    match fetch_video_detail(&task.url, &ytdlp_config, log_session.as_ref()) {
         Ok(detail) => {
             let checked_at = Utc::now().to_rfc3339();
             let subtitle_options = serde_json::to_string(&detail.subtitle_options)
@@ -641,7 +645,11 @@ pub(crate) fn download_home_video_task_subtitle_internal(
         .find(|option| option.language == request.language && option.source_kind == source_kind)
         .cloned()
         .ok_or_else(|| "未找到该字幕选项，请先读取视频详情".to_string())?;
-    let proxy = store.load()?.youtube_monitor_proxy;
+    let settings = store.load()?;
+    let ytdlp_config = ytdlp::YtdlpConfig::new(
+        settings.ytdlp_proxy.clone(),
+        settings.ytdlp_cookies_path.clone(),
+    );
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
     let subtitles_dir = task_dir.join("subtitles");
     fs::create_dir_all(&subtitles_dir).map_err(|error| format!("无法创建字幕目录: {error}"))?;
@@ -652,7 +660,7 @@ pub(crate) fn download_home_video_task_subtitle_internal(
     let output = match download_subtitle_file(
         &task,
         &option,
-        &proxy,
+        &ytdlp_config,
         &subtitles_dir,
         &progress,
         log_session.as_ref(),
@@ -692,7 +700,11 @@ pub(crate) fn download_home_video_task_video_internal(
     let store = app.state::<SettingsStore>();
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
-    let proxy = store.load()?.youtube_monitor_proxy;
+    let settings = store.load()?;
+    let ytdlp_config = ytdlp::YtdlpConfig::new(
+        settings.ytdlp_proxy.clone(),
+        settings.ytdlp_cookies_path.clone(),
+    );
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
     let videos_dir = task_dir.join("videos");
     fs::create_dir_all(&videos_dir).map_err(|error| format!("无法创建视频目录: {error}"))?;
@@ -700,14 +712,19 @@ pub(crate) fn download_home_video_task_video_internal(
 
     progress.emit_active(2, "准备下载视频");
     let log_session = ytdlp::start_log_session(&app, "home_video_download");
-    let output =
-        match download_video_file(&task, &proxy, &videos_dir, &progress, log_session.as_ref()) {
-            Ok(output) => output,
-            Err(error) => {
-                progress.emit_failed(&error);
-                return Err(error);
-            }
-        };
+    let output = match download_video_file(
+        &task,
+        &ytdlp_config,
+        &videos_dir,
+        &progress,
+        log_session.as_ref(),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            progress.emit_failed(&error);
+            return Err(error);
+        }
+    };
     let now = Utc::now().to_rfc3339();
     let updated_task = match store.with_connection(|connection| {
         upsert_home_video_download(connection, &task.id, output, &now)?;
@@ -1182,12 +1199,12 @@ fn upsert_home_video_download(
 
 fn fetch_video_detail(
     url: &str,
-    proxy: &str,
+    config: &ytdlp::YtdlpConfig,
     log_session: Option<&LogSession>,
 ) -> Result<VideoDetail, String> {
     let mut errors = Vec::new();
     for strategy in ytdlp::youtube_client_strategies() {
-        let mut command = ytdlp::command(proxy);
+        let mut command = ytdlp::command(config);
         command.args([
             "--dump-single-json",
             "--no-playlist",
@@ -1204,7 +1221,7 @@ fn fetch_video_detail(
 
         if output.status.success() {
             ytdlp::log_attempt_success(log_session, "home_video_detail", strategy);
-            return parse_video_detail(&output.stdout, url, proxy);
+            return parse_video_detail(&output.stdout, url, &config.proxy);
         }
 
         let error = ytdlp::stderr_or_default(&output.stderr, "yt-dlp 读取视频详情失败");
@@ -1271,7 +1288,7 @@ fn parse_video_detail(output: &[u8], url: &str, proxy: &str) -> Result<VideoDeta
 fn download_subtitle_file(
     task: &HomeVideoTask,
     option: &HomeVideoSubtitleOption,
-    proxy: &str,
+    config: &ytdlp::YtdlpConfig,
     subtitles_dir: &Path,
     progress: &DownloadProgressEmitter,
     log_session: Option<&LogSession>,
@@ -1288,7 +1305,7 @@ fn download_subtitle_file(
     let output_template = output_template.to_string_lossy().to_string();
     progress.emit_active(10, "字幕下载中");
     run_download_with_youtube_fallback(
-        proxy,
+        config,
         progress,
         "home_subtitle_download",
         "yt-dlp 下载字幕失败",
@@ -1337,7 +1354,7 @@ fn download_subtitle_file(
 
 fn download_video_file(
     task: &HomeVideoTask,
-    proxy: &str,
+    config: &ytdlp::YtdlpConfig,
     videos_dir: &Path,
     progress: &DownloadProgressEmitter,
     log_session: Option<&LogSession>,
@@ -1347,7 +1364,7 @@ fn download_video_file(
     let output_template = output_template.to_string_lossy().to_string();
     progress.emit_active(8, "视频下载中");
     run_download_with_youtube_fallback(
-        proxy,
+        config,
         progress,
         "home_video_download",
         "yt-dlp 下载视频失败",
@@ -1412,7 +1429,7 @@ fn add_ytdlp_progress_args(command: &mut Command) {
 }
 
 fn run_download_with_youtube_fallback<F>(
-    proxy: &str,
+    config: &ytdlp::YtdlpConfig,
     progress: &DownloadProgressEmitter,
     operation: &str,
     failure_message: &str,
@@ -1424,7 +1441,7 @@ where
 {
     let mut errors = Vec::new();
     for strategy in ytdlp::youtube_client_strategies() {
-        let mut command = ytdlp::command(proxy);
+        let mut command = ytdlp::command(config);
         configure(&mut command, strategy);
         match run_ytdlp_download_command(&mut command, progress, failure_message) {
             Ok(()) => {

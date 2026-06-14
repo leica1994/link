@@ -1,6 +1,8 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::AppHandle;
 
@@ -51,7 +53,14 @@ pub struct AppSettings {
     pub home_workbench_translation_enabled: bool,
     pub home_workbench_dubbing_enabled: bool,
     pub home_workbench_export_dir: String,
-    pub youtube_monitor_proxy: String,
+    pub ytdlp_proxy: String,
+    pub ytdlp_cookies_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YtdlpCookiesImportResult {
+    pub cookies_path: String,
 }
 
 pub struct SettingsStore {
@@ -183,11 +192,8 @@ impl SettingsStore {
                 "home_workbench_export_dir",
                 "",
             ),
-            youtube_monitor_proxy: read_string_setting(
-                &setting_values,
-                "youtube_monitor_proxy",
-                "",
-            ),
+            ytdlp_proxy: read_string_setting(&setting_values, "ytdlp_proxy", ""),
+            ytdlp_cookies_path: read_string_setting(&setting_values, "ytdlp_cookies_path", ""),
         })
     }
 
@@ -220,6 +226,22 @@ impl SettingsStore {
             )
             .map(|_| ())
             .map_err(|error| format!("无法保存当前字幕样式: {error}"))
+    }
+
+    pub(crate) fn set_ytdlp_cookies_path(&self, cookies_path: &str) -> Result<(), String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|error| format!("设置数据库锁定失败: {error}"))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("无法开始保存 yt-dlp Cookies: {error}"))?;
+
+        upsert_setting(&transaction, "ytdlp_cookies_path", cookies_path)?;
+
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 yt-dlp Cookies 设置: {error}"))
     }
 
     pub(crate) fn save(&self, settings: &AppSettings) -> Result<(), String> {
@@ -340,10 +362,11 @@ impl SettingsStore {
             "home_workbench_export_dir",
             &settings.home_workbench_export_dir,
         )?;
+        upsert_setting(&transaction, "ytdlp_proxy", &settings.ytdlp_proxy)?;
         upsert_setting(
             &transaction,
-            "youtube_monitor_proxy",
-            &settings.youtube_monitor_proxy,
+            "ytdlp_cookies_path",
+            &settings.ytdlp_cookies_path,
         )?;
 
         for (service, config) in normalize_llm_configs(&settings.llm_configs) {
@@ -399,6 +422,54 @@ pub fn save_settings(
 ) -> Result<(), String> {
     store.save(&settings)?;
     ai_service.update_thread_count(settings.translation_thread_count)
+}
+
+#[tauri::command]
+pub fn import_ytdlp_cookies(
+    store: tauri::State<'_, SettingsStore>,
+    source_path: String,
+) -> Result<YtdlpCookiesImportResult, String> {
+    let source_path = PathBuf::from(source_path);
+    let source_path = fs::canonicalize(&source_path)
+        .map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;
+    let source_metadata =
+        fs::metadata(&source_path).map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;
+
+    if !source_metadata.is_file() {
+        return Err("Cookies 只能选择文件".to_string());
+    }
+
+    if source_metadata.len() == 0 {
+        return Err("Cookies 文件为空".to_string());
+    }
+
+    let destination_path = app_paths::ytdlp_cookies_path()?;
+    let should_copy = fs::canonicalize(&destination_path)
+        .map(|existing_path| existing_path != source_path)
+        .unwrap_or(true);
+
+    if should_copy {
+        fs::copy(&source_path, &destination_path)
+            .map_err(|error| format!("无法保存 Cookies 文件: {error}"))?;
+    }
+
+    let cookies_path = path_to_string(&destination_path);
+    store.set_ytdlp_cookies_path(&cookies_path)?;
+
+    Ok(YtdlpCookiesImportResult { cookies_path })
+}
+
+#[tauri::command]
+pub fn clear_ytdlp_cookies(store: tauri::State<'_, SettingsStore>) -> Result<(), String> {
+    let cookies_path = app_paths::ytdlp_cookies_path()?;
+
+    match fs::remove_file(&cookies_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法移除 Cookies 文件: {error}")),
+    }
+
+    store.set_ytdlp_cookies_path("")
 }
 
 fn initialize_database(connection: &Connection) -> Result<(), String> {
@@ -1290,6 +1361,10 @@ fn bool_to_text(value: bool) -> &'static str {
 
 fn default_subtitle_style_id() -> String {
     "default".to_string()
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 fn upsert_setting(

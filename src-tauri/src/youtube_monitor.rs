@@ -315,7 +315,11 @@ pub fn refresh_youtube_channel(
     let channel = store.with_connection(|connection| {
         read_youtube_channel_by_id(connection, &channel_id)
     })?;
-    let proxy = store.load()?.youtube_monitor_proxy;
+    let settings = store.load()?;
+    let ytdlp_config = ytdlp::YtdlpConfig::new(
+        settings.ytdlp_proxy.clone(),
+        settings.ytdlp_cookies_path.clone(),
+    );
     let run = create_refresh_run(&store, &channel.id)?;
     emit_refresh(&app, &run);
     std::mem::forget(guard);
@@ -332,7 +336,7 @@ pub fn refresh_youtube_channel(
             &store,
             &channel,
             run.clone(),
-            &proxy,
+            &ytdlp_config,
             log_session.as_ref(),
         );
 
@@ -354,7 +358,7 @@ fn run_ytdlp_refresh(
     store: &SettingsStore,
     channel: &YoutubeChannel,
     mut run: YoutubeRefreshRun,
-    proxy: &str,
+    config: &ytdlp::YtdlpConfig,
     log_session: Option<&LogSession>,
 ) -> Result<YoutubeRefreshRun, String> {
     let latest_known_video_id = store.with_connection(|connection| {
@@ -368,7 +372,7 @@ fn run_ytdlp_refresh(
             match run_ytdlp_refresh_attempt(
                 &channel.url,
                 latest_known_video_id.as_deref(),
-                proxy,
+                config,
                 strategy,
             ) {
                 Ok(attempt) => {
@@ -465,10 +469,10 @@ fn run_ytdlp_refresh(
 fn run_ytdlp_refresh_attempt(
     channel_url: &str,
     latest_known_video_id: Option<&str>,
-    proxy: &str,
+    config: &ytdlp::YtdlpConfig,
     strategy: &YoutubeClientStrategy,
 ) -> Result<RefreshAttempt, String> {
-    let mut command = ytdlp::command(proxy);
+    let mut command = ytdlp::command(config);
     command.args([
         "--flat-playlist",
         "-j",

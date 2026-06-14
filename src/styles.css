@@ -354,6 +354,14 @@ html[data-theme='dark'] .settings-action:not(:disabled):hover {
   cursor: pointer;
 }
 
+.settings-action-group {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .settings-action:disabled {
   cursor: not-allowed;
   border-color: color-mix(in srgb, var(--text-muted) 18%, var(--hairline));
@@ -4519,10 +4527,16 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
   .setting-control,
   .setting-toggle,
   .setting-range-control,
+  .settings-action-group,
   .settings-action,
   .chevron-icon {
     grid-column: 2;
     justify-self: start;
+  }
+
+  .settings-action-group {
+    flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
   .setting-control {
