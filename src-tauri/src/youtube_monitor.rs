@@ -10,10 +10,10 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-use crate::command_utils::create_command;
+use crate::app_log::LogSession;
 use crate::settings::SettingsStore;
+use crate::ytdlp::{self, YoutubeClientStrategy, YtdlpStatus};
 
-const YTDLP_COMMAND: &str = "yt-dlp";
 const REFRESH_EVENT: &str = "youtube-monitor-refresh";
 const CHANNEL_STATUS_IDLE: &str = "idle";
 const CHANNEL_STATUS_CHECKING: &str = "checking";
@@ -23,9 +23,6 @@ const RUN_STATUS_DONE: &str = "done";
 const RUN_STATUS_FAILED: &str = "failed";
 const DEFAULT_VIDEO_PAGE_SIZE: u32 = 100;
 const MAX_VIDEO_PAGE_SIZE: u32 = 200;
-const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
-const YTDLP_YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=default,-android_vr";
-const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 
 pub struct YoutubeMonitorService {
     running_channels: Mutex<HashSet<String>>,
@@ -70,14 +67,6 @@ impl Drop for RefreshGuard<'_> {
     fn drop(&mut self) {
         self.service.release_channel(&self.channel_id);
     }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct YtdlpStatus {
-    pub is_available: bool,
-    pub version: String,
-    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,34 +173,17 @@ struct VideoEntry {
     metadata: Value,
 }
 
+struct RefreshAttempt {
+    did_update_channel_metadata: bool,
+    first_metadata: Option<Value>,
+    stopped_on_known_video: bool,
+    first_seen_video_id: Option<String>,
+    entries: Vec<VideoEntry>,
+}
+
 #[tauri::command]
 pub fn get_ytdlp_status() -> YtdlpStatus {
-    let mut cmd = create_command(YTDLP_COMMAND);
-
-    match cmd.arg("--version").output() {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            YtdlpStatus {
-                is_available: true,
-                version: version.clone(),
-                message: if version.is_empty() {
-                    "yt-dlp 可用".to_string()
-                } else {
-                    format!("yt-dlp {version}")
-                },
-            }
-        }
-        Ok(output) => YtdlpStatus {
-            is_available: false,
-            version: String::new(),
-            message: stderr_or_default(&output.stderr, "yt-dlp 检测失败"),
-        },
-        Err(error) => YtdlpStatus {
-            is_available: false,
-            version: String::new(),
-            message: format!("未检测到 yt-dlp: {error}"),
-        },
-    }
+    ytdlp::status()
 }
 
 #[tauri::command]
@@ -354,7 +326,15 @@ pub fn refresh_youtube_channel(
     let returned_run = run.clone();
     thread::spawn(move || {
         let store = background_app.state::<SettingsStore>();
-        let result = run_ytdlp_refresh(&background_app, &store, &channel, run.clone(), &proxy);
+        let log_session = ytdlp::start_log_session(&background_app, "youtube_monitor_refresh");
+        let result = run_ytdlp_refresh(
+            &background_app,
+            &store,
+            &channel,
+            run.clone(),
+            &proxy,
+            log_session.as_ref(),
+        );
 
         if let Err(error) = result {
             if let Ok(failed_run) = fail_refresh_run(&store, &background_channel_id, &background_run_id, &error) {
@@ -375,105 +355,58 @@ fn run_ytdlp_refresh(
     channel: &YoutubeChannel,
     mut run: YoutubeRefreshRun,
     proxy: &str,
+    log_session: Option<&LogSession>,
 ) -> Result<YoutubeRefreshRun, String> {
     let latest_known_video_id = store.with_connection(|connection| {
         read_latest_youtube_video_external_id(connection, &channel.id)
     })?;
     let is_incremental_refresh = latest_known_video_id.is_some();
-    let mut command = ytdlp_command(proxy);
-    command.args([
-        "--flat-playlist",
-        "-j",
-        "--ignore-errors",
-        "--no-warnings",
-        "--no-progress",
-        "--extractor-args",
-        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
-        "--add-headers",
-        YOUTUBE_ACCEPT_LANGUAGE,
-        "--socket-timeout",
-        YTDLP_SOCKET_TIMEOUT_SECONDS,
-        &channel.url,
-    ]);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "无法读取 yt-dlp 输出".to_string())?;
-    let stderr = child.stderr.take();
-    let stderr_handle = stderr.map(|mut value| {
-        thread::spawn(move || {
-            let mut text = String::new();
-            let _ = value.read_to_string(&mut text);
-            text
+    let mut errors = Vec::new();
+    let attempt = ytdlp::youtube_client_strategies()
+        .iter()
+        .find_map(|strategy| {
+            match run_ytdlp_refresh_attempt(
+                &channel.url,
+                latest_known_video_id.as_deref(),
+                proxy,
+                strategy,
+            ) {
+                Ok(attempt) => {
+                    ytdlp::log_attempt_success(log_session, "youtube_monitor_refresh", strategy);
+                    Some(Ok(attempt))
+                }
+                Err(error) => {
+                    ytdlp::log_attempt_failure(
+                        log_session,
+                        "youtube_monitor_refresh",
+                        strategy,
+                        &error,
+                    );
+                    errors.push((strategy.label.to_string(), error));
+                    None
+                }
+            }
         })
-    });
+        .unwrap_or_else(|| {
+            Err(ytdlp::format_attempt_errors(
+                "yt-dlp 检查失败",
+                &errors,
+            ))
+        })?;
 
-    let reader = BufReader::new(stdout);
-    let mut did_update_channel_metadata = false;
-    let mut stopped_on_known_video = false;
-    let mut first_seen_video_id: Option<String> = None;
-    let mut pending_entries = Vec::new();
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("读取 yt-dlp 输出失败: {error}"))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let value = match serde_json::from_str::<Value>(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if !did_update_channel_metadata {
-            update_channel_metadata_from_value(store, &channel.id, &value)?;
-            did_update_channel_metadata = true;
-        }
-        let Some(entry) = extract_video_entry(value) else {
-            continue;
-        };
-        if first_seen_video_id.is_none() {
-            first_seen_video_id = Some(entry.external_id.clone());
-        }
-
-        if latest_known_video_id
-            .as_deref()
-            .is_some_and(|latest_id| latest_id == entry.external_id)
-        {
-            stopped_on_known_video = true;
-            let _ = child.kill();
-            break;
-        }
-
-        run.processed_count += 1;
-        pending_entries.push(entry);
-
-        if run.processed_count == 1 || run.processed_count % 25 == 0 {
-            run.message = format!("已读取 {} 条视频", run.processed_count);
-            update_refresh_run(store, &run)?;
-            emit_refresh(app, &run);
+    if attempt.did_update_channel_metadata {
+        if let Some(value) = attempt.first_metadata.as_ref() {
+            update_channel_metadata_from_value(store, &channel.id, value)?;
         }
     }
-
-    let output_status = child
-        .wait()
-        .map_err(|error| format!("等待 yt-dlp 结束失败: {error}"))?;
-    let stderr_text = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-
-    if !stopped_on_known_video && !output_status.success() {
-        let message = if stderr_text.trim().is_empty() {
-            "yt-dlp 检查失败".to_string()
-        } else {
-            stderr_text.trim().to_string()
-        };
-        return Err(message);
+    let stopped_on_known_video = attempt.stopped_on_known_video;
+    let first_seen_video_id = attempt.first_seen_video_id;
+    let pending_entries = attempt.entries;
+    run.processed_count = pending_entries.len() as u64;
+    if run.processed_count > 0 {
+        run.message = format!("已读取 {} 条视频", run.processed_count);
+        update_refresh_run(store, &run)?;
+        emit_refresh(app, &run);
     }
 
     if !pending_entries.is_empty() {
@@ -529,6 +462,110 @@ fn run_ytdlp_refresh(
     Ok(run)
 }
 
+fn run_ytdlp_refresh_attempt(
+    channel_url: &str,
+    latest_known_video_id: Option<&str>,
+    proxy: &str,
+    strategy: &YoutubeClientStrategy,
+) -> Result<RefreshAttempt, String> {
+    let mut command = ytdlp::command(proxy);
+    command.args([
+        "--flat-playlist",
+        "-j",
+        "--ignore-errors",
+        "--no-warnings",
+        "--no-progress",
+    ]);
+    ytdlp::add_youtube_extractor_args(&mut command, strategy);
+    command.arg(channel_url);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 yt-dlp 输出".to_string())?;
+    let stderr = child.stderr.take();
+    let stderr_handle = stderr.map(|mut value| {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = value.read_to_string(&mut text);
+            text
+        })
+    });
+
+    let reader = BufReader::new(stdout);
+    let mut first_metadata = None;
+    let mut stopped_on_known_video = false;
+    let mut first_seen_video_id: Option<String> = None;
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("读取 yt-dlp 输出失败: {error}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if first_metadata.is_none() {
+            first_metadata = Some(value.clone());
+        }
+        let Some(entry) = extract_video_entry(value) else {
+            continue;
+        };
+        if first_seen_video_id.is_none() {
+            first_seen_video_id = Some(entry.external_id.clone());
+        }
+
+        if latest_known_video_id.is_some_and(|latest_id| latest_id == entry.external_id) {
+            stopped_on_known_video = true;
+            let _ = child.kill();
+            break;
+        }
+
+        entries.push(entry);
+    }
+
+    let output_status = child
+        .wait()
+        .map_err(|error| format!("等待 yt-dlp 结束失败: {error}"))?;
+    let stderr_text = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+
+    let reported_error_without_entries =
+        entries.is_empty() && stderr_text.lines().any(is_ytdlp_error_line);
+    if !stopped_on_known_video && (!output_status.success() || reported_error_without_entries) {
+        let message = if stderr_text.trim().is_empty() {
+            "yt-dlp 检查失败".to_string()
+        } else {
+            ytdlp::compact_error(stderr_text.trim())
+        };
+        return Err(message);
+    }
+
+    Ok(RefreshAttempt {
+        did_update_channel_metadata: first_metadata.is_some(),
+        first_metadata,
+        stopped_on_known_video,
+        first_seen_video_id,
+        entries,
+    })
+}
+
+fn is_ytdlp_error_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("error:")
+        || lower.contains("no player clients have been requested")
+        || lower.contains("unable to extract")
+}
+
 fn create_refresh_run(store: &SettingsStore, channel_id: &str) -> Result<YoutubeRefreshRun, String> {
     let run = YoutubeRefreshRun {
         id: Uuid::new_v4().to_string(),
@@ -562,7 +599,7 @@ fn fail_refresh_run(
         let mut run = read_refresh_run_by_id(connection, run_id)?;
         run.status = RUN_STATUS_FAILED.to_string();
         run.message = "检查失败".to_string();
-        run.error_message = compact_error(error);
+        run.error_message = ytdlp::compact_error(error);
         run.finished_at = Some(now);
         update_refresh_run_record(connection, &run)?;
         update_channel_after_refresh(
@@ -575,17 +612,6 @@ fn fail_refresh_run(
         )?;
         Ok(run)
     })
-}
-
-fn ytdlp_command(proxy: &str) -> std::process::Command {
-    let mut command = create_command(YTDLP_COMMAND);
-
-    let proxy = proxy.trim();
-    if !proxy.is_empty() {
-        command.args(["--proxy", proxy]);
-    }
-
-    command
 }
 
 fn channel_probe_from_url(url: &str) -> ChannelProbe {
@@ -1405,48 +1431,22 @@ fn id_from_url(value: &Value) -> String {
     String::new()
 }
 
-fn stderr_or_default(stderr: &[u8], fallback: &str) -> String {
-    let message = String::from_utf8_lossy(stderr).trim().to_string();
-    if message.is_empty() {
-        fallback.to_string()
-    } else {
-        compact_error(&message)
-    }
-}
-
-fn compact_error(error: &str) -> String {
-    let lines = error
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let selected = lines
-        .iter()
-        .copied()
-        .filter(|line| is_relevant_error_line(line))
-        .collect::<Vec<_>>();
-    let compact = if selected.is_empty() { lines } else { selected }
-        .into_iter()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join("；");
-
-    if compact.is_empty() {
-        "操作失败".to_string()
-    } else {
-        compact
-    }
-}
-
-fn is_relevant_error_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("error:")
-        || lower.contains("failed")
-        || lower.contains("unable")
-        || lower.contains("timed out")
-        || lower.contains("http error")
-}
-
 fn emit_refresh(app: &AppHandle, run: &YoutubeRefreshRun) {
     let _ = app.emit(REFRESH_EVENT, run);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_ytdlp_extractor_errors() {
+        assert!(is_ytdlp_error_line(
+            "ERROR: [youtube] abc: No player clients have been requested"
+        ));
+        assert!(is_ytdlp_error_line(
+            "WARNING: unable to extract initial player response"
+        ));
+        assert!(!is_ytdlp_error_line("[youtube] abc: Downloading webpage"));
+    }
 }

@@ -15,7 +15,7 @@
           <h1 class="page-title">{{ pageTitle }}</h1>
           <div class="youtube-monitor-status-line" :class="toolStatusClass">
             <span class="translate-status-dot" :class="toolStatusDotClass" aria-hidden="true" />
-            <span>{{ ytdlpStatus.message }}</span>
+            <span :title="ytdlpStatus.resolvedPath">{{ ytdlpStatus.message }}</span>
           </div>
         </div>
       </div>
@@ -478,6 +478,8 @@ type YtdlpStatus = {
   isAvailable: boolean
   version: string
   message: string
+  resolvedPath: string
+  configPolicy: 'ignoreConfig'
 }
 
 type YoutubeChannel = {
@@ -555,6 +557,8 @@ const ytdlpStatus = ref<YtdlpStatus>({
   isAvailable: false,
   version: '',
   message: '正在检测 yt-dlp',
+  resolvedPath: '',
+  configPolicy: 'ignoreConfig',
 })
 const channelQuery = ref('')
 const channelFilter = ref<ChannelStatusFilter>('all')
@@ -717,6 +721,8 @@ const loadYtdlpStatus = async () => {
       isAvailable: false,
       version: '',
       message: '请在桌面应用中使用监控',
+      resolvedPath: '',
+      configPolicy: 'ignoreConfig',
     }
     return
   }

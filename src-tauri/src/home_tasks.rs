@@ -16,22 +16,18 @@ use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+use crate::app_log::LogSession;
 use crate::app_paths;
-use crate::command_utils::create_command;
 use crate::dubbing::delete_dubbing_task_by_id;
 use crate::settings::SettingsStore;
+use crate::ytdlp::{self, YoutubeClientStrategy};
 
-const YTDLP_COMMAND: &str = "yt-dlp";
 const DETAIL_STATUS_PENDING: &str = "pending";
 const DETAIL_STATUS_LOADING: &str = "loading";
 const DETAIL_STATUS_READY: &str = "ready";
 const DETAIL_STATUS_FAILED: &str = "failed";
 const SUBTITLE_SOURCE_MANUAL: &str = "manual";
 const SUBTITLE_SOURCE_AUTOMATIC: &str = "automatic";
-const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
-const YTDLP_YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=default,-android_vr";
-const YTDLP_YOUTUBE_DETAIL_EXTRACTOR_ARGS: &str = "youtube:lang=zh-CN;player_client=ios";
-const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 const THUMBNAIL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 const HOME_VIDEO_DOWNLOAD_PROGRESS_EVENT: &str = "home-video-download-progress";
@@ -534,7 +530,8 @@ fn refresh_home_video_task_detail_blocking(
             .map_err(|error| format!("无法更新详情读取状态: {error}"))
     })?;
 
-    match fetch_video_detail(&task.url, &proxy) {
+    let log_session = ytdlp::start_log_session(&app, "home_video_detail");
+    match fetch_video_detail(&task.url, &proxy, log_session.as_ref()) {
         Ok(detail) => {
             let checked_at = Utc::now().to_rfc3339();
             let subtitle_options = serde_json::to_string(&detail.subtitle_options)
@@ -593,7 +590,7 @@ fn refresh_home_video_task_detail_blocking(
         }
         Err(error) => {
             let checked_at = Utc::now().to_rfc3339();
-            let compact = compact_error(&error);
+            let compact = ytdlp::compact_error(&error);
             let _ = store.with_connection(|connection| {
                 connection
                     .execute(
@@ -649,7 +646,15 @@ pub(crate) fn download_home_video_task_subtitle_internal(
     let progress = DownloadProgressEmitter::subtitle(app.clone(), &task.id, &option);
 
     progress.emit_active(2, "准备下载字幕");
-    let output = match download_subtitle_file(&task, &option, &proxy, &subtitles_dir, &progress) {
+    let log_session = ytdlp::start_log_session(&app, "home_subtitle_download");
+    let output = match download_subtitle_file(
+        &task,
+        &option,
+        &proxy,
+        &subtitles_dir,
+        &progress,
+        log_session.as_ref(),
+    ) {
         Ok(output) => output,
         Err(error) => {
             progress.emit_failed(&error);
@@ -692,13 +697,15 @@ pub(crate) fn download_home_video_task_video_internal(
     let progress = DownloadProgressEmitter::video(app.clone(), &task.id);
 
     progress.emit_active(2, "准备下载视频");
-    let output = match download_video_file(&task, &proxy, &videos_dir, &progress) {
-        Ok(output) => output,
-        Err(error) => {
-            progress.emit_failed(&error);
-            return Err(error);
-        }
-    };
+    let log_session = ytdlp::start_log_session(&app, "home_video_download");
+    let output =
+        match download_video_file(&task, &proxy, &videos_dir, &progress, log_session.as_ref()) {
+            Ok(output) => output,
+            Err(error) => {
+                progress.emit_failed(&error);
+                return Err(error);
+            }
+        };
     let now = Utc::now().to_rfc3339();
     let updated_task = match store.with_connection(|connection| {
         upsert_home_video_download(connection, &task.id, output, &now)?;
@@ -1171,32 +1178,46 @@ fn upsert_home_video_download(
         .map_err(|error| format!("无法保存视频下载记录: {error}"))
 }
 
-fn fetch_video_detail(url: &str, proxy: &str) -> Result<VideoDetail, String> {
-    let mut command = ytdlp_command(proxy);
-    command.args([
-        "--dump-single-json",
-        "--no-playlist",
-        "--skip-download",
-        "--ignore-no-formats-error",
-        "--no-warnings",
-        "--no-progress",
-        "--extractor-args",
-        YTDLP_YOUTUBE_DETAIL_EXTRACTOR_ARGS,
-        "--add-headers",
-        YOUTUBE_ACCEPT_LANGUAGE,
-        "--socket-timeout",
-        YTDLP_SOCKET_TIMEOUT_SECONDS,
-        url,
-    ]);
-    let output = command
-        .output()
-        .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
+fn fetch_video_detail(
+    url: &str,
+    proxy: &str,
+    log_session: Option<&LogSession>,
+) -> Result<VideoDetail, String> {
+    let mut errors = Vec::new();
+    for strategy in ytdlp::youtube_client_strategies() {
+        let mut command = ytdlp::command(proxy);
+        command.args([
+            "--dump-single-json",
+            "--no-playlist",
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--no-warnings",
+            "--no-progress",
+        ]);
+        ytdlp::add_youtube_extractor_args(&mut command, strategy);
+        command.arg(url);
+        let output = command
+            .output()
+            .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
 
-    if !output.status.success() {
-        return Err(stderr_or_default(&output.stderr, "yt-dlp 读取视频详情失败"));
+        if output.status.success() {
+            ytdlp::log_attempt_success(log_session, "home_video_detail", strategy);
+            return parse_video_detail(&output.stdout, url, proxy);
+        }
+
+        let error = ytdlp::stderr_or_default(&output.stderr, "yt-dlp 读取视频详情失败");
+        ytdlp::log_attempt_failure(log_session, "home_video_detail", strategy, &error);
+        errors.push((strategy.label.to_string(), error));
     }
 
-    let value: Value = serde_json::from_slice(&output.stdout)
+    Err(ytdlp::format_attempt_errors(
+        "yt-dlp 读取视频详情失败",
+        &errors,
+    ))
+}
+
+fn parse_video_detail(output: &[u8], url: &str, proxy: &str) -> Result<VideoDetail, String> {
+    let value: Value = serde_json::from_slice(output)
         .map_err(|error| format!("无法解析 yt-dlp 视频详情: {error}"))?;
     let external_id = first_non_empty(&[
         string_field(&value, "id").unwrap_or_default(),
@@ -1251,6 +1272,7 @@ fn download_subtitle_file(
     proxy: &str,
     subtitles_dir: &Path,
     progress: &DownloadProgressEmitter,
+    log_session: Option<&LogSession>,
 ) -> Result<SubtitleDownloadOutput, String> {
     let prefix = format!(
         "{}.{}.{}",
@@ -1262,36 +1284,38 @@ fn download_subtitle_file(
 
     let output_template = subtitles_dir.join(format!("{prefix}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let mut command = ytdlp_command(proxy);
-    command.args([
-        "--skip-download",
-        "--ignore-no-formats-error",
-        "--no-playlist",
-        "--no-warnings",
-        "--extractor-args",
-        YTDLP_YOUTUBE_DETAIL_EXTRACTOR_ARGS,
-        "--add-headers",
-        YOUTUBE_ACCEPT_LANGUAGE,
-        "--socket-timeout",
-        YTDLP_SOCKET_TIMEOUT_SECONDS,
-    ]);
-    add_ytdlp_progress_args(&mut command);
-    if option.source_kind == SUBTITLE_SOURCE_AUTOMATIC {
-        command.arg("--write-auto-subs");
-    } else {
-        command.arg("--write-subs");
-    }
-    command.args([
-        "--sub-langs",
-        &option.language,
-        "--sub-format",
-        "srt/vtt/ttml/ass/best",
-        "-o",
-        &output_template,
-        &task.url,
-    ]);
     progress.emit_active(10, "字幕下载中");
-    run_ytdlp_download_command(&mut command, progress, "yt-dlp 下载字幕失败")?;
+    run_download_with_youtube_fallback(
+        proxy,
+        progress,
+        "home_subtitle_download",
+        "yt-dlp 下载字幕失败",
+        log_session,
+        |command, strategy| {
+            command.args([
+                "--skip-download",
+                "--ignore-no-formats-error",
+                "--no-playlist",
+                "--no-warnings",
+            ]);
+            ytdlp::add_youtube_extractor_args(command, strategy);
+            add_ytdlp_progress_args(command);
+            if option.source_kind == SUBTITLE_SOURCE_AUTOMATIC {
+                command.arg("--write-auto-subs");
+            } else {
+                command.arg("--write-subs");
+            }
+            command.args([
+                "--sub-langs",
+                &option.language,
+                "--sub-format",
+                "srt/vtt/ttml/ass/best",
+                "-o",
+                &output_template,
+                &task.url,
+            ]);
+        },
+    )?;
     progress.emit_active(92, "字幕写入完成");
 
     let path = find_subtitle_output(subtitles_dir, &prefix)?;
@@ -1314,36 +1338,39 @@ fn download_video_file(
     proxy: &str,
     videos_dir: &Path,
     progress: &DownloadProgressEmitter,
+    log_session: Option<&LogSession>,
 ) -> Result<VideoDownloadOutput, String> {
     let prefix = home_video_prefix(&task.id);
     let output_template = videos_dir.join(format!("{prefix}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
-    let mut command = ytdlp_command(proxy);
-    command.args([
-        "--no-playlist",
-        "--no-warnings",
-        "--extractor-args",
-        YTDLP_YOUTUBE_EXTRACTOR_ARGS,
-        "--add-headers",
-        YOUTUBE_ACCEPT_LANGUAGE,
-        "--socket-timeout",
-        YTDLP_SOCKET_TIMEOUT_SECONDS,
-        "-f",
-        "bv*+ba/best",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        &output_template,
-    ]);
-    if task.downloaded_video.is_some() {
-        command.arg("--force-overwrites");
-    } else {
-        command.args(["--continue", "--part"]);
-    }
-    add_ytdlp_progress_args(&mut command);
-    command.arg(&task.url);
     progress.emit_active(8, "视频下载中");
-    run_ytdlp_download_command(&mut command, progress, "yt-dlp 下载视频失败")?;
+    run_download_with_youtube_fallback(
+        proxy,
+        progress,
+        "home_video_download",
+        "yt-dlp 下载视频失败",
+        log_session,
+        |command, strategy| {
+            command.args([
+                "--no-playlist",
+                "--no-warnings",
+                "-f",
+                "bv*+ba/best",
+                "--merge-output-format",
+                "mp4",
+                "-o",
+                &output_template,
+            ]);
+            ytdlp::add_youtube_extractor_args(command, strategy);
+            if task.downloaded_video.is_some() {
+                command.arg("--force-overwrites");
+            } else {
+                command.args(["--continue", "--part"]);
+            }
+            add_ytdlp_progress_args(command);
+            command.arg(&task.url);
+        },
+    )?;
     progress.emit_active(98, "视频文件处理中");
 
     let path = find_video_output(videos_dir, &prefix)?;
@@ -1379,6 +1406,36 @@ fn add_ytdlp_progress_args(command: &mut Command) {
         "--progress-template",
         YTDLP_POSTPROCESS_PROGRESS_TEMPLATE,
     ]);
+}
+
+fn run_download_with_youtube_fallback<F>(
+    proxy: &str,
+    progress: &DownloadProgressEmitter,
+    operation: &str,
+    failure_message: &str,
+    log_session: Option<&LogSession>,
+    mut configure: F,
+) -> Result<(), String>
+where
+    F: FnMut(&mut Command, &YoutubeClientStrategy),
+{
+    let mut errors = Vec::new();
+    for strategy in ytdlp::youtube_client_strategies() {
+        let mut command = ytdlp::command(proxy);
+        configure(&mut command, strategy);
+        match run_ytdlp_download_command(&mut command, progress, failure_message) {
+            Ok(()) => {
+                ytdlp::log_attempt_success(log_session, operation, strategy);
+                return Ok(());
+            }
+            Err(error) => {
+                ytdlp::log_attempt_failure(log_session, operation, strategy, &error);
+                errors.push((strategy.label.to_string(), error));
+            }
+        }
+    }
+
+    Err(ytdlp::format_attempt_errors(failure_message, &errors))
 }
 
 fn run_ytdlp_download_command(
@@ -1425,7 +1482,7 @@ fn run_ytdlp_download_command(
     }
 
     if !status.success() {
-        return Err(lines_or_default(&output_lines, failure_message));
+        return Err(ytdlp::lines_or_default(&output_lines, failure_message));
     }
 
     Ok(())
@@ -1795,17 +1852,6 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
-fn ytdlp_command(proxy: &str) -> std::process::Command {
-    let mut command = create_command(YTDLP_COMMAND);
-
-    let proxy = proxy.trim();
-    if !proxy.is_empty() {
-        command.args(["--proxy", proxy]);
-    }
-
-    command
-}
-
 fn normalize_subtitle_source_kind(value: &str) -> String {
     if value == SUBTITLE_SOURCE_AUTOMATIC {
         SUBTITLE_SOURCE_AUTOMATIC.to_string()
@@ -2003,63 +2049,6 @@ fn first_non_empty(values: &[String]) -> String {
         .unwrap_or_default()
 }
 
-fn stderr_or_default(stderr: &[u8], fallback: &str) -> String {
-    let message = String::from_utf8_lossy(stderr).trim().to_string();
-    if message.is_empty() {
-        fallback.to_string()
-    } else {
-        compact_error(&message)
-    }
-}
-
-fn lines_or_default(lines: &[String], fallback: &str) -> String {
-    let message = lines
-        .iter()
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if message.is_empty() {
-        fallback.to_string()
-    } else {
-        compact_error(&message)
-    }
-}
-
-fn compact_error(error: &str) -> String {
-    let lines = error
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let selected = lines
-        .iter()
-        .copied()
-        .filter(|line| is_relevant_error_line(line))
-        .collect::<Vec<_>>();
-    let compact = if selected.is_empty() { lines } else { selected }
-        .into_iter()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join("；");
-
-    if compact.is_empty() {
-        "操作失败".to_string()
-    } else {
-        compact
-    }
-}
-
-fn is_relevant_error_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("error:")
-        || lower.contains("failed")
-        || lower.contains("unable")
-        || lower.contains("timed out")
-        || lower.contains("http error")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2115,7 +2104,7 @@ mod tests {
             [youtube] abc: Downloading android vr player API JSON\n\
             ERROR: [youtube] abc: Sign in to confirm you are not a bot";
 
-        let compact = compact_error(error);
+        let compact = ytdlp::compact_error(error);
 
         assert_eq!(
             compact,

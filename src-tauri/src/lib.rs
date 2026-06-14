@@ -17,6 +17,7 @@ mod subtitle_style;
 mod subtitle_translation;
 mod transcription;
 mod youtube_monitor;
+mod ytdlp;
 
 use ai::{check_llm_connection, AiService};
 use app_log::{open_log_directory, AppLogger};
