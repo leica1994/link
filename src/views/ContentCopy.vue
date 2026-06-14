@@ -104,8 +104,15 @@
               </div>
 
               <div class="translate-actions content-copy-actions">
-                <button class="settings-action" type="button" :disabled="!currentRecord" @click="copyFullRecord">
-                  <Copy :stroke-width="2.1" aria-hidden="true" />
+                <button
+                  class="settings-action"
+                  :class="{ 'copy-confirmed': isCopied(CopyTarget.Full) }"
+                  type="button"
+                  :disabled="!currentRecord"
+                  @click="copyFullRecord"
+                >
+                  <Check v-if="isCopied(CopyTarget.Full)" :stroke-width="2.1" aria-hidden="true" />
+                  <Copy v-else :stroke-width="2.1" aria-hidden="true" />
                   <span>{{ copiedLabel === CopyTarget.Full ? '已复制' : '复制全部' }}</span>
                 </button>
                 <button class="settings-action" type="button" :disabled="!currentRecord || isGenerating" @click="deleteCurrentRecord">
@@ -146,17 +153,25 @@
               <section class="content-copy-block" aria-labelledby="content-copy-titles-heading">
                 <div class="content-copy-block-heading">
                   <h2 id="content-copy-titles-heading">标题候选</h2>
-                  <button class="content-copy-icon-button" type="button" aria-label="复制标题" @click="copyTitles">
-                    <Copy :stroke-width="2.1" aria-hidden="true" />
-                  </button>
                 </div>
                 <div class="content-copy-title-list">
                   <article v-for="(title, index) in currentRecord.result.titles" :key="`${title.title}-${index}`" class="content-copy-title-item">
                     <span class="content-copy-index">{{ index + 1 }}</span>
-                    <div>
+                    <div class="content-copy-title-body">
                       <h3>{{ title.title }}</h3>
                       <p>{{ title.hook }} · {{ title.reason }}</p>
                     </div>
+                    <button
+                      class="content-copy-copy-button content-copy-title-copy"
+                      :class="{ 'copy-confirmed': isCopied(titleCopyTarget(index)) }"
+                      type="button"
+                      :aria-label="isCopied(titleCopyTarget(index)) ? `标题 ${index + 1} 已复制` : `复制标题 ${index + 1}`"
+                      @click="copyTitle(title, index)"
+                    >
+                      <Check v-if="isCopied(titleCopyTarget(index))" :stroke-width="2.1" aria-hidden="true" />
+                      <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                      <span>{{ isCopied(titleCopyTarget(index)) ? '已复制' : '复制' }}</span>
+                    </button>
                   </article>
                 </div>
               </section>
@@ -164,14 +179,24 @@
               <section class="content-copy-block" aria-labelledby="content-copy-cover-heading">
                 <div class="content-copy-block-heading">
                   <h2 id="content-copy-cover-heading">封面字</h2>
-                  <button class="content-copy-icon-button" type="button" aria-label="复制封面字" @click="copyCoverTexts">
-                    <Copy :stroke-width="2.1" aria-hidden="true" />
-                  </button>
                 </div>
                 <div class="content-copy-cover-grid">
                   <article v-for="(cover, index) in currentRecord.result.coverTexts" :key="`${cover.lines.join('-')}-${index}`" class="content-copy-cover-item">
-                    <div class="content-copy-cover-lines">
-                      <span v-for="line in cover.lines" :key="line">{{ line }}</span>
+                    <div class="content-copy-cover-head">
+                      <div class="content-copy-cover-lines">
+                        <span v-for="line in cover.lines" :key="line">{{ line }}</span>
+                      </div>
+                      <button
+                        class="content-copy-copy-button content-copy-cover-copy"
+                        :class="{ 'copy-confirmed': isCopied(coverCopyTarget(index)) }"
+                        type="button"
+                        :aria-label="isCopied(coverCopyTarget(index)) ? `封面字 ${index + 1} 已复制` : `复制封面字 ${index + 1}`"
+                        @click="copyCoverText(cover, index)"
+                      >
+                        <Check v-if="isCopied(coverCopyTarget(index))" :stroke-width="2.1" aria-hidden="true" />
+                        <Copy v-else :stroke-width="2.1" aria-hidden="true" />
+                        <span>{{ isCopied(coverCopyTarget(index)) ? '已复制' : '复制' }}</span>
+                      </button>
                     </div>
                     <p>{{ cover.reason }}</p>
                   </article>
@@ -181,8 +206,15 @@
               <section class="content-copy-block" aria-labelledby="content-copy-description-heading">
                 <div class="content-copy-block-heading">
                   <h2 id="content-copy-description-heading">内容简介</h2>
-                  <button class="content-copy-icon-button" type="button" aria-label="复制简介" @click="copyDescription">
-                    <Copy :stroke-width="2.1" aria-hidden="true" />
+                  <button
+                    class="content-copy-icon-button"
+                    :class="{ 'copy-confirmed': isCopied(CopyTarget.Description) }"
+                    type="button"
+                    :aria-label="isCopied(CopyTarget.Description) ? '简介已复制' : '复制简介'"
+                    @click="copyDescription"
+                  >
+                    <Check v-if="isCopied(CopyTarget.Description)" :stroke-width="2.1" aria-hidden="true" />
+                    <Copy v-else :stroke-width="2.1" aria-hidden="true" />
                   </button>
                 </div>
                 <div class="content-copy-description">
@@ -200,8 +232,15 @@
               <section class="content-copy-block" aria-labelledby="content-copy-tags-heading">
                 <div class="content-copy-block-heading">
                   <h2 id="content-copy-tags-heading">标签组合</h2>
-                  <button class="content-copy-icon-button" type="button" aria-label="复制标签" @click="copyTags">
-                    <Copy :stroke-width="2.1" aria-hidden="true" />
+                  <button
+                    class="content-copy-icon-button"
+                    :class="{ 'copy-confirmed': isCopied(CopyTarget.Tags) }"
+                    type="button"
+                    :aria-label="isCopied(CopyTarget.Tags) ? '标签已复制' : '复制标签'"
+                    @click="copyTags"
+                  >
+                    <Check v-if="isCopied(CopyTarget.Tags)" :stroke-width="2.1" aria-hidden="true" />
+                    <Copy v-else :stroke-width="2.1" aria-hidden="true" />
                   </button>
                 </div>
                 <div class="content-copy-tags">
@@ -212,8 +251,15 @@
               <section class="content-copy-block" aria-labelledby="content-copy-comment-heading">
                 <div class="content-copy-block-heading">
                   <h2 id="content-copy-comment-heading">互动评论</h2>
-                  <button class="content-copy-icon-button" type="button" aria-label="复制互动评论" @click="copyPinnedComment">
-                    <Copy :stroke-width="2.1" aria-hidden="true" />
+                  <button
+                    class="content-copy-icon-button"
+                    :class="{ 'copy-confirmed': isCopied(CopyTarget.Comment) }"
+                    type="button"
+                    :aria-label="isCopied(CopyTarget.Comment) ? '互动评论已复制' : '复制互动评论'"
+                    @click="copyPinnedComment"
+                  >
+                    <Check v-if="isCopied(CopyTarget.Comment)" :stroke-width="2.1" aria-hidden="true" />
+                    <Copy v-else :stroke-width="2.1" aria-hidden="true" />
                   </button>
                 </div>
                 <p class="content-copy-comment">{{ currentRecord.result.pinnedComment }}</p>
@@ -240,6 +286,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import {
   Captions,
+  Check,
   CircleAlert,
   ClipboardList,
   Copy,
@@ -255,12 +302,14 @@ defineOptions({ name: 'ContentCopy' })
 
 enum CopyTarget {
   Full = 'full',
-  Titles = 'titles',
-  Cover = 'cover',
   Description = 'description',
   Tags = 'tags',
   Comment = 'comment',
 }
+
+type TitleCopyTarget = `title-${number}`
+type CoverCopyTarget = `cover-${number}`
+type CopyFeedbackTarget = CopyTarget | TitleCopyTarget | CoverCopyTarget
 
 type ContentCopyCategory = {
   primary: string
@@ -337,7 +386,7 @@ const isGenerating = ref(false)
 const generationError = ref('')
 const records = ref<ContentCopyRecord[]>([])
 const currentRecord = ref<ContentCopyRecord | null>(null)
-const copiedLabel = ref<CopyTarget | null>(null)
+const copiedLabel = ref<CopyFeedbackTarget | null>(null)
 let unlistenDragDrop: UnlistenFn | undefined
 let copiedTimer: ReturnType<typeof window.setTimeout> | undefined
 
@@ -421,6 +470,7 @@ const generateCopy = async () => {
 
   isGenerating.value = true
   generationError.value = ''
+  clearCopiedFeedback()
 
   try {
     const record = await invoke<ContentCopyRecord>('generate_content_copy', {
@@ -459,6 +509,7 @@ const loadRecords = async () => {
 const selectRecord = (record: ContentCopyRecord) => {
   currentRecord.value = record
   generationError.value = ''
+  clearCopiedFeedback()
   selectedSubtitlePath.value = record.subtitlePath
   extraContext.value = record.extraContext
 }
@@ -546,17 +597,17 @@ const copyFullRecord = () => {
   }
 }
 
-const copyTitles = () => {
-  if (currentRecord.value) {
-    void copyText(currentRecord.value.result.titles.map((title) => title.title).join('\n'), CopyTarget.Titles)
-  }
+const titleCopyTarget = (index: number): TitleCopyTarget => `title-${index}`
+const coverCopyTarget = (index: number): CoverCopyTarget => `cover-${index}`
+
+const isCopied = (target: CopyFeedbackTarget) => copiedLabel.value === target
+
+const copyTitle = (title: ContentCopyTitle, index: number) => {
+  void copyText(title.title, titleCopyTarget(index))
 }
 
-const copyCoverTexts = () => {
-  if (currentRecord.value) {
-    const text = currentRecord.value.result.coverTexts.map((cover) => cover.lines.join(' / ')).join('\n')
-    void copyText(text, CopyTarget.Cover)
-  }
+const copyCoverText = (cover: ContentCopyCoverText, index: number) => {
+  void copyText(cover.lines.join('\n'), coverCopyTarget(index))
 }
 
 const copyDescription = () => {
@@ -579,7 +630,7 @@ const copyPinnedComment = () => {
   }
 }
 
-const copyText = async (text: string, target: CopyTarget) => {
+const copyText = async (text: string, target: CopyFeedbackTarget) => {
   try {
     await navigator.clipboard.writeText(text)
     copiedLabel.value = target
@@ -592,6 +643,14 @@ const copyText = async (text: string, target: CopyTarget) => {
     }, 1300)
   } catch (error) {
     generationError.value = stringifyError(error, '复制失败')
+  }
+}
+
+const clearCopiedFeedback = () => {
+  copiedLabel.value = null
+  if (copiedTimer !== undefined) {
+    window.clearTimeout(copiedTimer)
+    copiedTimer = undefined
   }
 }
 
@@ -864,6 +923,12 @@ html[data-theme='dark'] .content-copy-primary-action:not(:disabled) {
   gap: 7px;
 }
 
+.content-copy-actions .settings-action.copy-confirmed {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-soft) 64%, var(--bg-surface));
+  color: var(--accent-strong);
+}
+
 .content-copy-progress-bar {
   width: 42%;
   animation: content-copy-progress 1.2s ease-in-out infinite alternate;
@@ -945,7 +1010,7 @@ html[data-theme='dark'] .content-copy-overview {
   width: 32px;
   height: 32px;
   border: 1px solid var(--hairline);
-  border-radius: 10px;
+  border-radius: 9px;
   background: rgba(255, 255, 255, 0.2);
   color: var(--text-muted);
   cursor: pointer;
@@ -963,6 +1028,13 @@ html[data-theme='dark'] .content-copy-icon-button {
   border-color: color-mix(in srgb, var(--accent) 36%, var(--hairline));
   background: var(--bg-surface-hover);
   color: var(--accent);
+}
+
+.content-copy-icon-button.copy-confirmed,
+.content-copy-copy-button.copy-confirmed {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--hairline));
+  background: color-mix(in srgb, var(--accent-soft) 68%, var(--bg-surface));
+  color: var(--accent-strong);
 }
 
 .content-copy-icon-button svg {
@@ -983,8 +1055,9 @@ html[data-theme='dark'] .content-copy-icon-button {
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.2);
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr);
+  grid-template-columns: 28px minmax(0, 1fr) auto;
   gap: 12px;
+  align-items: start;
   padding: 13px 14px;
 }
 
@@ -1004,6 +1077,10 @@ html[data-theme='dark'] .content-copy-title-item {
   font-size: 13px;
   font-weight: 900;
   line-height: 1;
+}
+
+.content-copy-title-body {
+  min-width: 0;
 }
 
 .content-copy-title-item h3 {
@@ -1027,6 +1104,45 @@ html[data-theme='dark'] .content-copy-title-item {
   margin-top: 5px;
 }
 
+.content-copy-copy-button {
+  min-width: 72px;
+  height: 32px;
+  border: 1px solid var(--hairline);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.2);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.15s;
+}
+
+html[data-theme='dark'] .content-copy-copy-button {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.content-copy-copy-button:hover {
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--hairline));
+  background: var(--bg-surface-hover);
+  color: var(--accent);
+}
+
+.content-copy-copy-button:active {
+  transform: translateY(1px);
+}
+
+.content-copy-copy-button svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
 .content-copy-cover-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1046,12 +1162,20 @@ html[data-theme='dark'] .content-copy-cover-item {
   background: rgba(0, 0, 0, 0.12);
 }
 
+.content-copy-cover-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
 .content-copy-cover-lines {
   min-height: 54px;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 5px;
+  min-width: 0;
 }
 
 .content-copy-cover-lines span {
@@ -1063,6 +1187,10 @@ html[data-theme='dark'] .content-copy-cover-item {
 
 .content-copy-cover-item p {
   margin-top: 10px;
+}
+
+.content-copy-cover-copy {
+  min-width: 72px;
 }
 
 .content-copy-description {
@@ -1168,6 +1296,15 @@ html[data-theme='dark'] .content-copy-comment {
 
   .content-copy-cover-lines span {
     font-size: 20px;
+  }
+
+  .content-copy-title-item {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .content-copy-title-copy {
+    grid-column: 2;
+    justify-self: start;
   }
 }
 </style>
