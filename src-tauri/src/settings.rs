@@ -429,6 +429,11 @@ pub fn import_ytdlp_cookies(
     store: tauri::State<'_, SettingsStore>,
     source_path: String,
 ) -> Result<YtdlpCookiesImportResult, String> {
+    let existing_cookies_path = store.load()?.ytdlp_cookies_path;
+    if !existing_cookies_path.trim().is_empty() {
+        return Err("请先移除已上传的 Cookies 文件，再上传新的 Cookies".to_string());
+    }
+
     let source_path = PathBuf::from(source_path);
     let source_path = fs::canonicalize(&source_path)
         .map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;

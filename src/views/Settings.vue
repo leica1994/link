@@ -496,7 +496,13 @@
               </div>
             </div>
             <div class="settings-action-group">
-              <button class="settings-action" type="button" :disabled="isYtdlpCookiesBusy" @click="selectYtdlpCookiesFile">
+              <button
+                v-if="!ytdlpCookiesPath"
+                class="settings-action"
+                type="button"
+                :disabled="isYtdlpCookiesBusy"
+                @click="selectYtdlpCookiesFile"
+              >
                 {{ isYtdlpCookiesBusy ? '处理中' : '选择文件' }}
               </button>
               <button
@@ -1918,6 +1924,11 @@ const selectYtdlpCookiesFile = async () => {
   }
 
   if (isYtdlpCookiesBusy.value) {
+    return
+  }
+
+  if (ytdlpCookiesPath.value) {
+    ytdlpCookiesError.value = '请先移除已上传的 Cookies 文件，再上传新的 Cookies'
     return
   }
 
