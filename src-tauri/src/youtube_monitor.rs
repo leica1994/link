@@ -365,38 +365,19 @@ fn run_ytdlp_refresh(
         read_latest_youtube_video_external_id(connection, &channel.id)
     })?;
     let is_incremental_refresh = latest_known_video_id.is_some();
-    let mut errors = Vec::new();
-    let attempt = ytdlp::youtube_client_strategies()
-        .iter()
-        .find_map(|strategy| {
-            match run_ytdlp_refresh_attempt(
+    let attempt = ytdlp::run_with_youtube_client_fallback(
+        "youtube_monitor_refresh",
+        "yt-dlp 检查失败",
+        log_session,
+        |strategy| {
+            run_ytdlp_refresh_attempt(
                 &channel.url,
                 latest_known_video_id.as_deref(),
                 config,
                 strategy,
-            ) {
-                Ok(attempt) => {
-                    ytdlp::log_attempt_success(log_session, "youtube_monitor_refresh", strategy);
-                    Some(Ok(attempt))
-                }
-                Err(error) => {
-                    ytdlp::log_attempt_failure(
-                        log_session,
-                        "youtube_monitor_refresh",
-                        strategy,
-                        &error,
-                    );
-                    errors.push((strategy.label.to_string(), error));
-                    None
-                }
-            }
-        })
-        .unwrap_or_else(|| {
-            Err(ytdlp::format_attempt_errors(
-                "yt-dlp 检查失败",
-                &errors,
-            ))
-        })?;
+            )
+        },
+    )?;
 
     if attempt.did_update_channel_metadata {
         if let Some(value) = attempt.first_metadata.as_ref() {

@@ -11,6 +11,7 @@ use crate::app_paths;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
 const LLM_SERVICES: [&str; 3] = ["openai", "openai-responses", "anthropic"];
+const MAX_YTDLP_COOKIES_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -447,6 +448,11 @@ pub fn import_ytdlp_cookies(
     if source_metadata.len() == 0 {
         return Err("Cookies 文件为空".to_string());
     }
+    if source_metadata.len() > MAX_YTDLP_COOKIES_FILE_BYTES {
+        return Err("Cookies 文件过大，请上传浏览器导出的 cookies.txt".to_string());
+    }
+
+    let cookies_bytes = read_validated_ytdlp_cookies(&source_path)?;
 
     let destination_path = app_paths::ytdlp_cookies_path()?;
     let should_copy = fs::canonicalize(&destination_path)
@@ -454,7 +460,7 @@ pub fn import_ytdlp_cookies(
         .unwrap_or(true);
 
     if should_copy {
-        fs::copy(&source_path, &destination_path)
+        fs::write(&destination_path, cookies_bytes)
             .map_err(|error| format!("无法保存 Cookies 文件: {error}"))?;
     }
 
@@ -1372,6 +1378,64 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+fn read_validated_ytdlp_cookies(path: &Path) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "Cookies 文件需要是 UTF-8 编码的 Netscape cookies.txt".to_string())?;
+
+    validate_netscape_cookies_text(&text)?;
+    Ok(normalize_cookie_line_endings(&text).into_bytes())
+}
+
+fn validate_netscape_cookies_text(text: &str) -> Result<(), String> {
+    if text.lines().any(is_netscape_cookie_row) {
+        Ok(())
+    } else {
+        Err("Cookies 文件格式无效，请上传 Netscape 格式的 cookies.txt".to_string())
+    }
+}
+
+fn is_netscape_cookie_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let comparable = trimmed.strip_prefix("#HttpOnly_").unwrap_or(trimmed);
+    if comparable.starts_with('#') {
+        return false;
+    }
+
+    let parts = trimmed.split('\t').collect::<Vec<_>>();
+    if parts.len() < 7 {
+        return false;
+    }
+
+    let domain = parts[0]
+        .strip_prefix("#HttpOnly_")
+        .unwrap_or(parts[0])
+        .trim();
+    let include_subdomains = parts[1].trim();
+    let path = parts[2].trim();
+    let secure = parts[3].trim();
+
+    !domain.is_empty()
+        && !path.is_empty()
+        && matches!(include_subdomains, "TRUE" | "FALSE")
+        && matches!(secure, "TRUE" | "FALSE")
+}
+
+fn normalize_cookie_line_endings(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+
+    #[cfg(target_os = "windows")]
+    let line_ending = "\r\n";
+    #[cfg(not(target_os = "windows"))]
+    let line_ending = "\n";
+
+    normalized.split('\n').collect::<Vec<_>>().join(line_ending)
+}
+
 fn upsert_setting(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
@@ -1389,4 +1453,31 @@ fn upsert_setting(
         .map_err(|error| format!("无法保存设置 {key}: {error}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_netscape_cookie_rows() {
+        let text =
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t2145916800\tSID\tvalue\n";
+
+        assert!(validate_netscape_cookies_text(text).is_ok());
+    }
+
+    #[test]
+    fn validates_http_only_netscape_cookie_rows() {
+        let text = "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t2145916800\t__Secure-1PSID\tvalue\n";
+
+        assert!(validate_netscape_cookies_text(text).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_netscape_cookie_text() {
+        let text = "SID=value; path=/; domain=.youtube.com";
+
+        assert!(validate_netscape_cookies_text(text).is_err());
+    }
 }

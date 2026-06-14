@@ -20,7 +20,7 @@ use crate::app_log::LogSession;
 use crate::app_paths;
 use crate::dubbing::delete_dubbing_task_by_id;
 use crate::settings::SettingsStore;
-use crate::ytdlp::{self, YoutubeClientStrategy};
+use crate::ytdlp::{self, YoutubeClientStrategy, YoutubeVideoFormatStrategy};
 
 const DETAIL_STATUS_PENDING: &str = "pending";
 const DETAIL_STATUS_LOADING: &str = "loading";
@@ -37,8 +37,6 @@ const DOWNLOAD_PROGRESS_ACTIVE: &str = "active";
 const DOWNLOAD_PROGRESS_DONE: &str = "done";
 const DOWNLOAD_PROGRESS_FAILED: &str = "failed";
 const YTDLP_PROGRESS_PREFIX: &str = "LINK_YTDLP_PROGRESS";
-const YTDLP_VIDEO_FORMAT_SELECTOR: &str = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
-const YTDLP_VIDEO_MERGE_OUTPUT_FORMATS: &str = "mp4/mkv";
 const YTDLP_DOWNLOAD_PROGRESS_TEMPLATE: &str =
     "download:LINK_YTDLP_PROGRESS\tdownload\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress._percent_str)s";
 const YTDLP_POSTPROCESS_PROGRESS_TEMPLATE: &str =
@@ -1202,37 +1200,36 @@ fn fetch_video_detail(
     config: &ytdlp::YtdlpConfig,
     log_session: Option<&LogSession>,
 ) -> Result<VideoDetail, String> {
-    let mut errors = Vec::new();
-    for strategy in ytdlp::youtube_client_strategies() {
-        let mut command = ytdlp::command(config);
-        command.args([
-            "--dump-single-json",
-            "--no-playlist",
-            "--skip-download",
-            "--ignore-no-formats-error",
-            "--no-warnings",
-            "--no-progress",
-        ]);
-        ytdlp::add_youtube_extractor_args(&mut command, strategy);
-        command.arg(url);
-        let output = command
-            .output()
-            .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
-
-        if output.status.success() {
-            ytdlp::log_attempt_success(log_session, "home_video_detail", strategy);
-            return parse_video_detail(&output.stdout, url, &config.proxy);
-        }
-
-        let error = ytdlp::stderr_or_default(&output.stderr, "yt-dlp 读取视频详情失败");
-        ytdlp::log_attempt_failure(log_session, "home_video_detail", strategy, &error);
-        errors.push((strategy.label.to_string(), error));
-    }
-
-    Err(ytdlp::format_attempt_errors(
+    ytdlp::run_with_youtube_client_fallback(
+        "home_video_detail",
         "yt-dlp 读取视频详情失败",
-        &errors,
-    ))
+        log_session,
+        |strategy| {
+            let mut command = ytdlp::command(config);
+            command.args([
+                "--dump-single-json",
+                "--no-playlist",
+                "--skip-download",
+                "--ignore-no-formats-error",
+                "--no-warnings",
+                "--no-progress",
+            ]);
+            ytdlp::add_youtube_extractor_args(&mut command, strategy);
+            command.arg(url);
+            let output = command
+                .output()
+                .map_err(|error| format!("无法启动 yt-dlp: {error}"))?;
+
+            if output.status.success() {
+                return parse_video_detail(&output.stdout, url, &config.proxy);
+            }
+
+            Err(ytdlp::stderr_or_default(
+                &output.stderr,
+                "yt-dlp 读取视频详情失败",
+            ))
+        },
+    )
 }
 
 fn parse_video_detail(output: &[u8], url: &str, proxy: &str) -> Result<VideoDetail, String> {
@@ -1363,24 +1360,14 @@ fn download_video_file(
     let output_template = videos_dir.join(format!("{prefix}.%(ext)s"));
     let output_template = output_template.to_string_lossy().to_string();
     progress.emit_active(8, "视频下载中");
-    run_download_with_youtube_fallback(
+    run_video_download_with_youtube_fallback(
         config,
         progress,
         "home_video_download",
         "yt-dlp 下载视频失败",
         log_session,
         |command, strategy| {
-            command.args([
-                "--no-playlist",
-                "--no-warnings",
-                "--check-formats",
-                "-f",
-                YTDLP_VIDEO_FORMAT_SELECTOR,
-                "--merge-output-format",
-                YTDLP_VIDEO_MERGE_OUTPUT_FORMATS,
-                "-o",
-                &output_template,
-            ]);
+            command.args(["--no-playlist", "--no-warnings", "-o", &output_template]);
             ytdlp::add_youtube_extractor_args(command, strategy);
             if task.downloaded_video.is_some() {
                 command.arg("--force-overwrites");
@@ -1439,18 +1426,56 @@ fn run_download_with_youtube_fallback<F>(
 where
     F: FnMut(&mut Command, &YoutubeClientStrategy),
 {
-    let mut errors = Vec::new();
-    for strategy in ytdlp::youtube_client_strategies() {
+    ytdlp::run_with_youtube_client_fallback(operation, failure_message, log_session, |strategy| {
         let mut command = ytdlp::command(config);
         configure(&mut command, strategy);
-        match run_ytdlp_download_command(&mut command, progress, failure_message) {
-            Ok(()) => {
-                ytdlp::log_attempt_success(log_session, operation, strategy);
-                return Ok(());
-            }
-            Err(error) => {
-                ytdlp::log_attempt_failure(log_session, operation, strategy, &error);
-                errors.push((strategy.label.to_string(), error));
+        run_ytdlp_download_command(&mut command, progress, failure_message)
+    })
+}
+
+fn run_video_download_with_youtube_fallback<F>(
+    config: &ytdlp::YtdlpConfig,
+    progress: &DownloadProgressEmitter,
+    operation: &str,
+    failure_message: &str,
+    log_session: Option<&LogSession>,
+    mut configure: F,
+) -> Result<(), String>
+where
+    F: FnMut(&mut Command, &YoutubeClientStrategy),
+{
+    let mut errors = Vec::new();
+    for strategy in ytdlp::youtube_client_strategies() {
+        for format_strategy in ytdlp::youtube_video_format_strategies() {
+            let mut command = ytdlp::command(config);
+            ytdlp::add_youtube_video_format_args(&mut command, format_strategy);
+            configure(&mut command, strategy);
+            let attempt_label = format!("{} / {}", strategy.label, format_strategy.label);
+            progress.emit_active(
+                8,
+                &format!("视频下载中 · {}", format_strategy_label(format_strategy)),
+            );
+
+            match run_ytdlp_download_command(&mut command, progress, failure_message) {
+                Ok(()) => {
+                    ytdlp::log_attempt_success_with_profile(
+                        log_session,
+                        operation,
+                        strategy,
+                        Some(format_strategy.label),
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    ytdlp::log_attempt_failure_with_profile(
+                        log_session,
+                        operation,
+                        strategy,
+                        Some(format_strategy.label),
+                        &error,
+                    );
+                    errors.push((attempt_label, error));
+                }
             }
         }
     }
@@ -1506,6 +1531,16 @@ fn run_ytdlp_download_command(
     }
 
     Ok(())
+}
+
+fn format_strategy_label(strategy: &YoutubeVideoFormatStrategy) -> &'static str {
+    match strategy.label {
+        "preferred_mp4" => "优先 MP4",
+        "flexible_best" => "自动选择",
+        "single_best" => "单文件兼容",
+        "yt_dlp_default" => "默认策略",
+        _ => "兼容策略",
+    }
 }
 
 fn spawn_output_reader<R: Read + Send + 'static>(
