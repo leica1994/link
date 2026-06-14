@@ -122,9 +122,9 @@ pub fn status() -> YtdlpStatus {
                 is_available: true,
                 version: version.clone(),
                 message: if version.is_empty() {
-                    "yt-dlp 可用 · 忽略全局配置".to_string()
+                    "yt-dlp 可用".to_string()
                 } else {
-                    format!("yt-dlp {version} · 忽略全局配置")
+                    format!("yt-dlp {version}")
                 },
                 resolved_path,
                 config_policy: CONFIG_POLICY_IGNORE.to_string(),
