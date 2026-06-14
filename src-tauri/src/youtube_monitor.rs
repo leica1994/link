@@ -814,9 +814,7 @@ fn read_youtube_channels(connection: &rusqlite::Connection) -> Result<Vec<Youtub
                      LIMIT 1
                    )
             FROM youtube_channels
-            ORDER BY
-              CASE status WHEN 'checking' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END,
-              datetime(created_at) DESC
+            ORDER BY datetime(created_at) ASC, id ASC
             ",
         )
         .map_err(|error| format!("无法读取监控博主: {error}"))?;
