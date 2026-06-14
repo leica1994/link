@@ -2514,13 +2514,15 @@ const addTaskFromInput = async () => {
     })
     upsertTask(task)
     draftUrl.value = ''
-    closeAddDialog()
     await router.push({ name: 'HomeTaskDetail', params: { taskId: task.id } })
     maybeAutoRefreshActiveTask()
   } catch (error) {
     addError.value = stringifyError(error, '添加待办任务失败')
   } finally {
     isAddingTask.value = false
+    if (!addError.value) {
+      closeAddDialog()
+    }
   }
 }
 
