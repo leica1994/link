@@ -664,6 +664,9 @@ type SubtitleTranslationStageProgress = {
   postTranslationOptimization?: TranscriptionProgressStage
 }
 
+const subtitleTranslationStageKeys = ['subtitleTranslation', 'postTranslationOptimization'] as const
+type SubtitleTranslationStageKey = (typeof subtitleTranslationStageKeys)[number]
+
 type SubtitlePreviewResult = {
   segments: TranscriptionSegment[]
 }
@@ -909,8 +912,8 @@ const currentTranslationStage = computed(() => {
   const stages = visibleTranslationStages.value
   return (
     [...stages].reverse().find((stage) => stage.status === 'active') ??
-    [...stages].reverse().find((stage) => stage.status === 'pending') ??
     [...stages].reverse().find((stage) => stage.status === 'failed') ??
+    [...stages].reverse().find((stage) => stage.status === 'pending') ??
     [...stages].reverse().find((stage) => stage.status === 'done') ??
     null
   )
@@ -1307,25 +1310,68 @@ const markTranslationStageProgressDone = (
     : undefined,
 })
 
-const markActiveTranslationStageFailed = (
+const findTranslationStageKey = (
   stages: SubtitleTranslationStageProgress,
-): SubtitleTranslationStageProgress => ({
-  subtitleTranslation: stages.subtitleTranslation
-    ? {
-        ...stages.subtitleTranslation,
-        status: stages.subtitleTranslation.status === 'active' ? 'failed' : stages.subtitleTranslation.status,
-      }
-    : undefined,
-  postTranslationOptimization: stages.postTranslationOptimization
-    ? {
-        ...stages.postTranslationOptimization,
-        status:
-          stages.postTranslationOptimization.status === 'active'
-            ? 'failed'
-            : stages.postTranslationOptimization.status,
-      }
-    : undefined,
-})
+  predicate: (stage: TranscriptionProgressStage | undefined) => boolean,
+): SubtitleTranslationStageKey | undefined => {
+  return subtitleTranslationStageKeys.find((key) => predicate(stages[key]))
+}
+
+const findLastTranslationStageKey = (
+  stages: SubtitleTranslationStageProgress,
+  predicate: (stage: TranscriptionProgressStage | undefined) => boolean,
+): SubtitleTranslationStageKey | undefined => {
+  return [...subtitleTranslationStageKeys].reverse().find((key) => predicate(stages[key]))
+}
+
+const markTranslationStageProgressFailed = (
+  stages: SubtitleTranslationStageProgress,
+  message = '处理失败',
+): SubtitleTranslationStageProgress => {
+  const failedStageKey =
+    findTranslationStageKey(stages, (stage) => stage?.status === 'active') ??
+    findTranslationStageKey(stages, (stage) => stage?.status === 'failed') ??
+    findLastTranslationStageKey(stages, (stage) =>
+      Boolean(stage && (stage.status === 'done' || clampProgress(stage.progress) > 0)),
+    ) ??
+    findTranslationStageKey(stages, (stage) => stage?.status === 'pending') ??
+    findTranslationStageKey(stages, (stage) => Boolean(stage))
+
+  const markStage = (key: SubtitleTranslationStageKey) => {
+    const stage = stages[key]
+    if (!stage) {
+      return undefined
+    }
+
+    if (key !== failedStageKey) {
+      return stage
+    }
+
+    return {
+      ...stage,
+      progress: stage.status === 'pending' ? 0 : clampProgress(stage.progress),
+      status: 'failed' as TranscriptionStageStatus,
+      message,
+    }
+  }
+
+  return {
+    subtitleTranslation: markStage('subtitleTranslation'),
+    postTranslationOptimization: markStage('postTranslationOptimization'),
+  }
+}
+
+const isHardSubtitleTranslationFailure = (message: string) => {
+  return message.includes('字幕翻译全部失败') || message.startsWith('字幕翻译失败：')
+}
+
+const filterTranslationWarningsAfterError = (warnings: string[], errorMessage: string) => {
+  if (!isHardSubtitleTranslationFailure(errorMessage)) {
+    return warnings
+  }
+
+  return warnings.filter((warning) => !warning.startsWith('字幕翻译部分失败'))
+}
 
 const loadSubtitlePreview = async (path: string) => {
   if (!isTauriRuntime()) {
@@ -1518,9 +1564,11 @@ const startTranslationProcessing = async () => {
     translationMessage.value = `处理完成 · ${result.translatedSegments.length} 条字幕`
   } catch (error) {
     if (activeTranslationRunId.value === runId) {
-      translationError.value = stringifyError(error)
+      const errorMessage = stringifyError(error)
+      translationError.value = errorMessage
       translationMessage.value = '处理失败'
-      translationStageProgress.value = markActiveTranslationStageFailed(translationStageProgress.value)
+      translationWarnings.value = filterTranslationWarningsAfterError(translationWarnings.value, errorMessage)
+      translationStageProgress.value = markTranslationStageProgressFailed(translationStageProgress.value, errorMessage)
     }
   } finally {
     if (activeTranslationRunId.value === runId) {

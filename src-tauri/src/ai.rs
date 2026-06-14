@@ -159,6 +159,11 @@ impl AiService {
         self.send_chat(service, config, &request, None).await
     }
 
+    pub(crate) fn validate_selected_llm_config(settings: &AppSettings) -> Result<(), String> {
+        let (_, config) = selected_llm_config(settings)?;
+        validate_llm_config(config)
+    }
+
     async fn chat_for_connection_check(
         &self,
         settings: &AppSettings,

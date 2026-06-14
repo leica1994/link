@@ -275,6 +275,23 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
             ));
         }
 
+        if let Err(error) = AiService::validate_selected_llm_config(&settings) {
+            let message = format!("字幕翻译失败：{error}");
+            workflow_progress.set_stage(
+                TranslationProgressStage::SubtitleTranslation,
+                0,
+                &message,
+                "failed",
+            );
+            emitter.emit(&message, &source_segments, &translated_segments, &warnings);
+            log_session.warn(
+                "subtitle_translation_config_invalid",
+                "字幕翻译 LLM 配置无效",
+                json!({ "error": &error }),
+            );
+            return Err(message);
+        }
+
         workflow_progress.set_stage(
             TranslationProgressStage::SubtitleTranslation,
             0,
@@ -294,10 +311,9 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
             &log_session,
             &source_segments,
             translated_segments,
-            |progress, message, snapshot, snapshot_warnings| {
+            |progress, message, status, snapshot, snapshot_warnings| {
                 let mut combined_warnings = warnings.clone();
                 combined_warnings.extend(snapshot_warnings.iter().cloned());
-                let status = if progress >= 100 { "done" } else { "active" };
                 workflow_progress.set_stage(
                     TranslationProgressStage::SubtitleTranslation,
                     progress,
@@ -343,10 +359,9 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
                 &log_session,
                 &source_segments,
                 translated_segments,
-                |progress, message, snapshot, snapshot_warnings| {
+                |progress, message, status, snapshot, snapshot_warnings| {
                     let mut combined_warnings = warnings.clone();
                     combined_warnings.extend(snapshot_warnings.iter().cloned());
-                    let status = if progress >= 100 { "done" } else { "active" };
                     workflow_progress.set_stage(
                         TranslationProgressStage::PostTranslationOptimization,
                         progress,
@@ -597,7 +612,7 @@ async fn translate_subtitles<F>(
     mut report: F,
 ) -> Result<SubtitleProcessingResult, String>
 where
-    F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
+    F: FnMut(u8, &str, &str, &[TranscriptionSegment], &[String]),
 {
     let chunks = build_translation_chunks(
         source_segments,
@@ -647,7 +662,13 @@ where
         ));
         next_chunk_index += 1;
     }
-    report(0, "AI 字幕翻译中", &translated_segments, &warnings);
+    report(
+        0,
+        "AI 字幕翻译中",
+        "active",
+        &translated_segments,
+        &warnings,
+    );
 
     let mut completed = 0usize;
     while let Some(result) = futures.next().await {
@@ -706,14 +727,29 @@ where
             next_chunk_index += 1;
         }
 
-        warnings = build_processing_warnings("字幕翻译", failed_chunks, "翻译批次");
         let progress = stage_progress(0, 100, completed, total);
+        if completed == total && failed_chunks == total {
+            let message = "字幕翻译全部失败，请检查 LLM 配置、网络或模型响应格式";
+            log_session.error(
+                "subtitle_translation_stage_failed",
+                "AI 字幕翻译全部失败",
+                json!({
+                    "failedChunkCount": failed_chunks,
+                    "chunkCount": total,
+                }),
+            );
+            report(progress, message, "failed", &translated_segments, &[]);
+            return Err(message.to_string());
+        }
+
+        warnings = build_processing_warnings("字幕翻译", failed_chunks, "翻译批次");
         let message = if completed == total {
             "字幕翻译完成"
         } else {
             "字幕翻译中"
         };
-        report(progress, message, &translated_segments, &warnings);
+        let status = if completed == total { "done" } else { "active" };
+        report(progress, message, status, &translated_segments, &warnings);
     }
 
     if failed_chunks == total {
@@ -746,7 +782,7 @@ async fn optimize_translated_subtitles<F>(
     mut report: F,
 ) -> SubtitleProcessingResult
 where
-    F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
+    F: FnMut(u8, &str, &str, &[TranscriptionSegment], &[String]),
 {
     let chunks = build_text_chunks(
         &translated_segments,
@@ -804,7 +840,13 @@ where
         ));
         next_chunk_index += 1;
     }
-    report(0, "AI 译后优化中", &translated_segments, &warnings);
+    report(
+        0,
+        "AI 译后优化中",
+        "active",
+        &translated_segments,
+        &warnings,
+    );
 
     let mut completed = 0usize;
     while let Some(result) = futures.next().await {
@@ -874,7 +916,8 @@ where
         } else {
             "译后优化中"
         };
-        report(progress, message, &translated_segments, &warnings);
+        let status = if completed == total { "done" } else { "active" };
+        report(progress, message, status, &translated_segments, &warnings);
     }
 
     if failed_chunks > 0 {
