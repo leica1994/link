@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use rusqlite::{params, OptionalExtension, Row};
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
@@ -70,7 +70,6 @@ pub struct HomeVideoTask {
     pub detail_checked_at: Option<String>,
     pub downloaded_subtitles: Vec<HomeVideoSubtitle>,
     pub downloaded_video: Option<HomeVideoDownload>,
-    pub partial_video_download: Option<HomePartialVideoDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,14 +108,6 @@ pub struct HomeVideoDownload {
     pub file_size: i64,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HomePartialVideoDownload {
-    pub file_count: usize,
-    pub file_size: i64,
-    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -760,8 +751,6 @@ fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVi
         let mut task = row.map_err(|error| format!("无法解析待办任务: {error}"))?;
         task.downloaded_subtitles = read_home_video_subtitles(connection, &task.id)?;
         task.downloaded_video = read_home_video_download(connection, &task.id)?;
-        task.partial_video_download =
-            read_home_partial_video_download(&task.id, task.downloaded_video.as_ref())?;
         tasks.push(task);
     }
 
@@ -791,8 +780,6 @@ pub(crate) fn read_home_video_task_by_id(
         .ok_or_else(|| "未找到待办任务".to_string())?;
     task.downloaded_subtitles = read_home_video_subtitles(connection, &task.id)?;
     task.downloaded_video = read_home_video_download(connection, &task.id)?;
-    task.partial_video_download =
-        read_home_partial_video_download(&task.id, task.downloaded_video.as_ref())?;
     Ok(task)
 }
 
@@ -920,7 +907,6 @@ fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {
         detail_checked_at: row.get(22)?,
         downloaded_subtitles: Vec::new(),
         downloaded_video: None,
-        partial_video_download: None,
     })
 }
 
@@ -991,64 +977,6 @@ fn read_home_video_download(
         )
         .optional()
         .map_err(|error| format!("无法读取视频下载记录: {error}"))
-}
-
-fn read_home_partial_video_download(
-    task_id: &str,
-    downloaded_video: Option<&HomeVideoDownload>,
-) -> Result<Option<HomePartialVideoDownload>, String> {
-    if downloaded_video.is_some() {
-        return Ok(None);
-    }
-
-    let videos_dir = app_paths::youtube_task_dir(task_id)?.join("videos");
-    let prefix = home_video_prefix(task_id);
-    scan_partial_video_download(&videos_dir, &prefix)
-}
-
-fn scan_partial_video_download(
-    dir: &Path,
-    prefix: &str,
-) -> Result<Option<HomePartialVideoDownload>, String> {
-    if !dir.exists() {
-        return Ok(None);
-    }
-
-    let mut file_count = 0_usize;
-    let mut file_size = 0_u64;
-    let mut updated_at: Option<SystemTime> = None;
-
-    for entry in fs::read_dir(dir).map_err(|error| format!("无法读取视频目录: {error}"))? {
-        let entry = entry.map_err(|error| format!("无法读取视频文件: {error}"))?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !path.is_file() || !is_partial_video_download_file_name(name, prefix) {
-            continue;
-        }
-
-        let metadata =
-            fs::metadata(&path).map_err(|error| format!("无法读取未完成视频文件: {error}"))?;
-        file_count += 1;
-        file_size = file_size.saturating_add(metadata.len());
-        if let Ok(modified_at) = metadata.modified() {
-            updated_at = match updated_at {
-                Some(current) if current >= modified_at => Some(current),
-                _ => Some(modified_at),
-            };
-        }
-    }
-
-    if file_count == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(HomePartialVideoDownload {
-        file_count,
-        file_size: file_size.min(i64::MAX as u64) as i64,
-        updated_at: updated_at.map(|value| DateTime::<Utc>::from(value).to_rfc3339()),
-    }))
 }
 
 fn upsert_home_video_subtitle(
@@ -2020,15 +1948,6 @@ fn home_video_prefix(task_id: &str) -> String {
     format!("{}.video", sanitize_file_segment(task_id))
 }
 
-fn is_partial_video_download_file_name(name: &str, prefix: &str) -> bool {
-    if !name.starts_with(prefix) {
-        return false;
-    }
-
-    let name = name.to_ascii_lowercase();
-    name.ends_with(".part") || name.ends_with(".ytdl") || name.contains(".part-")
-}
-
 fn sanitize_file_segment(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -2107,50 +2026,6 @@ fn first_non_empty(values: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn recognizes_yt_dlp_partial_video_files() {
-        let prefix = "task.video";
-
-        assert!(is_partial_video_download_file_name(
-            "task.video.f399.mp4.part",
-            prefix
-        ));
-        assert!(is_partial_video_download_file_name(
-            "task.video.f399.mp4.part-Frag12",
-            prefix
-        ));
-        assert!(is_partial_video_download_file_name(
-            "task.video.f399.mp4.ytdl",
-            prefix
-        ));
-        assert!(!is_partial_video_download_file_name(
-            "task.video.mp4",
-            prefix
-        ));
-        assert!(!is_partial_video_download_file_name(
-            "other.video.f399.mp4.part",
-            prefix
-        ));
-    }
-
-    #[test]
-    fn scans_partial_video_download_summary() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        fs::write(dir.path().join("task.video.f399.mp4.part"), vec![0_u8; 10]).expect("write part");
-        fs::write(dir.path().join("task.video.f140.m4a.ytdl"), b"12345").expect("write ytdl");
-        fs::write(dir.path().join("task.video.mp4"), vec![0_u8; 100]).expect("write final");
-        fs::write(dir.path().join("other.video.f399.mp4.part"), vec![0_u8; 7])
-            .expect("write other");
-
-        let partial = scan_partial_video_download(dir.path(), "task.video")
-            .expect("scan partial")
-            .expect("partial summary");
-
-        assert_eq!(partial.file_count, 2);
-        assert_eq!(partial.file_size, 15);
-        assert!(partial.updated_at.is_some());
-    }
 
     #[test]
     fn compact_error_prefers_relevant_yt_dlp_errors() {

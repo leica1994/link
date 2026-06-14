@@ -272,7 +272,6 @@
                 class="home-video-download-strip"
                 :class="{
                   downloaded: Boolean(activeTask.downloadedVideo),
-                  partial: hasPartialVideoDownload,
                 }"
               >
                 <span class="home-video-download-copy">
@@ -280,16 +279,9 @@
                     <Video :stroke-width="2.1" aria-hidden="true" />
                     <span>视频文件</span>
                     <span v-if="activeTask.downloadedVideo" class="youtube-video-status unread">已下载</span>
-                    <span v-else-if="hasPartialVideoDownload" class="youtube-video-status checking">未完成</span>
                   </span>
-                  <span class="home-video-download-meta">
+                  <span v-if="videoDownloadMeta" class="home-video-download-meta">
                     {{ videoDownloadMeta }}
-                  </span>
-                  <span
-                    v-if="isActiveTaskDownloadingVideo && videoDownloadProgressMessage"
-                    class="home-download-progress-message"
-                  >
-                    {{ videoDownloadProgressMessage }}
                   </span>
                 </span>
 
@@ -341,6 +333,12 @@
                 aria-valuemin="0"
                 aria-valuemax="100"
               >
+                <div class="home-download-progress-copy">
+                  <span class="home-download-progress-label">{{ videoDownloadProgressMessage }}</span>
+                  <span v-if="videoDownloadProgressSize" class="home-download-progress-size">
+                    已下载 {{ videoDownloadProgressSize }}
+                  </span>
+                </div>
                 <div class="translate-progress-track">
                   <span class="translate-progress-bar" :style="{ width: `${videoDownloadProgressValue}%` }" />
                 </div>
@@ -440,7 +438,7 @@
                     aria-valuemax="100"
                   >
                     <div class="home-download-progress-copy">
-                      <span>{{ subtitleDownloadProgressMessage(option) }}</span>
+                      <span class="home-download-progress-label">{{ subtitleDownloadProgressMessage(option) }}</span>
                     </div>
                     <div class="translate-progress-track">
                       <span
@@ -1483,12 +1481,6 @@ type HomeVideoDownload = {
   updatedAt: string
 }
 
-type HomePartialVideoDownload = {
-  fileCount: number
-  fileSize: number
-  updatedAt?: string | null
-}
-
 type HomeVideoDownloadProgress = {
   taskId: string
   kind: DownloadProgressKind
@@ -1528,7 +1520,6 @@ type HomeVideoTask = {
   detailCheckedAt?: string | null
   downloadedSubtitles: HomeVideoSubtitle[]
   downloadedVideo?: HomeVideoDownload | null
-  partialVideoDownload?: HomePartialVideoDownload | null
 }
 
 type HomeWorkbenchOptions = {
@@ -1886,17 +1877,7 @@ const subtitleEmptyText = computed(() => {
 const videoDownloadMeta = computed(() => {
   const video = activeTask.value?.downloadedVideo
   if (!video) {
-    const partial = partialVideoDownload.value
-    if (partial) {
-      const pieces = [
-        '未完成',
-        `已保留 ${formatFileSize(partial.fileSize)}`,
-        partial.updatedAt ? formatDateTime(partial.updatedAt) : '',
-      ].filter(Boolean)
-      return pieces.join(' · ')
-    }
-
-    return '尚未下载'
+    return isActiveTaskDownloadingVideo.value ? '' : '尚未下载'
   }
 
   const pieces = [
@@ -1907,16 +1888,6 @@ const videoDownloadMeta = computed(() => {
   return pieces.join(' · ')
 })
 
-const partialVideoDownload = computed(() => {
-  if (activeTask.value?.downloadedVideo) {
-    return null
-  }
-
-  return activeTask.value?.partialVideoDownload ?? null
-})
-
-const hasPartialVideoDownload = computed(() => Boolean(partialVideoDownload.value))
-
 const isActiveTaskDownloadingVideo = computed(() => {
   const taskId = activeTask.value?.id
   return Boolean(taskId && isVideoTaskDownloading(taskId))
@@ -1925,9 +1896,6 @@ const isActiveTaskDownloadingVideo = computed(() => {
 const videoActionLabel = computed(() => {
   if (isActiveTaskDownloadingVideo.value) {
     return '下载中'
-  }
-  if (hasPartialVideoDownload.value) {
-    return '继续下载'
   }
   if (activeTask.value?.downloadedVideo) {
     return '重新下载'
@@ -1961,6 +1929,10 @@ const videoDownloadProgressValue = computed(() => {
 
 const videoDownloadProgressMessage = computed(() => {
   return videoDownloadProgress.value?.message || (isActiveTaskDownloadingVideo.value ? '视频下载中' : '')
+})
+
+const videoDownloadProgressSize = computed(() => {
+  return formatDownloadSizeProgress(videoDownloadProgress.value)
 })
 
 const subtitleError = computed(() => activeTaskScopedError(subtitleErrorsByTaskId))
@@ -2808,7 +2780,6 @@ const downloadVideo = async () => {
     return
   }
 
-  const isContinuing = hasPartialVideoDownload.value
   const taskId = task.id
   setVideoTaskDownloading(taskId, true)
   setDownloadProgress({
@@ -2817,7 +2788,7 @@ const downloadVideo = async () => {
     key: 'video',
     progress: 2,
     status: 'active',
-    message: isContinuing ? '准备继续下载视频' : '准备下载视频',
+    message: '准备下载视频',
   })
   clearTaskError(videoErrorsByTaskId, taskId)
 
@@ -3755,6 +3726,30 @@ const formatDateTime = (value?: string | null) => {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+const normalizeByteCount = (value?: number | null) => {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+const formatDownloadByteSize = (value: number) => {
+  const safeValue = normalizeByteCount(value)
+  return safeValue > 0 ? formatFileSize(safeValue) : '0 B'
+}
+
+const formatDownloadSizeProgress = (progress: HomeVideoDownloadProgress | null) => {
+  const downloaded = normalizeByteCount(progress?.downloadedBytes)
+  const total = normalizeByteCount(progress?.totalBytes)
+
+  if (downloaded <= 0 && total <= 0) {
+    return ''
+  }
+
+  if (total > 0) {
+    return `${formatDownloadByteSize(downloaded)} / ${formatDownloadByteSize(total)}`
+  }
+
+  return `${formatDownloadByteSize(downloaded)} / 计算中`
 }
 
 const formatFileSize = (value: number) => {
