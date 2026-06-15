@@ -486,36 +486,6 @@
               aria-label="yt-dlp 代理"
             />
           </div>
-
-          <div class="setting-row">
-            <FileText class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
-            <div class="setting-copy">
-              <div class="setting-title">Cookies 文件</div>
-              <div class="setting-subtitle" :class="{ 'setting-subtitle-error': Boolean(ytdlpCookiesError) }">
-                {{ ytdlpCookiesSubtitle }}
-              </div>
-            </div>
-            <div class="settings-action-group">
-              <button
-                v-if="!ytdlpCookiesPath"
-                class="settings-action"
-                type="button"
-                :disabled="isYtdlpCookiesBusy"
-                @click="selectYtdlpCookiesFile"
-              >
-                {{ isYtdlpCookiesBusy ? '处理中' : '选择文件' }}
-              </button>
-              <button
-                v-if="ytdlpCookiesPath"
-                class="settings-action danger"
-                type="button"
-                :disabled="isYtdlpCookiesBusy"
-                @click="clearYtdlpCookies"
-              >
-                移除
-              </button>
-            </div>
-          </div>
         </div>
       </section>
 
@@ -861,7 +831,6 @@ import {
   Eye,
   EyeOff,
   FileMusic,
-  FileText,
   Film,
   FolderOpen,
   Gauge,
@@ -987,7 +956,6 @@ type AppSettings = {
   homeWorkbenchDubbingEnabled: boolean
   homeWorkbenchExportDir: string
   ytdlpProxy: string
-  ytdlpCookiesPath: string
 }
 
 type LlmConnectionCheckResult = {
@@ -998,10 +966,6 @@ type LlmConnectionCheckResult = {
 }
 
 type LlmConnectionStatus = 'idle' | 'success' | 'error'
-
-type YtdlpCookiesImportResult = {
-  cookiesPath: string
-}
 
 const languageDisplayNames = new Intl.DisplayNames(['zh-Hans'], { type: 'language' })
 
@@ -1421,7 +1385,6 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
   homeWorkbenchExportDir:
     typeof settings.homeWorkbenchExportDir === 'string' ? settings.homeWorkbenchExportDir : '',
   ytdlpProxy: typeof settings.ytdlpProxy === 'string' ? settings.ytdlpProxy : '',
-  ytdlpCookiesPath: typeof settings.ytdlpCookiesPath === 'string' ? settings.ytdlpCookiesPath : '',
 })
 
 const selectedTranscriptionModel = ref<TranscriptionModel>(TranscriptionModel.Bilibili)
@@ -1465,9 +1428,6 @@ const homeWorkbenchTranslationEnabled = ref(true)
 const homeWorkbenchDubbingEnabled = ref(false)
 const homeWorkbenchExportDir = ref('')
 const ytdlpProxy = ref('')
-const ytdlpCookiesPath = ref('')
-const ytdlpCookiesError = ref('')
-const isYtdlpCookiesBusy = ref(false)
 const logDirectoryError = ref('')
 const isSettingsLoaded = ref(false)
 let isApplyingStoredSettings = false
@@ -1475,7 +1435,6 @@ let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 const referenceAudioExtensions = ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma']
-const ytdlpCookiesExtensions = ['txt']
 
 const getCurrentLlmConfig = () => {
   return llmConfigs.value[selectedLlmService.value]
@@ -1572,18 +1531,6 @@ const homeWorkbenchExportDirLabel = computed(() => {
   return homeWorkbenchExportDir.value || '未选择时使用应用默认导出目录'
 })
 
-const ytdlpCookiesSubtitle = computed(() => {
-  if (ytdlpCookiesError.value) {
-    return ytdlpCookiesError.value
-  }
-
-  if (ytdlpCookiesPath.value) {
-    return `已上传：${fileNameFromPath(ytdlpCookiesPath.value)}`
-  }
-
-  return '未上传；上传后所有 yt-dlp 访问会自动使用该 Cookies'
-})
-
 const filteredTargetLanguageOptions = computed(() => {
   const query = targetLanguageSearch.value.trim().toLowerCase()
 
@@ -1625,7 +1572,6 @@ const createSettingsSnapshot = (): AppSettings => ({
   homeWorkbenchDubbingEnabled: homeWorkbenchDubbingEnabled.value,
   homeWorkbenchExportDir: homeWorkbenchExportDir.value.trim(),
   ytdlpProxy: ytdlpProxy.value.trim(),
-  ytdlpCookiesPath: ytdlpCookiesPath.value.trim(),
 })
 
 const applySettings = (settings: AppSettings) => {
@@ -1660,8 +1606,6 @@ const applySettings = (settings: AppSettings) => {
     settings.homeWorkbenchDubbingEnabled && settings.homeWorkbenchTranslationEnabled
   homeWorkbenchExportDir.value = settings.homeWorkbenchExportDir
   ytdlpProxy.value = settings.ytdlpProxy
-  ytdlpCookiesPath.value = settings.ytdlpCookiesPath
-  ytdlpCookiesError.value = ''
   resetLlmConnectionStatus()
 
   nextTick(() => {
@@ -1912,82 +1856,6 @@ const selectHomeWorkbenchExportDir = async () => {
 
   if (typeof selected === 'string') {
     homeWorkbenchExportDir.value = selected
-  }
-}
-
-const selectYtdlpCookiesFile = async () => {
-  ytdlpCookiesError.value = ''
-
-  if (!isTauriRuntime()) {
-    ytdlpCookiesError.value = '请在桌面应用中选择 Cookies 文件'
-    return
-  }
-
-  if (isYtdlpCookiesBusy.value) {
-    return
-  }
-
-  if (ytdlpCookiesPath.value) {
-    ytdlpCookiesError.value = '请先移除已上传的 Cookies 文件，再上传新的 Cookies'
-    return
-  }
-
-  let selected: string | string[] | null
-
-  try {
-    selected = await open({
-      title: '选择 Cookies 文件',
-      multiple: false,
-      filters: [
-        {
-          name: 'Cookies 文件',
-          extensions: ytdlpCookiesExtensions,
-        },
-      ],
-    })
-  } catch (error) {
-    ytdlpCookiesError.value = stringifyError(error, '选择 Cookies 文件失败')
-    return
-  }
-
-  if (typeof selected !== 'string') {
-    return
-  }
-
-  isYtdlpCookiesBusy.value = true
-
-  try {
-    await flushPendingSave()
-    const result = await invoke<YtdlpCookiesImportResult>('import_ytdlp_cookies', { sourcePath: selected })
-    ytdlpCookiesPath.value = result.cookiesPath
-  } catch (error) {
-    ytdlpCookiesError.value = stringifyError(error, '导入 Cookies 失败')
-  } finally {
-    isYtdlpCookiesBusy.value = false
-  }
-}
-
-const clearYtdlpCookies = async () => {
-  ytdlpCookiesError.value = ''
-
-  if (!isTauriRuntime()) {
-    ytdlpCookiesError.value = '请在桌面应用中移除 Cookies'
-    return
-  }
-
-  if (isYtdlpCookiesBusy.value) {
-    return
-  }
-
-  isYtdlpCookiesBusy.value = true
-
-  try {
-    await invoke('clear_ytdlp_cookies')
-    ytdlpCookiesPath.value = ''
-  } catch (error) {
-    ytdlpCookiesError.value = stringifyError(error, '移除 Cookies 失败')
-  } finally {
-    isYtdlpCookiesBusy.value = false
   }
 }
 

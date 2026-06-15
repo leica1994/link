@@ -1,8 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::AppHandle;
 
@@ -11,7 +9,6 @@ use crate::app_paths;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
 const LLM_SERVICES: [&str; 3] = ["openai", "openai-responses", "anthropic"];
-const MAX_YTDLP_COOKIES_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,13 +52,6 @@ pub struct AppSettings {
     pub home_workbench_dubbing_enabled: bool,
     pub home_workbench_export_dir: String,
     pub ytdlp_proxy: String,
-    pub ytdlp_cookies_path: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct YtdlpCookiesImportResult {
-    pub cookies_path: String,
 }
 
 pub struct SettingsStore {
@@ -194,7 +184,6 @@ impl SettingsStore {
                 "",
             ),
             ytdlp_proxy: read_string_setting(&setting_values, "ytdlp_proxy", ""),
-            ytdlp_cookies_path: read_string_setting(&setting_values, "ytdlp_cookies_path", ""),
         })
     }
 
@@ -227,22 +216,6 @@ impl SettingsStore {
             )
             .map(|_| ())
             .map_err(|error| format!("无法保存当前字幕样式: {error}"))
-    }
-
-    pub(crate) fn set_ytdlp_cookies_path(&self, cookies_path: &str) -> Result<(), String> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|error| format!("设置数据库锁定失败: {error}"))?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("无法开始保存 yt-dlp Cookies: {error}"))?;
-
-        upsert_setting(&transaction, "ytdlp_cookies_path", cookies_path)?;
-
-        transaction
-            .commit()
-            .map_err(|error| format!("无法提交 yt-dlp Cookies 设置: {error}"))
     }
 
     pub(crate) fn save(&self, settings: &AppSettings) -> Result<(), String> {
@@ -364,11 +337,6 @@ impl SettingsStore {
             &settings.home_workbench_export_dir,
         )?;
         upsert_setting(&transaction, "ytdlp_proxy", &settings.ytdlp_proxy)?;
-        upsert_setting(
-            &transaction,
-            "ytdlp_cookies_path",
-            &settings.ytdlp_cookies_path,
-        )?;
 
         for (service, config) in normalize_llm_configs(&settings.llm_configs) {
             transaction
@@ -425,64 +393,6 @@ pub fn save_settings(
     ai_service.update_thread_count(settings.translation_thread_count)
 }
 
-#[tauri::command]
-pub fn import_ytdlp_cookies(
-    store: tauri::State<'_, SettingsStore>,
-    source_path: String,
-) -> Result<YtdlpCookiesImportResult, String> {
-    let existing_cookies_path = store.load()?.ytdlp_cookies_path;
-    if !existing_cookies_path.trim().is_empty() {
-        return Err("请先移除已上传的 Cookies 文件，再上传新的 Cookies".to_string());
-    }
-
-    let source_path = PathBuf::from(source_path);
-    let source_path = fs::canonicalize(&source_path)
-        .map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;
-    let source_metadata =
-        fs::metadata(&source_path).map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;
-
-    if !source_metadata.is_file() {
-        return Err("Cookies 只能选择文件".to_string());
-    }
-
-    if source_metadata.len() == 0 {
-        return Err("Cookies 文件为空".to_string());
-    }
-    if source_metadata.len() > MAX_YTDLP_COOKIES_FILE_BYTES {
-        return Err("Cookies 文件过大，请上传浏览器导出的 cookies.txt".to_string());
-    }
-
-    let cookies_bytes = read_validated_ytdlp_cookies(&source_path)?;
-
-    let destination_path = app_paths::ytdlp_cookies_path()?;
-    let should_copy = fs::canonicalize(&destination_path)
-        .map(|existing_path| existing_path != source_path)
-        .unwrap_or(true);
-
-    if should_copy {
-        fs::write(&destination_path, cookies_bytes)
-            .map_err(|error| format!("无法保存 Cookies 文件: {error}"))?;
-    }
-
-    let cookies_path = path_to_string(&destination_path);
-    store.set_ytdlp_cookies_path(&cookies_path)?;
-
-    Ok(YtdlpCookiesImportResult { cookies_path })
-}
-
-#[tauri::command]
-pub fn clear_ytdlp_cookies(store: tauri::State<'_, SettingsStore>) -> Result<(), String> {
-    let cookies_path = app_paths::ytdlp_cookies_path()?;
-
-    match fs::remove_file(&cookies_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("无法移除 Cookies 文件: {error}")),
-    }
-
-    store.set_ytdlp_cookies_path("")
-}
-
 fn initialize_database(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -493,6 +403,9 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             );
+
+            DELETE FROM app_settings
+            WHERE key = 'ytdlp_cookies_path';
 
             CREATE TABLE IF NOT EXISTS llm_configs (
                 service TEXT PRIMARY KEY NOT NULL,
@@ -1387,68 +1300,6 @@ fn default_subtitle_style_id() -> String {
     "default".to_string()
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().to_string()
-}
-
-fn read_validated_ytdlp_cookies(path: &Path) -> Result<Vec<u8>, String> {
-    let bytes = fs::read(path).map_err(|error| format!("无法读取 Cookies 文件: {error}"))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| "Cookies 文件需要是 UTF-8 编码的 Netscape cookies.txt".to_string())?;
-
-    validate_netscape_cookies_text(&text)?;
-    Ok(normalize_cookie_line_endings(&text).into_bytes())
-}
-
-fn validate_netscape_cookies_text(text: &str) -> Result<(), String> {
-    if text.lines().any(is_netscape_cookie_row) {
-        Ok(())
-    } else {
-        Err("Cookies 文件格式无效，请上传 Netscape 格式的 cookies.txt".to_string())
-    }
-}
-
-fn is_netscape_cookie_row(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    let comparable = trimmed.strip_prefix("#HttpOnly_").unwrap_or(trimmed);
-    if comparable.starts_with('#') {
-        return false;
-    }
-
-    let parts = trimmed.split('\t').collect::<Vec<_>>();
-    if parts.len() < 7 {
-        return false;
-    }
-
-    let domain = parts[0]
-        .strip_prefix("#HttpOnly_")
-        .unwrap_or(parts[0])
-        .trim();
-    let include_subdomains = parts[1].trim();
-    let path = parts[2].trim();
-    let secure = parts[3].trim();
-
-    !domain.is_empty()
-        && !path.is_empty()
-        && matches!(include_subdomains, "TRUE" | "FALSE")
-        && matches!(secure, "TRUE" | "FALSE")
-}
-
-fn normalize_cookie_line_endings(text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-
-    #[cfg(target_os = "windows")]
-    let line_ending = "\r\n";
-    #[cfg(not(target_os = "windows"))]
-    let line_ending = "\n";
-
-    normalized.split('\n').collect::<Vec<_>>().join(line_ending)
-}
-
 fn upsert_setting(
     transaction: &rusqlite::Transaction<'_>,
     key: &str,
@@ -1466,31 +1317,4 @@ fn upsert_setting(
         .map_err(|error| format!("无法保存设置 {key}: {error}"))?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_netscape_cookie_rows() {
-        let text =
-            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t2145916800\tSID\tvalue\n";
-
-        assert!(validate_netscape_cookies_text(text).is_ok());
-    }
-
-    #[test]
-    fn validates_http_only_netscape_cookie_rows() {
-        let text = "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t2145916800\t__Secure-1PSID\tvalue\n";
-
-        assert!(validate_netscape_cookies_text(text).is_ok());
-    }
-
-    #[test]
-    fn rejects_non_netscape_cookie_text() {
-        let text = "SID=value; path=/; domain=.youtube.com";
-
-        assert!(validate_netscape_cookies_text(text).is_err());
-    }
 }

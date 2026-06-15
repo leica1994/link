@@ -91,7 +91,6 @@ export type AppSettings = {
   homeWorkbenchDubbingEnabled: boolean
   homeWorkbenchExportDir: string
   ytdlpProxy: string
-  ytdlpCookiesPath: string
 }
 
 export const transcriptionModelOptions = [
@@ -529,7 +528,6 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
   homeWorkbenchExportDir:
     typeof settings.homeWorkbenchExportDir === 'string' ? settings.homeWorkbenchExportDir : '',
   ytdlpProxy: typeof settings.ytdlpProxy === 'string' ? settings.ytdlpProxy : '',
-  ytdlpCookiesPath: typeof settings.ytdlpCookiesPath === 'string' ? settings.ytdlpCookiesPath : '',
 })
 
 export const getOptionLabel = <T extends string>(

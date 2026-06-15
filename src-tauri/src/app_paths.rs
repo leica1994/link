@@ -112,7 +112,3 @@ pub fn ytdlp_dir() -> Result<PathBuf, String> {
     fs::create_dir_all(&ytdlp_dir).map_err(|error| format!("无法创建 yt-dlp 缓存目录: {error}"))?;
     Ok(ytdlp_dir)
 }
-
-pub fn ytdlp_cookies_path() -> Result<PathBuf, String> {
-    Ok(ytdlp_dir()?.join("cookies.txt"))
-}

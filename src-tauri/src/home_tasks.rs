@@ -572,10 +572,7 @@ fn refresh_home_video_task_detail_blocking(
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
     let settings = store.load()?;
-    let ytdlp_config = ytdlp::YtdlpConfig::new(
-        settings.ytdlp_proxy.clone(),
-        settings.ytdlp_cookies_path.clone(),
-    );
+    let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let now = Utc::now().to_rfc3339();
     store.with_connection(|connection| {
         connection
@@ -703,10 +700,7 @@ pub(crate) fn download_home_video_task_subtitle_internal(
         .cloned()
         .ok_or_else(|| "未找到该字幕选项，请先读取视频详情".to_string())?;
     let settings = store.load()?;
-    let ytdlp_config = ytdlp::YtdlpConfig::new(
-        settings.ytdlp_proxy.clone(),
-        settings.ytdlp_cookies_path.clone(),
-    );
+    let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
     let subtitles_dir = task_dir.join("subtitles");
     fs::create_dir_all(&subtitles_dir).map_err(|error| format!("无法创建字幕目录: {error}"))?;
@@ -758,10 +752,7 @@ pub(crate) fn download_home_video_task_video_internal(
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
     let settings = store.load()?;
-    let ytdlp_config = ytdlp::YtdlpConfig::new(
-        settings.ytdlp_proxy.clone(),
-        settings.ytdlp_cookies_path.clone(),
-    );
+    let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
     let videos_dir = task_dir.join("videos");
     fs::create_dir_all(&videos_dir).map_err(|error| format!("无法创建视频目录: {error}"))?;
@@ -2463,7 +2454,7 @@ mod tests {
 
         assert_eq!(
             compact,
-            "YouTube 要求登录或人机验证，请更新 Cookies 后重试"
+            "YouTube 要求登录或人机验证，请确认代理可用或稍后重试"
         );
     }
 

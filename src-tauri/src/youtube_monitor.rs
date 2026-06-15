@@ -316,10 +316,7 @@ pub fn refresh_youtube_channel(
         read_youtube_channel_by_id(connection, &channel_id)
     })?;
     let settings = store.load()?;
-    let ytdlp_config = ytdlp::YtdlpConfig::new(
-        settings.ytdlp_proxy.clone(),
-        settings.ytdlp_cookies_path.clone(),
-    );
+    let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let run = create_refresh_run(&store, &channel.id)?;
     emit_refresh(&app, &run);
     std::mem::forget(guard);

@@ -44,14 +44,12 @@ pub struct YtdlpStatus {
 #[derive(Debug, Clone, Default)]
 pub struct YtdlpConfig {
     pub proxy: String,
-    pub cookies_path: String,
 }
 
 impl YtdlpConfig {
-    pub fn new(proxy: impl Into<String>, cookies_path: impl Into<String>) -> Self {
+    pub fn new(proxy: impl Into<String>) -> Self {
         Self {
             proxy: proxy.into(),
-            cookies_path: cookies_path.into(),
         }
     }
 }
@@ -148,11 +146,6 @@ pub fn command(config: &YtdlpConfig) -> Command {
     let proxy = config.proxy.trim();
     if !proxy.is_empty() {
         command.args(["--proxy", proxy]);
-    }
-
-    let cookies_path = config.cookies_path.trim();
-    if !cookies_path.is_empty() && Path::new(cookies_path).is_file() {
-        command.args(["--cookies", cookies_path]);
     }
 
     command.args([
@@ -345,8 +338,6 @@ fn attempt_error_priority(error: &str) -> u8 {
     let lower = error.to_ascii_lowercase();
     if lower.contains("sign in")
         || lower.contains("not a bot")
-        || lower.contains("cookies")
-        || lower.contains("cookie")
         || lower.contains("forbidden")
         || lower.contains("http error 403")
         || lower.contains("http error 429")
@@ -405,14 +396,14 @@ pub fn compact_error(error: &str) -> String {
         let lower = line.to_ascii_lowercase();
         lower.contains("sign in") && lower.contains("not a bot")
     }) {
-        return "YouTube 要求登录或人机验证，请更新 Cookies 后重试".to_string();
+        return "YouTube 要求登录或人机验证，请确认代理可用或稍后重试".to_string();
     }
 
     if lines.iter().any(|line| {
         line.to_ascii_lowercase()
             .contains("requested format is not available")
     }) {
-        return "当前视频没有返回可用下载格式，请确认 yt-dlp 已更新，并检查 Cookies/代理是否能访问该视频".to_string();
+        return "当前视频没有返回可用下载格式，请确认 yt-dlp 已更新，并检查代理是否能访问该视频".to_string();
     }
 
     if lines.iter().any(|line| {
@@ -531,7 +522,7 @@ mod tests {
 
     #[test]
     fn base_command_adds_proxy_when_configured() {
-        let command = command(&YtdlpConfig::new("http://127.0.0.1:7890", ""));
+        let command = command(&YtdlpConfig::new("http://127.0.0.1:7890"));
         let args = command_args(&command);
 
         assert!(args
@@ -540,20 +531,8 @@ mod tests {
     }
 
     #[test]
-    fn base_command_adds_cookies_when_cached_file_exists() {
-        let cookies_file = tempfile::NamedTempFile::new().expect("create cookies file");
-        let cookies_path = cookies_file.path().to_string_lossy().to_string();
-        let command = command(&YtdlpConfig::new("", &cookies_path));
-        let args = command_args(&command);
-
-        assert!(args
-            .windows(2)
-            .any(|pair| pair[0] == "--cookies" && pair[1] == cookies_path.as_str()));
-    }
-
-    #[test]
-    fn base_command_skips_missing_cookies_file() {
-        let command = command(&YtdlpConfig::new("", "missing-cookies.txt"));
+    fn base_command_never_adds_cookies_arg() {
+        let command = command(&YtdlpConfig::default());
         let args = command_args(&command);
 
         assert!(!args.iter().any(|arg| arg == "--cookies"));
