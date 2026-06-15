@@ -14,6 +14,7 @@ const CONFIG_POLICY_IGNORE: &str = "ignoreConfig";
 const YTDLP_SOCKET_TIMEOUT_SECONDS: &str = "30";
 const YOUTUBE_ACCEPT_LANGUAGE: &str = "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8";
 const YTDLP_MERGE_OUTPUT_FORMATS: &str = "mp4/mkv";
+const YTDLP_FINAL_VIDEO_FORMAT: &str = "mp4";
 
 #[derive(Debug, Clone, Copy)]
 pub struct YoutubeClientStrategy {
@@ -27,6 +28,7 @@ pub struct YoutubeVideoFormatStrategy {
     pub selector: Option<&'static str>,
     pub check_formats: bool,
     pub merge_output_format: Option<&'static str>,
+    pub recode_video_format: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,24 +85,28 @@ const YOUTUBE_VIDEO_FORMAT_STRATEGIES: [YoutubeVideoFormatStrategy; 4] = [
         selector: Some("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best[ext=mp4]"),
         check_formats: true,
         merge_output_format: Some(YTDLP_MERGE_OUTPUT_FORMATS),
+        recode_video_format: Some(YTDLP_FINAL_VIDEO_FORMAT),
     },
     YoutubeVideoFormatStrategy {
         label: "flexible_best",
         selector: Some("bv*+ba/bestvideo*+bestaudio/best"),
         check_formats: false,
         merge_output_format: Some(YTDLP_MERGE_OUTPUT_FORMATS),
+        recode_video_format: Some(YTDLP_FINAL_VIDEO_FORMAT),
     },
     YoutubeVideoFormatStrategy {
         label: "single_best",
         selector: Some("best/b"),
         check_formats: false,
         merge_output_format: Some(YTDLP_MERGE_OUTPUT_FORMATS),
+        recode_video_format: Some(YTDLP_FINAL_VIDEO_FORMAT),
     },
     YoutubeVideoFormatStrategy {
         label: "yt_dlp_default",
         selector: None,
         check_formats: false,
         merge_output_format: Some(YTDLP_MERGE_OUTPUT_FORMATS),
+        recode_video_format: Some(YTDLP_FINAL_VIDEO_FORMAT),
     },
 ];
 
@@ -125,6 +131,9 @@ pub fn add_youtube_video_format_args(command: &mut Command, strategy: &YoutubeVi
     }
     if let Some(format) = strategy.merge_output_format {
         command.args(["--merge-output-format", format]);
+    }
+    if let Some(format) = strategy.recode_video_format {
+        command.args(["--recode-video", format]);
     }
 }
 
@@ -587,6 +596,9 @@ mod tests {
         assert!(strategies[0].selector.is_some());
         assert_eq!(strategies.last().unwrap().label, "yt_dlp_default");
         assert!(strategies.last().unwrap().selector.is_none());
+        assert!(strategies
+            .iter()
+            .all(|strategy| strategy.recode_video_format == Some("mp4")));
     }
 
     #[test]
@@ -599,7 +611,12 @@ mod tests {
         let args = command_args(&command);
 
         assert!(!args.iter().any(|arg| arg == "-f"));
-        assert!(args.iter().any(|arg| arg == "--merge-output-format"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--merge-output-format" && pair[1] == "mp4/mkv"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--recode-video" && pair[1] == "mp4"));
     }
 
     #[test]

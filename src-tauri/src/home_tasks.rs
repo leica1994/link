@@ -2083,7 +2083,8 @@ fn find_subtitle_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
 }
 
 fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
-    let mut matches = Vec::new();
+    let mut mp4_matches = Vec::new();
+    let mut other_video_matches = Vec::new();
     for entry in fs::read_dir(dir).map_err(|error| format!("无法读取视频目录: {error}"))? {
         let entry = entry.map_err(|error| format!("无法读取视频文件: {error}"))?;
         let path = entry.path();
@@ -2091,23 +2092,38 @@ fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
             continue;
         };
         if name.starts_with(prefix) && path.is_file() && is_video_output_path(&path) {
-            matches.push(path);
+            if is_mp4_video_output_path(&path) {
+                mp4_matches.push(path);
+            } else {
+                other_video_matches.push(path);
+            }
         }
     }
+
+    if let Some(output) = best_video_output_match(mp4_matches, prefix) {
+        return Ok(output);
+    }
+
+    if !other_video_matches.is_empty() {
+        return Err("yt-dlp 未生成 MP4 视频文件，请确认 ffmpeg 可用后重试".to_string());
+    }
+
+    Err("yt-dlp 未生成视频文件".to_string())
+}
+
+fn best_video_output_match(mut matches: Vec<PathBuf>, prefix: &str) -> Option<PathBuf> {
     if let Some(final_path) = matches
         .iter()
         .find(|path| path.file_stem().and_then(|value| value.to_str()) == Some(prefix))
     {
-        return Ok(final_path.clone());
+        return Some(final_path.clone());
     }
     matches.sort_by_key(|path| {
         fs::metadata(path)
             .and_then(|metadata| metadata.modified())
             .ok()
     });
-    matches
-        .pop()
-        .ok_or_else(|| "yt-dlp 未生成视频文件".to_string())
+    matches.pop()
 }
 
 #[derive(Debug, Clone)]
@@ -2347,6 +2363,12 @@ fn is_video_output_path(path: &Path) -> bool {
     matches!(extension.as_str(), "mp4" | "mkv" | "webm" | "mov" | "m4v")
 }
 
+fn is_mp4_video_output_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+}
+
 fn home_video_prefix(task_id: &str) -> String {
     format!("{}.video", sanitize_file_segment(task_id))
 }
@@ -2441,7 +2463,33 @@ mod tests {
 
         assert_eq!(
             compact,
-            "ERROR: [youtube] abc: Sign in to confirm you are not a bot"
+            "YouTube 要求登录或人机验证，请更新 Cookies 后重试"
         );
+    }
+
+    #[test]
+    fn find_video_output_prefers_mp4_over_other_video_outputs() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let prefix = "task.video";
+        fs::write(dir.path().join(format!("{prefix}.webm")), b"old").expect("write webm");
+        fs::write(dir.path().join(format!("{prefix}.mp4")), b"new").expect("write mp4");
+
+        let output = find_video_output(dir.path(), prefix).expect("find video output");
+
+        assert_eq!(
+            output.extension().and_then(|value| value.to_str()),
+            Some("mp4")
+        );
+    }
+
+    #[test]
+    fn find_video_output_rejects_non_mp4_outputs() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let prefix = "task.video";
+        fs::write(dir.path().join(format!("{prefix}.mkv")), b"video").expect("write mkv");
+
+        let error = find_video_output(dir.path(), prefix).expect_err("reject non-mp4 output");
+
+        assert!(error.contains("MP4"));
     }
 }
