@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
 const PROGRESS_EVENT: &str = "subtitle-translation-progress";
+const MAX_VALIDATION_ATTEMPTS: usize = 3;
 const MAX_TRANSLATION_ATTEMPTS: usize = 3;
 const MAX_AI_SUBTITLE_REVIEW_ATTEMPTS: usize = 3;
 
@@ -158,6 +159,12 @@ struct ReviewedTranslationEntry {
 struct TranslationChunkResult {
     chunk: TranslationChunk,
     entries: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone)]
+enum TranslationChunkError {
+    NetworkError(String),      // 网络/API错误，不重试翻译
+    ValidationError(String),   // 校验失败，可以重试翻译
 }
 
 #[derive(Debug)]
@@ -717,6 +724,16 @@ where
                 );
             }
             Err((chunk, error)) => {
+                // 区分错误类型记录日志
+                let error_message = match error {
+                    TranslationChunkError::NetworkError(ref msg) => {
+                        format!("网络/API错误: {}", msg)
+                    }
+                    TranslationChunkError::ValidationError(ref msg) => {
+                        format!("校验失败（已重试{}次翻译）: {}", MAX_TRANSLATION_ATTEMPTS, msg)
+                    }
+                };
+
                 copy_source_range_to_target(source_segments, &mut translated_segments, &chunk);
                 mark_range_status(
                     &mut translated_segments,
@@ -727,12 +744,12 @@ where
                 failed_chunks += 1;
                 log_session.warn(
                     "subtitle_translation_chunk_failed",
-                    "字幕翻译批次失败，已保留原文",
+                    "字幕翻译批次最终失败，已保留原文",
                     json!({
                         "startIndex": chunk.start_index + 1,
                         "endIndex": chunk.end_index + 1,
                         "entryCount": chunk.entries.len(),
-                        "error": &error,
+                        "error": &error_message,
                     }),
                 );
             }
@@ -1020,7 +1037,7 @@ async fn run_translation_chunk(
     ai_service: &AiService,
     chunk: TranslationChunk,
     log_session: LogSession,
-) -> Result<TranslationChunkResult, (TranslationChunk, String)> {
+) -> Result<TranslationChunkResult, (TranslationChunk, TranslationChunkError)> {
     translate_chunk_by_llm(settings, ai_service, chunk, log_session).await
 }
 
@@ -1039,7 +1056,88 @@ async fn translate_chunk_by_llm(
     ai_service: &AiService,
     chunk: TranslationChunk,
     log_session: LogSession,
-) -> Result<TranslationChunkResult, (TranslationChunk, String)> {
+) -> Result<TranslationChunkResult, (TranslationChunk, TranslationChunkError)> {
+    // 翻译重试循环（最多3次完整翻译尝试）
+    for translation_attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
+        let validation_result = try_translate_with_validation(
+            settings,
+            ai_service,
+            &chunk,
+            &log_session,
+            translation_attempt,
+        )
+        .await;
+
+        match validation_result {
+            Ok(result) => {
+                if translation_attempt > 1 {
+                    log_session.info(
+                        "subtitle_translation_retry_success",
+                        &format!("字幕翻译第{}次尝试成功", translation_attempt),
+                        json!({
+                            "translationAttempt": translation_attempt,
+                            "startIndex": chunk.start_index + 1,
+                            "endIndex": chunk.end_index + 1,
+                        }),
+                    );
+                }
+                return Ok(result);
+            }
+            Err(error) => {
+                match error {
+                    TranslationChunkError::NetworkError(_) => {
+                        // 网络错误直接返回，不重试翻译
+                        return Err((chunk, error));
+                    }
+                    TranslationChunkError::ValidationError(ref msg) => {
+                        if translation_attempt < MAX_TRANSLATION_ATTEMPTS {
+                            log_session.warn(
+                                "subtitle_translation_retry_translation",
+                                &format!("字幕翻译第{}次尝试校验失败，准备重新翻译", translation_attempt),
+                                json!({
+                                    "translationAttempt": translation_attempt,
+                                    "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
+                                    "startIndex": chunk.start_index + 1,
+                                    "endIndex": chunk.end_index + 1,
+                                    "error": msg,
+                                }),
+                            );
+                            // 继续下一次翻译尝试
+                        } else {
+                            // 所有翻译尝试都失败
+                            log_session.error(
+                                "subtitle_translation_all_attempts_failed",
+                                &format!("字幕翻译{}次尝试全部失败", MAX_TRANSLATION_ATTEMPTS),
+                                json!({
+                                    "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
+                                    "startIndex": chunk.start_index + 1,
+                                    "endIndex": chunk.end_index + 1,
+                                    "error": msg,
+                                }),
+                            );
+                            return Err((chunk, error));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 理论上不会到这里
+    Err((
+        chunk,
+        TranslationChunkError::ValidationError("未知错误".to_string()),
+    ))
+}
+
+/// 单次翻译尝试（包含最多3次校验重试）
+async fn try_translate_with_validation(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: &TranslationChunk,
+    log_session: &LogSession,
+    translation_attempt: usize,
+) -> Result<TranslationChunkResult, TranslationChunkError> {
     let system_prompt = build_translation_system_prompt(settings);
     let source_text = chunk
         .entries
@@ -1050,12 +1148,14 @@ async fn translate_chunk_by_llm(
     let max_output_tokens = estimate_max_output_tokens(&source_text);
     let mut feedback = String::new();
 
-    for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
+    // 校验重试循环（最多3次）
+    for validation_attempt in 1..=MAX_VALIDATION_ATTEMPTS {
         let user_prompt = build_translation_user_prompt(
             &chunk.entries,
             settings.needs_reflection_translation,
             &feedback,
         );
+
         let response = match ai_service
             .chat_for_json_output(
                 settings,
@@ -1071,16 +1171,18 @@ async fn translate_chunk_by_llm(
                     "subtitle_translation_llm_request_failed",
                     "字幕翻译 LLM 请求失败",
                     json!({
-                        "attempt": attempt,
+                        "translationAttempt": translation_attempt,
+                        "validationAttempt": validation_attempt,
                         "startIndex": chunk.start_index + 1,
                         "endIndex": chunk.end_index + 1,
                         "error": &error,
                     }),
                 );
-                return Err((chunk, error));
+                return Err(TranslationChunkError::NetworkError(error));
             }
         };
 
+        // JSON 格式校验
         let parsed =
             match parse_translation_response(&response, settings.needs_reflection_translation) {
                 Ok(parsed) => parsed,
@@ -1090,10 +1192,22 @@ async fn translate_chunk_by_llm(
                         settings.needs_reflection_translation,
                         &error,
                     );
+                    log_session.warn(
+                        "subtitle_translation_json_validation_failed",
+                        "字幕翻译 JSON 格式校验失败，准备带反馈重试",
+                        json!({
+                            "translationAttempt": translation_attempt,
+                            "validationAttempt": validation_attempt,
+                            "startIndex": chunk.start_index + 1,
+                            "endIndex": chunk.end_index + 1,
+                            "error": &error,
+                        }),
+                    );
                     continue;
                 }
             };
 
+        // Key 匹配校验
         match validate_or_remap_relative_keys(&chunk.entries, parsed) {
             Ok(parsed) => {
                 let entries = parsed
@@ -1102,7 +1216,24 @@ async fn translate_chunk_by_llm(
                         key.parse::<usize>().ok().map(|index| (index - 1, text))
                     })
                     .collect();
-                return Ok(TranslationChunkResult { chunk, entries });
+
+                if translation_attempt > 1 || validation_attempt > 1 {
+                    log_session.info(
+                        "subtitle_translation_chunk_validated",
+                        "字幕翻译批次校验成功",
+                        json!({
+                            "translationAttempt": translation_attempt,
+                            "validationAttempt": validation_attempt,
+                            "startIndex": chunk.start_index + 1,
+                            "endIndex": chunk.end_index + 1,
+                        }),
+                    );
+                }
+
+                return Ok(TranslationChunkResult {
+                    chunk: chunk.clone(),
+                    entries,
+                });
             }
             Err(error) => {
                 feedback = build_translation_key_feedback(
@@ -1110,11 +1241,25 @@ async fn translate_chunk_by_llm(
                     settings.needs_reflection_translation,
                     &error,
                 );
+                log_session.warn(
+                    "subtitle_translation_key_validation_failed",
+                    "字幕翻译 Key 匹配校验失败，准备带反馈重试",
+                    json!({
+                        "translationAttempt": translation_attempt,
+                        "validationAttempt": validation_attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": &error,
+                    }),
+                );
             }
         }
     }
 
-    Err((chunk, "LLM 翻译结果多次校验失败".to_string()))
+    // 所有校验重试都失败
+    Err(TranslationChunkError::ValidationError(
+        format!("LLM 翻译结果{}次校验失败", MAX_VALIDATION_ATTEMPTS),
+    ))
 }
 
 async fn review_translation_chunk_by_llm(
