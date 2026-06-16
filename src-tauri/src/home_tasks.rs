@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::app_log::LogSession;
 use crate::app_paths;
+use crate::command_utils::create_command;
 use crate::dubbing::delete_dubbing_task_by_id;
 use crate::settings::SettingsStore;
 use crate::ytdlp::{self, YoutubeClientStrategy, YoutubeVideoFormatStrategy};
@@ -1494,6 +1495,7 @@ fn download_video_file(
     progress.emit_active(98, "视频文件处理中");
 
     let path = find_video_output(videos_dir, &prefix)?;
+    let path = normalize_downloaded_video_file(&path, videos_dir, &prefix, progress)?;
     remove_other_matching_outputs(videos_dir, &prefix, &path)?;
     let metadata = fs::metadata(&path).map_err(|error| format!("无法读取视频文件: {error}"))?;
     let format = path
@@ -1644,6 +1646,38 @@ fn run_ytdlp_download_command(
     }
 
     Ok(())
+}
+
+fn run_ffmpeg_command(command: &mut Command, failure_message: &str) -> Result<(), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|error| format!("{failure_message}: 无法启动 ffmpeg: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{failure_message}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn run_command_with_output(command: &mut Command, failure_message: &str) -> Result<String, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|error| format!("{failure_message}: 无法启动进程: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!(
+            "{failure_message}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn format_strategy_label(strategy: &YoutubeVideoFormatStrategy) -> &'static str {
@@ -2074,8 +2108,7 @@ fn find_subtitle_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
 }
 
 fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
-    let mut mp4_matches = Vec::new();
-    let mut other_video_matches = Vec::new();
+    let mut matches = Vec::new();
     for entry in fs::read_dir(dir).map_err(|error| format!("无法读取视频目录: {error}"))? {
         let entry = entry.map_err(|error| format!("无法读取视频文件: {error}"))?;
         let path = entry.path();
@@ -2083,38 +2116,106 @@ fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
             continue;
         };
         if name.starts_with(prefix) && path.is_file() && is_video_output_path(&path) {
-            if is_mp4_video_output_path(&path) {
-                mp4_matches.push(path);
-            } else {
-                other_video_matches.push(path);
-            }
+            matches.push(path);
         }
     }
 
-    if let Some(output) = best_video_output_match(mp4_matches, prefix) {
-        return Ok(output);
-    }
-
-    if !other_video_matches.is_empty() {
-        return Err("yt-dlp 未生成 MP4 视频文件，请确认 ffmpeg 可用后重试".to_string());
-    }
-
-    Err("yt-dlp 未生成视频文件".to_string())
+    best_video_output_match(matches).ok_or_else(|| "yt-dlp 未生成视频文件".to_string())
 }
 
-fn best_video_output_match(mut matches: Vec<PathBuf>, prefix: &str) -> Option<PathBuf> {
-    if let Some(final_path) = matches
-        .iter()
-        .find(|path| path.file_stem().and_then(|value| value.to_str()) == Some(prefix))
-    {
-        return Some(final_path.clone());
-    }
+fn best_video_output_match(mut matches: Vec<PathBuf>) -> Option<PathBuf> {
     matches.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
+        (
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
     });
     matches.pop()
+}
+
+fn normalize_downloaded_video_file(
+    path: &Path,
+    videos_dir: &Path,
+    prefix: &str,
+    progress: &DownloadProgressEmitter,
+) -> Result<PathBuf, String> {
+    if is_mp4_video_output_path(path) {
+        return Ok(path.to_path_buf());
+    }
+
+    let normalized_path = videos_dir.join(format!("{prefix}.mp4"));
+    progress.emit_active(99, "视频格式标准化中");
+    transcode_video_to_mp4(path, &normalized_path)?;
+    Ok(normalized_path)
+}
+
+fn transcode_video_to_mp4(input: &Path, output: &Path) -> Result<(), String> {
+    if output.exists() {
+        fs::remove_file(output).map_err(|error| format!("无法清理旧视频文件: {error}"))?;
+    }
+
+    let has_audio = probe_media_stream_exists(input, "a:0")?;
+    let mut command = create_command("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-fflags")
+        .arg("+genpts")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("medium")
+        .arg("-crf")
+        .arg("23")
+        .arg("-vf")
+        .arg("fps=25")
+        .arg("-fps_mode")
+        .arg("cfr")
+        .arg("-video_track_timescale")
+        .arg("12800")
+        .arg("-movflags")
+        .arg("+faststart");
+
+    if has_audio {
+        command
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("1")
+            .arg("-b:a")
+            .arg("128k")
+            .arg("-af")
+            .arg("aresample=async=1:first_pts=0");
+    } else {
+        command.arg("-an");
+    }
+
+    command.arg(output);
+    run_ffmpeg_command(&mut command, "视频格式标准化失败")
+}
+
+fn probe_media_stream_exists(path: &Path, stream_selector: &str) -> Result<bool, String> {
+    let mut command = create_command("ffprobe");
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg(stream_selector)
+        .arg("-show_entries")
+        .arg("stream=index")
+        .arg("-of")
+        .arg("csv=p=0")
+        .arg(path);
+    let output = run_command_with_output(&mut command, "无法检查媒体流")?;
+    Ok(!output.trim().is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -2474,13 +2575,16 @@ mod tests {
     }
 
     #[test]
-    fn find_video_output_rejects_non_mp4_outputs() {
+    fn find_video_output_accepts_non_mp4_outputs() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let prefix = "task.video";
         fs::write(dir.path().join(format!("{prefix}.mkv")), b"video").expect("write mkv");
 
-        let error = find_video_output(dir.path(), prefix).expect_err("reject non-mp4 output");
+        let output = find_video_output(dir.path(), prefix).expect("find non-mp4 output");
 
-        assert!(error.contains("MP4"));
+        assert_eq!(
+            output.extension().and_then(|value| value.to_str()),
+            Some("mkv")
+        );
     }
 }
