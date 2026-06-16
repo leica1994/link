@@ -42,6 +42,18 @@ const YTDLP_DOWNLOAD_PROGRESS_TEMPLATE: &str =
     "download:LINK_YTDLP_PROGRESS\tdownload\t%(progress.status)s\t%(progress.downloaded_bytes)s\t%(progress.total_bytes)s\t%(progress.total_bytes_estimate)s\t%(progress._percent_str)s";
 const YTDLP_POSTPROCESS_PROGRESS_TEMPLATE: &str =
     "postprocess:LINK_YTDLP_PROGRESS\tpostprocess\t%(progress.status)s\tNA\tNA\tNA\t%(progress._percent_str)s";
+const STANDARD_VIDEO_EXTENSION: &str = "mp4";
+const STANDARD_VIDEO_CODEC: &str = "libx264";
+const STANDARD_VIDEO_PRESET: &str = "medium";
+const STANDARD_VIDEO_CRF: &str = "23";
+const STANDARD_VIDEO_FILTER: &str = "fps=25";
+const STANDARD_VIDEO_FPS_MODE: &str = "cfr";
+const STANDARD_VIDEO_TRACK_TIMESCALE: &str = "12800";
+const STANDARD_AUDIO_CODEC: &str = "aac";
+const STANDARD_AUDIO_SAMPLE_RATE: &str = "44100";
+const STANDARD_AUDIO_CHANNELS: &str = "1";
+const STANDARD_AUDIO_BITRATE: &str = "128k";
+const STANDARD_AUDIO_FILTER: &str = "aresample=async=1:first_pts=0";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2125,11 +2137,9 @@ fn find_video_output(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
 
 fn best_video_output_match(mut matches: Vec<PathBuf>) -> Option<PathBuf> {
     matches.sort_by_key(|path| {
-        (
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok(),
-        )
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
     });
     matches.pop()
 }
@@ -2144,10 +2154,14 @@ fn normalize_downloaded_video_file(
         return Ok(path.to_path_buf());
     }
 
-    let normalized_path = videos_dir.join(format!("{prefix}.mp4"));
+    let normalized_path = standard_video_output_path(videos_dir, prefix);
     progress.emit_active(99, "视频格式标准化中");
     transcode_video_to_mp4(path, &normalized_path)?;
     Ok(normalized_path)
+}
+
+fn standard_video_output_path(videos_dir: &Path, prefix: &str) -> PathBuf {
+    videos_dir.join(format!("{prefix}.{STANDARD_VIDEO_EXTENSION}"))
 }
 
 fn transcode_video_to_mp4(input: &Path, output: &Path) -> Result<(), String> {
@@ -2159,24 +2173,24 @@ fn transcode_video_to_mp4(input: &Path, output: &Path) -> Result<(), String> {
     let mut command = create_command("ffmpeg");
     command
         .arg("-y")
+        .arg("-fflags")
+        .arg("+genpts")
         .arg("-i")
         .arg(input)
         .arg("-map")
         .arg("0:v:0")
-        .arg("-fflags")
-        .arg("+genpts")
         .arg("-c:v")
-        .arg("libx264")
+        .arg(STANDARD_VIDEO_CODEC)
         .arg("-preset")
-        .arg("medium")
+        .arg(STANDARD_VIDEO_PRESET)
         .arg("-crf")
-        .arg("23")
+        .arg(STANDARD_VIDEO_CRF)
         .arg("-vf")
-        .arg("fps=25")
+        .arg(STANDARD_VIDEO_FILTER)
         .arg("-fps_mode")
-        .arg("cfr")
+        .arg(STANDARD_VIDEO_FPS_MODE)
         .arg("-video_track_timescale")
-        .arg("12800")
+        .arg(STANDARD_VIDEO_TRACK_TIMESCALE)
         .arg("-movflags")
         .arg("+faststart");
 
@@ -2185,15 +2199,15 @@ fn transcode_video_to_mp4(input: &Path, output: &Path) -> Result<(), String> {
             .arg("-map")
             .arg("0:a:0")
             .arg("-c:a")
-            .arg("aac")
+            .arg(STANDARD_AUDIO_CODEC)
             .arg("-ar")
-            .arg("44100")
+            .arg(STANDARD_AUDIO_SAMPLE_RATE)
             .arg("-ac")
-            .arg("1")
+            .arg(STANDARD_AUDIO_CHANNELS)
             .arg("-b:a")
-            .arg("128k")
+            .arg(STANDARD_AUDIO_BITRATE)
             .arg("-af")
-            .arg("aresample=async=1:first_pts=0");
+            .arg(STANDARD_AUDIO_FILTER);
     } else {
         command.arg("-an");
     }
@@ -2560,17 +2574,18 @@ mod tests {
     }
 
     #[test]
-    fn find_video_output_prefers_mp4_over_other_video_outputs() {
+    fn find_video_output_prefers_newest_video_output() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let prefix = "task.video";
-        fs::write(dir.path().join(format!("{prefix}.webm")), b"old").expect("write webm");
-        fs::write(dir.path().join(format!("{prefix}.mp4")), b"new").expect("write mp4");
+        fs::write(dir.path().join(format!("{prefix}.mp4")), b"old").expect("write mp4");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        fs::write(dir.path().join(format!("{prefix}.webm")), b"new").expect("write webm");
 
         let output = find_video_output(dir.path(), prefix).expect("find video output");
 
         assert_eq!(
             output.extension().and_then(|value| value.to_str()),
-            Some("mp4")
+            Some("webm")
         );
     }
 
@@ -2585,6 +2600,18 @@ mod tests {
         assert_eq!(
             output.extension().and_then(|value| value.to_str()),
             Some("mkv")
+        );
+    }
+
+    #[test]
+    fn standard_video_output_path_uses_mp4_extension() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let prefix = "task.video";
+        let path = standard_video_output_path(dir.path(), prefix);
+
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("task.video.mp4")
         );
     }
 }
