@@ -218,10 +218,10 @@
 
       <section
         v-else
-        :id="`${TranslateTab.TranslationOptimization}-panel`"
+        :id="`${TranslateTab.TranslationReview}-panel`"
         class="translate-panel"
         role="tabpanel"
-        :aria-labelledby="`${TranslateTab.TranslationOptimization}-tab`"
+        :aria-labelledby="`${TranslateTab.TranslationReview}-tab`"
       >
         <div class="translate-grid">
           <section class="settings-section" aria-labelledby="subtitle-input-title">
@@ -260,7 +260,7 @@
           <section class="settings-section" aria-labelledby="translation-options-title">
             <div id="translation-options-title" class="section-heading">
               <WandSparkles aria-hidden="true" />
-              <span>翻译与优化参数</span>
+              <span>翻译与审核参数</span>
             </div>
 
             <div class="settings-panel">
@@ -385,7 +385,7 @@
               v-if="translationRows.length > 0"
               class="translate-preview translate-subtitle-list translate-translation-table"
               role="table"
-              aria-label="翻译与优化结果"
+              aria-label="翻译与审核结果"
             >
               <article
                 v-for="row in translationRows"
@@ -566,7 +566,7 @@ defineOptions({ name: 'Translate' })
 
 enum TranslateTab {
   Transcription = 'transcription',
-  TranslationOptimization = 'translation-optimization',
+  TranslationReview = 'translation-review',
 }
 
 enum TranslateDialog {
@@ -604,6 +604,9 @@ type TranscriptionSegmentStatus =
   | 'translated'
   | 'optimizing'
   | 'optimized'
+  | 'reviewing'
+  | 'reviewed'
+  | 'removed'
   | 'kept'
   | 'done'
 
@@ -637,6 +640,7 @@ type TranscriptionStageProgress = {
   transcription?: TranscriptionProgressStage
   smartSegmentation?: TranscriptionProgressStage
   subtitleCorrection?: TranscriptionProgressStage
+  aiReview?: TranscriptionProgressStage
 }
 
 type TranscriptionResult = {
@@ -661,10 +665,10 @@ type TranscriptionProgress = {
 
 type SubtitleTranslationStageProgress = {
   subtitleTranslation?: TranscriptionProgressStage
-  postTranslationOptimization?: TranscriptionProgressStage
+  aiSubtitleReview?: TranscriptionProgressStage
 }
 
-const subtitleTranslationStageKeys = ['subtitleTranslation', 'postTranslationOptimization'] as const
+const subtitleTranslationStageKeys = ['subtitleTranslation', 'aiSubtitleReview'] as const
 type SubtitleTranslationStageKey = (typeof subtitleTranslationStageKeys)[number]
 
 type SubtitlePreviewResult = {
@@ -706,13 +710,16 @@ const transcriptionSegmentStatusLabels: Record<TranscriptionSegmentStatus, strin
   translated: '已翻译',
   optimizing: '优化中',
   optimized: '已优化',
+  reviewing: '审核中',
+  reviewed: '已审核',
+  removed: '已移除',
   kept: '保留原文',
   done: '完成',
 }
 
 const translateTabs = [
   { value: TranslateTab.Transcription, label: '转录', icon: Captions },
-  { value: TranslateTab.TranslationOptimization, label: '翻译与优化', icon: WandSparkles },
+  { value: TranslateTab.TranslationReview, label: '翻译与审核', icon: WandSparkles },
 ] as const
 
 const activeTab = ref<TranslateTab>(TranslateTab.Transcription)
@@ -873,6 +880,7 @@ const visibleTranscriptionStages = computed(() => {
     { key: 'transcription', label: '转录', stage: stages.transcription },
     { key: 'smart-segmentation', label: '智能断句', stage: stages.smartSegmentation },
     { key: 'subtitle-correction', label: '字幕校正', stage: stages.subtitleCorrection },
+    { key: 'ai-review', label: 'AI审核', stage: stages.aiReview },
   ]
     .filter((item): item is { key: string; label: string; stage: TranscriptionProgressStage } => Boolean(item.stage))
     .map((item) => ({
@@ -897,7 +905,7 @@ const visibleTranslationStages = computed(() => {
   const stages = translationStageProgress.value
   return [
     { key: 'subtitle-translation', label: '字幕翻译', stage: stages.subtitleTranslation },
-    { key: 'post-translation-optimization', label: '译后优化', stage: stages.postTranslationOptimization },
+    { key: 'ai-subtitle-review', label: 'AI审核', stage: stages.aiSubtitleReview },
   ]
     .filter((item): item is { key: string; label: string; stage: TranscriptionProgressStage } => Boolean(item.stage))
     .map((item) => ({
@@ -1281,6 +1289,7 @@ const markStageProgressDone = (stages: TranscriptionStageProgress): Transcriptio
   subtitleCorrection: stages.subtitleCorrection
     ? { ...stages.subtitleCorrection, progress: 100, status: 'done' }
     : undefined,
+  aiReview: stages.aiReview ? { ...stages.aiReview, progress: 100, status: 'done' } : undefined,
 })
 
 const markActiveStageFailed = (stages: TranscriptionStageProgress): TranscriptionStageProgress => ({
@@ -1299,15 +1308,19 @@ const markActiveStageFailed = (stages: TranscriptionStageProgress): Transcriptio
         status: stages.subtitleCorrection.status === 'active' ? 'failed' : stages.subtitleCorrection.status,
       }
     : undefined,
+  aiReview: stages.aiReview
+    ? {
+        ...stages.aiReview,
+        status: stages.aiReview.status === 'active' ? 'failed' : stages.aiReview.status,
+      }
+    : undefined,
 })
 
 const markTranslationStageProgressDone = (
   stages: SubtitleTranslationStageProgress,
 ): SubtitleTranslationStageProgress => ({
   subtitleTranslation: stages.subtitleTranslation ? { ...stages.subtitleTranslation, progress: 100, status: 'done' } : undefined,
-  postTranslationOptimization: stages.postTranslationOptimization
-    ? { ...stages.postTranslationOptimization, progress: 100, status: 'done' }
-    : undefined,
+  aiSubtitleReview: stages.aiSubtitleReview ? { ...stages.aiSubtitleReview, progress: 100, status: 'done' } : undefined,
 })
 
 const findTranslationStageKey = (
@@ -1357,7 +1370,7 @@ const markTranslationStageProgressFailed = (
 
   return {
     subtitleTranslation: markStage('subtitleTranslation'),
-    postTranslationOptimization: markStage('postTranslationOptimization'),
+    aiSubtitleReview: markStage('aiSubtitleReview'),
   }
 }
 
@@ -1412,6 +1425,9 @@ const startTranscription = async () => {
       : {}),
     ...(currentSettings.value.isSubtitleCorrectionEnabled
       ? { subtitleCorrection: { progress: 0, message: '等待前置处理完成', status: 'pending' as TranscriptionStageStatus } }
+      : {}),
+    ...(currentSettings.value.isAiSubtitleReviewEnabled
+      ? { aiReview: { progress: 0, message: '等待前置处理完成', status: 'pending' as TranscriptionStageStatus } }
       : {}),
   }
   transcriptionMessage.value = '准备转录'
@@ -1522,9 +1538,9 @@ const startTranslationProcessing = async () => {
     ...(currentSettings.value.isSubtitleTranslationEnabled
       ? { subtitleTranslation: { progress: 0, message: '等待开始翻译', status: 'pending' as TranscriptionStageStatus } }
       : {}),
-    ...(currentSettings.value.isSubtitleTranslationEnabled && currentSettings.value.isPostTranslationOptimizationEnabled
+    ...(currentSettings.value.isSubtitleTranslationEnabled && currentSettings.value.isAiSubtitleReviewEnabled
       ? {
-          postTranslationOptimization: {
+          aiSubtitleReview: {
             progress: 0,
             message: '等待翻译完成',
             status: 'pending' as TranscriptionStageStatus,

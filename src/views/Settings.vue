@@ -288,22 +288,34 @@
           <div class="setting-row">
             <AlignJustify class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
             <div class="setting-copy">
-              <div class="setting-title">译后优化</div>
-              <div class="setting-subtitle">翻译完成后进一步优化译文</div>
+              <div class="setting-title">AI审核</div>
+              <div class="setting-subtitle">审核源文、译文、上下文连贯性和无关噪音行</div>
             </div>
             <button
               class="setting-toggle"
-              :class="{ active: isPostTranslationOptimizationEnabled }"
+              :class="{ active: isAiSubtitleReviewEnabled }"
               type="button"
-              :aria-pressed="isPostTranslationOptimizationEnabled"
-              @click="isPostTranslationOptimizationEnabled = !isPostTranslationOptimizationEnabled"
+              :aria-pressed="isAiSubtitleReviewEnabled"
+              @click="isAiSubtitleReviewEnabled = !isAiSubtitleReviewEnabled"
             >
-              <span class="setting-toggle-label">{{ isPostTranslationOptimizationEnabled ? '开' : '关' }}</span>
+              <span class="setting-toggle-label">{{ isAiSubtitleReviewEnabled ? '开' : '关' }}</span>
               <span class="setting-toggle-track" aria-hidden="true">
                 <span class="setting-toggle-thumb" />
               </span>
             </button>
           </div>
+
+          <button class="setting-row setting-row-button" type="button" @click="openAiSubtitleReviewModeDialog">
+            <ListChecks class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <span class="setting-copy">
+              <span class="setting-title">审核模式</span>
+              <span class="setting-subtitle">控制 AI 审核的修正力度</span>
+            </span>
+            <span class="setting-inline-action">
+              <span class="setting-value">{{ aiSubtitleReviewModeLabel }}</span>
+              <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
+            </span>
+          </button>
 
           <button class="setting-row setting-row-button" type="button" @click="openTargetLanguageDialog">
             <Languages class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
@@ -717,6 +729,37 @@
       </div>
 
       <div
+        v-if="isAiSubtitleReviewModeDialogOpen"
+        class="dialog-backdrop"
+        role="presentation"
+        @click.self="closeAiSubtitleReviewModeDialog"
+      >
+        <section
+          class="settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="ai-subtitle-review-mode-title"
+        >
+          <h2 id="ai-subtitle-review-mode-title" class="dialog-title">审核模式</h2>
+          <div class="dialog-options" role="radiogroup" aria-label="审核模式">
+            <button
+              v-for="option in aiSubtitleReviewModeOptions"
+              :key="option.value"
+              class="dialog-option"
+              :class="{ active: selectedAiSubtitleReviewMode === option.value }"
+              type="button"
+              role="radio"
+              :aria-checked="selectedAiSubtitleReviewMode === option.value"
+              @click="selectAiSubtitleReviewMode(option.value)"
+            >
+              <span class="dialog-radio" aria-hidden="true" />
+              <span>{{ option.label }}</span>
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <div
         v-if="isReferenceAudioDialogOpen"
         class="dialog-backdrop"
         role="presentation"
@@ -895,6 +938,11 @@ enum VideoContentType {
   Trading = 'trading',
 }
 
+enum AiSubtitleReviewMode {
+  Expert = 'expert',
+  Conservative = 'conservative',
+}
+
 enum SubtitleFormat {
   Srt = 'srt',
   Vtt = 'vtt',
@@ -945,7 +993,8 @@ type AppSettings = {
   outputMode: OutputMode
   isSubtitleCorrectionEnabled: boolean
   isSubtitleTranslationEnabled: boolean
-  isPostTranslationOptimizationEnabled: boolean
+  isAiSubtitleReviewEnabled: boolean
+  aiSubtitleReviewMode: AiSubtitleReviewMode
   targetLanguage: string
   dubbingTtsIntervalMs: number
   dubbingReferenceAudioSource: ReferenceAudioSource
@@ -1251,6 +1300,11 @@ const videoContentTypeOptions = [
   { value: VideoContentType.Trading, label: '交易' },
 ] as const
 
+const aiSubtitleReviewModeOptions = [
+  { value: AiSubtitleReviewMode.Expert, label: '专家审核' },
+  { value: AiSubtitleReviewMode.Conservative, label: '保守审核' },
+] as const
+
 const subtitleFormatOptions = [
   { value: SubtitleFormat.Srt, label: 'SRT' },
   { value: SubtitleFormat.Vtt, label: 'VTT' },
@@ -1354,10 +1408,13 @@ const normalizeSettings = (settings: Partial<AppSettings>): AppSettings => ({
     typeof settings.isSubtitleCorrectionEnabled === 'boolean' ? settings.isSubtitleCorrectionEnabled : true,
   isSubtitleTranslationEnabled:
     typeof settings.isSubtitleTranslationEnabled === 'boolean' ? settings.isSubtitleTranslationEnabled : true,
-  isPostTranslationOptimizationEnabled:
-    typeof settings.isPostTranslationOptimizationEnabled === 'boolean'
-      ? settings.isPostTranslationOptimizationEnabled
-      : true,
+  isAiSubtitleReviewEnabled:
+    typeof settings.isAiSubtitleReviewEnabled === 'boolean' ? settings.isAiSubtitleReviewEnabled : true,
+  aiSubtitleReviewMode: readOptionValue(
+    settings.aiSubtitleReviewMode,
+    aiSubtitleReviewModeOptions,
+    AiSubtitleReviewMode.Expert,
+  ),
   targetLanguage:
     typeof settings.targetLanguage === 'string' &&
     targetLanguageOptions.some((option) => option.value === settings.targetLanguage)
@@ -1412,7 +1469,9 @@ const selectedOutputMode = ref<OutputMode>(OutputMode.Bilingual)
 const isVideoContentTypeDialogOpen = ref(false)
 const isSubtitleCorrectionEnabled = ref(true)
 const isSubtitleTranslationEnabled = ref(true)
-const isPostTranslationOptimizationEnabled = ref(true)
+const isAiSubtitleReviewEnabled = ref(true)
+const selectedAiSubtitleReviewMode = ref<AiSubtitleReviewMode>(AiSubtitleReviewMode.Expert)
+const isAiSubtitleReviewModeDialogOpen = ref(false)
 const selectedTargetLanguage = ref('zh-Hans')
 const isTargetLanguageDialogOpen = ref(false)
 const targetLanguageSearch = ref('')
@@ -1515,6 +1574,10 @@ const videoContentTypeLabel = computed(() => {
   return videoContentTypeOptions.find((option) => option.value === selectedVideoContentType.value)?.label ?? ''
 })
 
+const aiSubtitleReviewModeLabel = computed(() => {
+  return aiSubtitleReviewModeOptions.find((option) => option.value === selectedAiSubtitleReviewMode.value)?.label ?? ''
+})
+
 const targetLanguageLabel = computed(() => {
   return targetLanguageOptions.find((option) => option.value === selectedTargetLanguage.value)?.label ?? ''
 })
@@ -1561,7 +1624,8 @@ const createSettingsSnapshot = (): AppSettings => ({
   outputMode: selectedOutputMode.value,
   isSubtitleCorrectionEnabled: isSubtitleCorrectionEnabled.value,
   isSubtitleTranslationEnabled: isSubtitleTranslationEnabled.value,
-  isPostTranslationOptimizationEnabled: isPostTranslationOptimizationEnabled.value,
+  isAiSubtitleReviewEnabled: isAiSubtitleReviewEnabled.value,
+  aiSubtitleReviewMode: selectedAiSubtitleReviewMode.value,
   targetLanguage: selectedTargetLanguage.value,
   dubbingTtsIntervalMs: dubbingTtsIntervalMs.value,
   dubbingReferenceAudioSource: selectedReferenceAudioSource.value,
@@ -1594,7 +1658,8 @@ const applySettings = (settings: AppSettings) => {
   selectedOutputMode.value = settings.outputMode
   isSubtitleCorrectionEnabled.value = settings.isSubtitleCorrectionEnabled
   isSubtitleTranslationEnabled.value = settings.isSubtitleTranslationEnabled
-  isPostTranslationOptimizationEnabled.value = settings.isPostTranslationOptimizationEnabled
+  isAiSubtitleReviewEnabled.value = settings.isAiSubtitleReviewEnabled
+  selectedAiSubtitleReviewMode.value = settings.aiSubtitleReviewMode
   selectedTargetLanguage.value = settings.targetLanguage
   dubbingTtsIntervalMs.value = settings.dubbingTtsIntervalMs
   selectedReferenceAudioSource.value = settings.dubbingReferenceAudioSource
@@ -1783,6 +1848,19 @@ const selectVideoContentType = (type: VideoContentType) => {
   closeVideoContentTypeDialog()
 }
 
+const openAiSubtitleReviewModeDialog = () => {
+  isAiSubtitleReviewModeDialogOpen.value = true
+}
+
+const closeAiSubtitleReviewModeDialog = () => {
+  isAiSubtitleReviewModeDialogOpen.value = false
+}
+
+const selectAiSubtitleReviewMode = (mode: AiSubtitleReviewMode) => {
+  selectedAiSubtitleReviewMode.value = mode
+  closeAiSubtitleReviewModeDialog()
+}
+
 const openReferenceAudioDialog = () => {
   draftReferenceAudioSource.value = selectedReferenceAudioSource.value
   draftCustomReferenceAudioPath.value = dubbingCustomReferenceAudioPath.value
@@ -1885,6 +1963,7 @@ const handleKeydown = (event: KeyboardEvent) => {
     closeReasoningEffortDialog()
     closeTranslationServiceDialog()
     closeVideoContentTypeDialog()
+    closeAiSubtitleReviewModeDialog()
     closeReferenceAudioDialog()
     closeTargetLanguageDialog()
   }

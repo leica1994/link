@@ -19,7 +19,7 @@ use tauri::{AppHandle, Emitter};
 
 const PROGRESS_EVENT: &str = "subtitle-translation-progress";
 const MAX_TRANSLATION_ATTEMPTS: usize = 3;
-const MAX_POST_OPTIMIZATION_ATTEMPTS: usize = 3;
+const MAX_AI_SUBTITLE_REVIEW_ATTEMPTS: usize = 3;
 
 pub(crate) type SubtitleTranslationProgressSink =
     Arc<dyn Fn(SubtitleTranslationProgress) + Send + Sync>;
@@ -75,7 +75,7 @@ pub struct SubtitleTranslationStageProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_translation: Option<SubtitleTranslationProgressStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub post_translation_optimization: Option<SubtitleTranslationProgressStage>,
+    pub ai_subtitle_review: Option<SubtitleTranslationProgressStage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,7 +96,7 @@ pub struct SubtitleTranslationResult {
 #[derive(Debug, Clone, Copy)]
 enum TranslationProgressStage {
     SubtitleTranslation,
-    PostTranslationOptimization,
+    AiSubtitleReview,
 }
 
 #[derive(Clone)]
@@ -142,15 +142,35 @@ struct TranslationChunk {
 }
 
 #[derive(Debug, Clone)]
-struct TextChunkResult {
+struct TranslationReviewChunkResult {
     chunk: TextChunk,
-    entries: Vec<(usize, String)>,
+    source_entries: Vec<(usize, ReviewedTranslationEntry)>,
+    target_entries: Vec<(usize, ReviewedTranslationEntry)>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewedTranslationEntry {
+    text: String,
+    action: String,
 }
 
 #[derive(Debug, Clone)]
 struct TranslationChunkResult {
     chunk: TranslationChunk,
     entries: Vec<(usize, String)>,
+}
+
+#[derive(Debug)]
+struct SubtitleReviewResult {
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SubtitleReviewSnapshot {
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
 }
 
 #[tauri::command]
@@ -215,7 +235,7 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
     let log_session = app_logger.start_session("subtitle_translation")?;
     log_session.info(
         "request_received",
-        "收到字幕翻译与优化请求",
+        "收到字幕翻译与AI审核请求",
         json!({ "filePath": &request.file_path }),
     );
 
@@ -339,49 +359,55 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
             &warnings,
         );
 
-        if settings.is_post_translation_optimization_enabled {
+        if settings.is_ai_subtitle_review_enabled {
             workflow_progress.set_stage(
-                TranslationProgressStage::PostTranslationOptimization,
+                TranslationProgressStage::AiSubtitleReview,
                 0,
-                "AI 译后优化中",
+                "AI 字幕审核中",
                 "active",
             );
             emitter.emit(
-                "AI 译后优化中",
+                "AI 字幕审核中",
                 &source_segments,
                 &translated_segments,
                 &warnings,
             );
 
-            let optimization_result = optimize_translated_subtitles(
+            let review_result = review_translated_subtitles(
                 &settings,
                 ai_service,
                 &log_session,
-                &source_segments,
+                source_segments,
                 translated_segments,
                 |progress, message, status, snapshot, snapshot_warnings| {
                     let mut combined_warnings = warnings.clone();
                     combined_warnings.extend(snapshot_warnings.iter().cloned());
                     workflow_progress.set_stage(
-                        TranslationProgressStage::PostTranslationOptimization,
+                        TranslationProgressStage::AiSubtitleReview,
                         progress,
                         message,
                         status,
                     );
-                    emitter.emit(message, &source_segments, snapshot, &combined_warnings);
+                    emitter.emit(
+                        message,
+                        &snapshot.source_segments,
+                        &snapshot.translated_segments,
+                        &combined_warnings,
+                    );
                 },
             )
             .await;
-            translated_segments = optimization_result.segments;
-            warnings.extend(optimization_result.warnings);
+            source_segments = review_result.source_segments;
+            translated_segments = review_result.translated_segments;
+            warnings.extend(review_result.warnings);
             workflow_progress.set_stage(
-                TranslationProgressStage::PostTranslationOptimization,
+                TranslationProgressStage::AiSubtitleReview,
                 100,
-                "AI 译后优化完成",
+                "AI 字幕审核完成",
                 "done",
             );
             emitter.emit(
-                "AI 译后优化完成",
+                "AI 字幕审核完成",
                 &source_segments,
                 &translated_segments,
                 &warnings,
@@ -392,8 +418,8 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
         assign_segment_metadata(&mut translated_segments, "target", "done");
     }
 
-    mark_segments_status(&mut source_segments, "done");
-    mark_segments_status(&mut translated_segments, "done");
+    mark_finished_segments_status(&mut source_segments, "done");
+    mark_finished_segments_status(&mut translated_segments, "done");
     let output_segments = build_output_segments(
         &source_segments,
         &translated_segments,
@@ -416,15 +442,10 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
         &settings,
     )?;
 
-    emitter.emit(
-        "翻译与优化完成",
-        &source_segments,
-        &translated_segments,
-        &warnings,
-    );
+    emitter.emit("翻译与AI审核完成", &source_segments, &translated_segments, &warnings);
     log_session.info(
         "subtitle_translation_completed",
-        "字幕翻译与优化流程完成",
+        "字幕翻译与AI审核流程完成",
         json!({
             "sourceSegmentCount": source_segments.len(),
             "translatedSegmentCount": translated_segments.len(),
@@ -483,18 +504,25 @@ fn serialize_translation_for_export(
     settings_store: Option<&SettingsStore>,
     settings: &AppSettings,
 ) -> Result<String, String> {
+    let (export_source_segments, export_translated_segments) =
+        filter_removed_translation_pairs(source_segments, translated_segments);
+
     if output_mode == "bilingual" && matches!(output_format, SubtitleFormat::Ass) {
         if let Some(store) = settings_store {
             let style = get_selected_subtitle_style(store, &settings.selected_subtitle_style_id)?;
             return Ok(serialize_styled_bilingual_ass(
-                source_segments,
-                translated_segments,
+                &export_source_segments,
+                &export_translated_segments,
                 &style,
             ));
         }
     }
 
-    let output_segments = build_output_segments(source_segments, translated_segments, output_mode);
+    let output_segments = build_output_segments(
+        &export_source_segments,
+        &export_translated_segments,
+        output_mode,
+    );
     serialize_segments_for_export(&output_segments, output_format, settings_store, settings)
 }
 
@@ -525,8 +553,8 @@ impl TranslationWorkflowProgress {
                 TranslationProgressStage::SubtitleTranslation => {
                     stages.subtitle_translation = stage_progress
                 }
-                TranslationProgressStage::PostTranslationOptimization => {
-                    stages.post_translation_optimization = stage_progress
+                TranslationProgressStage::AiSubtitleReview => {
+                    stages.ai_subtitle_review = stage_progress
                 }
             }
         }
@@ -592,9 +620,9 @@ fn initialize_workflow_progress(
             "pending",
         );
 
-        if settings.is_post_translation_optimization_enabled {
+        if settings.is_ai_subtitle_review_enabled {
             workflow_progress.set_stage(
-                TranslationProgressStage::PostTranslationOptimization,
+                TranslationProgressStage::AiSubtitleReview,
                 0,
                 "等待翻译完成",
                 "pending",
@@ -773,37 +801,39 @@ where
     })
 }
 
-async fn optimize_translated_subtitles<F>(
+async fn review_translated_subtitles<F>(
     settings: &AppSettings,
     ai_service: &AiService,
     log_session: &LogSession,
-    source_segments: &[TranscriptionSegment],
+    mut source_segments: Vec<TranscriptionSegment>,
     mut translated_segments: Vec<TranscriptionSegment>,
     mut report: F,
-) -> SubtitleProcessingResult
+) -> SubtitleReviewResult
 where
-    F: FnMut(u8, &str, &str, &[TranscriptionSegment], &[String]),
+    F: FnMut(u8, &str, &str, &SubtitleReviewSnapshot, &[String]),
 {
     let chunks = build_text_chunks(
         &translated_segments,
         settings.translation_batch_size.max(1) as usize,
     );
     if chunks.is_empty() {
-        return SubtitleProcessingResult {
-            segments: translated_segments,
+        return SubtitleReviewResult {
+            source_segments,
+            translated_segments,
             warnings: Vec::new(),
         };
     }
 
     log_session.info(
-        "post_translation_optimization_stage_prepared",
-        "AI 译后优化批次已准备",
+        "ai_subtitle_review_stage_prepared",
+        "AI 字幕审核批次已准备",
         json!({
             "inputSegmentCount": translated_segments.len(),
             "chunkCount": chunks.len(),
             "batchSize": settings.translation_batch_size.max(1),
             "targetLanguage": &settings.target_language,
             "videoContentType": &settings.video_content_type,
+            "reviewMode": &settings.ai_subtitle_review_mode,
             "llmMode": "configured_llm_settings_json_response",
         }),
     );
@@ -811,7 +841,7 @@ where
     let total = chunks.len().max(1);
     let max_active = active_ai_work_count(settings);
     let source_chunks = build_text_chunks(
-        source_segments,
+        &source_segments,
         settings.translation_batch_size.max(1) as usize,
     );
     let mut futures = FuturesUnordered::new();
@@ -829,9 +859,15 @@ where
             &mut translated_segments,
             chunk.start_index,
             chunk.end_index,
-            "optimizing",
+            "reviewing",
         );
-        futures.push(run_post_optimization_chunk(
+        mark_range_status(
+            &mut source_segments,
+            chunk.start_index,
+            chunk.end_index,
+            "reviewing",
+        );
+        futures.push(run_translation_review_chunk(
             settings,
             ai_service,
             source_entries,
@@ -840,11 +876,15 @@ where
         ));
         next_chunk_index += 1;
     }
+    let snapshot = SubtitleReviewSnapshot {
+        source_segments: source_segments.clone(),
+        translated_segments: translated_segments.clone(),
+    };
     report(
         0,
-        "AI 译后优化中",
+        "AI 字幕审核中",
         "active",
-        &translated_segments,
+        &snapshot,
         &warnings,
     );
 
@@ -854,19 +894,46 @@ where
 
         match result {
             Ok(result) => {
-                for (index, text) in result.entries {
-                    if let Some(segment) = translated_segments.get_mut(index) {
-                        segment.text = text;
+                for (index, entry) in result.source_entries {
+                    if let Some(segment) = source_segments.get_mut(index) {
+                        segment.text = entry.text;
+                        segment.status = if entry.action == "remove" {
+                            "removed".to_string()
+                        } else {
+                            "reviewed".to_string()
+                        };
                     }
                 }
-                mark_range_status(
+                for (index, entry) in result.target_entries {
+                    if let Some(segment) = translated_segments.get_mut(index) {
+                        segment.text = entry.text;
+                        segment.status = if entry.action == "remove" {
+                            "removed".to_string()
+                        } else {
+                            "reviewed".to_string()
+                        };
+                    }
+                }
+                mark_unfinished_review_range(
+                    &mut source_segments,
+                    result.chunk.start_index,
+                    result.chunk.end_index,
+                    "reviewed",
+                );
+                mark_unfinished_review_range(
                     &mut translated_segments,
                     result.chunk.start_index,
                     result.chunk.end_index,
-                    "optimized",
+                    "reviewed",
                 );
             }
             Err((chunk, error)) => {
+                mark_range_status(
+                    &mut source_segments,
+                    chunk.start_index,
+                    chunk.end_index,
+                    "translated",
+                );
                 mark_range_status(
                     &mut translated_segments,
                     chunk.start_index,
@@ -875,8 +942,8 @@ where
                 );
                 failed_chunks += 1;
                 log_session.warn(
-                    "post_translation_optimization_chunk_failed",
-                    "译后优化批次失败，已保留译文",
+                    "ai_subtitle_review_chunk_failed",
+                    "AI 字幕审核批次失败，已保留当前字幕",
                     json!({
                         "startIndex": chunk.start_index + 1,
                         "endIndex": chunk.end_index + 1,
@@ -897,9 +964,15 @@ where
                 &mut translated_segments,
                 chunk.start_index,
                 chunk.end_index,
-                "optimizing",
+                "reviewing",
             );
-            futures.push(run_post_optimization_chunk(
+            mark_range_status(
+                &mut source_segments,
+                chunk.start_index,
+                chunk.end_index,
+                "reviewing",
+            );
+            futures.push(run_translation_review_chunk(
                 settings,
                 ai_service,
                 source_entries,
@@ -909,21 +982,25 @@ where
             next_chunk_index += 1;
         }
 
-        warnings = build_processing_warnings("译后优化", failed_chunks, "优化批次");
+        warnings = build_processing_warnings("AI字幕审核", failed_chunks, "审核批次");
         let progress = stage_progress(0, 100, completed, total);
         let message = if completed == total {
-            "译后优化完成"
+            "AI 字幕审核完成"
         } else {
-            "译后优化中"
+            "AI 字幕审核中"
         };
         let status = if completed == total { "done" } else { "active" };
-        report(progress, message, status, &translated_segments, &warnings);
+        let snapshot = SubtitleReviewSnapshot {
+            source_segments: source_segments.clone(),
+            translated_segments: translated_segments.clone(),
+        };
+        report(progress, message, status, &snapshot, &warnings);
     }
 
     if failed_chunks > 0 {
         log_session.warn(
-            "post_translation_optimization_stage_partial",
-            "AI 译后优化部分批次失败，已保留译文",
+            "ai_subtitle_review_stage_partial",
+            "AI 字幕审核部分批次失败，已保留当前字幕",
             json!({
                 "failedChunkCount": failed_chunks,
                 "chunkCount": total,
@@ -931,8 +1008,9 @@ where
         );
     }
 
-    SubtitleProcessingResult {
-        segments: translated_segments,
+    SubtitleReviewResult {
+        source_segments,
+        translated_segments,
         warnings,
     }
 }
@@ -946,15 +1024,14 @@ async fn run_translation_chunk(
     translate_chunk_by_llm(settings, ai_service, chunk, log_session).await
 }
 
-async fn run_post_optimization_chunk(
+async fn run_translation_review_chunk(
     settings: &AppSettings,
     ai_service: &AiService,
     source_entries: BTreeMap<String, String>,
     chunk: TextChunk,
     log_session: LogSession,
-) -> Result<TextChunkResult, (TextChunk, String)> {
-    optimize_translation_chunk_by_llm(settings, ai_service, source_entries, chunk, log_session)
-        .await
+) -> Result<TranslationReviewChunkResult, (TextChunk, String)> {
+    review_translation_chunk_by_llm(settings, ai_service, source_entries, chunk, log_session).await
 }
 
 async fn translate_chunk_by_llm(
@@ -1040,14 +1117,14 @@ async fn translate_chunk_by_llm(
     Err((chunk, "LLM 翻译结果多次校验失败".to_string()))
 }
 
-async fn optimize_translation_chunk_by_llm(
+async fn review_translation_chunk_by_llm(
     settings: &AppSettings,
     ai_service: &AiService,
     source_entries: BTreeMap<String, String>,
     chunk: TextChunk,
     log_session: LogSession,
-) -> Result<TextChunkResult, (TextChunk, String)> {
-    let system_prompt = build_post_optimization_system_prompt(settings);
+) -> Result<TranslationReviewChunkResult, (TextChunk, String)> {
+    let system_prompt = build_translation_review_system_prompt(settings);
     let current_text = chunk
         .entries
         .values()
@@ -1057,9 +1134,8 @@ async fn optimize_translation_chunk_by_llm(
     let max_output_tokens = estimate_max_output_tokens(&current_text);
     let mut feedback = String::new();
 
-    for attempt in 1..=MAX_POST_OPTIMIZATION_ATTEMPTS {
-        let user_prompt =
-            build_post_optimization_user_prompt(&source_entries, &chunk.entries, &feedback);
+    for attempt in 1..=MAX_AI_SUBTITLE_REVIEW_ATTEMPTS {
+        let user_prompt = build_translation_review_user_prompt(&source_entries, &chunk.entries, &feedback);
         let response = match ai_service
             .chat_for_json_output(
                 settings,
@@ -1072,8 +1148,8 @@ async fn optimize_translation_chunk_by_llm(
             Ok(response) => response,
             Err(error) => {
                 log_session.warn(
-                    "post_translation_optimization_llm_request_failed",
-                    "译后优化 LLM 请求失败",
+                    "ai_subtitle_review_llm_request_failed",
+                    "AI 字幕审核 LLM 请求失败",
                     json!({
                         "attempt": attempt,
                         "startIndex": chunk.start_index + 1,
@@ -1085,11 +1161,11 @@ async fn optimize_translation_chunk_by_llm(
             }
         };
 
-        let parsed = match parse_json_text_map(&response) {
+        let parsed = match parse_translation_review_response(&response) {
             Ok(parsed) => parsed,
             Err(error) => {
-                feedback = build_json_parse_feedback(&chunk.entries, &error);
-                log_post_optimization_validation_failure(
+                feedback = build_translation_review_json_feedback(&source_entries, &chunk.entries, &error);
+                log_translation_review_validation_failure(
                     &log_session,
                     attempt,
                     &chunk,
@@ -1100,19 +1176,33 @@ async fn optimize_translation_chunk_by_llm(
             }
         };
 
-        match validate_or_remap_relative_keys(&chunk.entries, parsed) {
+        match validate_translation_review_keys(&chunk.entries, &parsed) {
             Ok(parsed) => {
-                let entries = parsed
-                    .into_iter()
-                    .filter_map(|(key, text)| {
-                        key.parse::<usize>().ok().map(|index| (index - 1, text))
+                let source_entries = parsed
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        key.parse::<usize>()
+                            .ok()
+                            .map(|index| (index - 1, entry.source.clone()))
                     })
                     .collect();
-                return Ok(TextChunkResult { chunk, entries });
+                let target_entries = parsed
+                    .into_iter()
+                    .filter_map(|(key, entry)| {
+                        key.parse::<usize>()
+                            .ok()
+                            .map(|index| (index - 1, entry.target))
+                    })
+                    .collect();
+                return Ok(TranslationReviewChunkResult {
+                    chunk,
+                    source_entries,
+                    target_entries,
+                });
             }
             Err(error) => {
-                feedback = build_key_mismatch_feedback(&chunk.entries, &error);
-                log_post_optimization_validation_failure(
+                feedback = build_translation_review_key_feedback(&source_entries, &chunk.entries, &error);
+                log_translation_review_validation_failure(
                     &log_session,
                     attempt,
                     &chunk,
@@ -1123,10 +1213,16 @@ async fn optimize_translation_chunk_by_llm(
         }
     }
 
-    Err((chunk, "LLM 译后优化结果多次校验失败".to_string()))
+    Err((chunk, "LLM AI 字幕审核结果多次校验失败".to_string()))
 }
 
-fn log_post_optimization_validation_failure(
+#[derive(Debug, Clone)]
+struct TranslationReviewEntry {
+    source: ReviewedTranslationEntry,
+    target: ReviewedTranslationEntry,
+}
+
+fn log_translation_review_validation_failure(
     log_session: &LogSession,
     attempt: usize,
     chunk: &TextChunk,
@@ -1134,8 +1230,8 @@ fn log_post_optimization_validation_failure(
     error: &str,
 ) {
     log_session.warn(
-        "post_translation_optimization_validation_failed",
-        "译后优化 LLM 结果校验失败，准备带反馈重试",
+        "ai_subtitle_review_validation_failed",
+        "AI 字幕审核 LLM 结果校验失败，准备带反馈重试",
         json!({
             "attempt": attempt,
             "startIndex": chunk.start_index + 1,
@@ -1206,21 +1302,28 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
     )
 }
 
-fn build_post_optimization_system_prompt(settings: &AppSettings) -> String {
+fn build_translation_review_system_prompt(settings: &AppSettings) -> String {
     let target_language = language_label(&settings.target_language);
-    let custom_prompt = post_optimization_reference();
+    let custom_prompt = translation_review_reference(&settings.video_content_type);
+    let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
+        "保守模式：严格保持行数和每行含义，只修正明确错误、漏译、错译、术语不一致、标点和明显机器翻译腔；不要删除字幕。"
+    } else {
+        "专家模式：字幕质量优先。允许删除无意义噪音行、支付提示、系统通知、背景杂音、重复废话；允许修正源文中上下文高度明确的 ASR 错误，并同步修正译文。"
+    };
 
     format!(
-        r#"你是一位专业字幕译后优化专家，专精于{target_language}字幕润色。请把同一批字幕行连成句子或段落理解，找出不通顺、生硬、前后衔接差或机器翻译腔的译文行，并在不改变时间轴和行数的前提下优化。
+        r#"你是一位专业 AI 字幕审核专家，专精于源文校对和{target_language}字幕终审。请把同一批字幕行连成上下文理解，审查源文和译文的字幕质量。
 
+<review_mode>{mode_rule}</review_mode>
 <rules>
-1. 保持输入 JSON 的所有真实 key，不新增、不删除、不合并、不拆分条目，也不要把本批重新编号为 1..N。
-2. 只优化译文表达、语序、衔接和术语一致性，不改变原意、数字、专有名词、方向性判断或风险提示。
-3. 相邻字幕跨句衔接时，允许让单行译文更自然地承接前后文，但不要把一行内容搬到另一行。
-4. 如果某行已经通顺，保留该行。
-5. 你可以在内部分析哪些行不通顺，但不要输出分析、理由、评分、建议或嵌套对象。
-6. 输出只能是单个 JSON object，第一字符必须是 {{，最后字符必须是 }}。
-7. 外层只能是字幕 key，key 和 value 都必须使用英文双引号；禁止输出数组、列表、key: value 文本、Markdown、XML 标签、代码块、解释或额外文本。
+1. 保持输入 JSON 的所有真实 key，不新增、不删除、不重命名 key，也不要把本批重新编号为 1..N。
+2. 每个 key 输出对象，必须包含 source 和 target 两个字段；source/target 都必须包含 text 和 action。
+3. action 只能是 keep、revise、remove。
+4. source.text 是审核后的源文；target.text 是审核后的译文。remove 表示该行是无意义噪音，导出时会跳过。
+5. 源文只修正上下文高度明确的 ASR 错误、术语误识别、错别字、无意义声音和系统噪音；不要凭空补充信息。
+6. 译文必须准确对应审核后的源文，修正错译、漏译、术语不一致、前后不通顺、机器翻译腔和不适合字幕阅读的问题。
+7. 严格保护数字、金额、价格、比例、专有名词、方向性判断、风险提示和事实。
+8. 输出只能是单个 JSON object，第一字符必须是 {{，最后字符必须是 }}；禁止 Markdown、解释、代码块、评分或额外文本。
 </rules>
 
 <terminology_and_requirements>
@@ -1229,7 +1332,10 @@ fn build_post_optimization_system_prompt(settings: &AppSettings) -> String {
 
 <output_format>
 {{
-  "<current_translation 中的真实 key>": "优化后的译文"
+  "<真实 key>": {{
+    "source": {{ "text": "审核后的源文", "action": "keep" }},
+    "target": {{ "text": "审核后的译文", "action": "keep" }}
+  }}
 }}
 </output_format>"#
     )
@@ -1312,7 +1418,7 @@ fn build_translation_key_feedback(
     )
 }
 
-fn build_post_optimization_user_prompt(
+fn build_translation_review_user_prompt(
     source_entries: &BTreeMap<String, String>,
     translated_entries: &BTreeMap<String, String>,
     feedback: &str,
@@ -1320,23 +1426,13 @@ fn build_post_optimization_user_prompt(
     let source_json = serde_json::to_string(source_entries).unwrap_or_else(|_| "{}".to_string());
     let translated_json =
         serde_json::to_string(translated_entries).unwrap_or_else(|_| "{}".to_string());
-    let required_keys = sorted_subtitle_keys(translated_entries);
-    let required_keys_json =
-        serde_json::to_string(&required_keys).unwrap_or_else(|_| "[]".to_string());
-    let paragraph = translated_entries
-        .values()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let output_template = translation_review_output_template(source_entries, translated_entries);
     let mut prompt = format!(
-        "请对以下同批字幕译文做译后优化。先把译文行组成句子或段落理解，在内部判断哪些行不通顺，然后只输出 key 完全一致、value 全部为字符串的 JSON 对象。\n\
-         <required_keys>{required_keys_json}</required_keys>\n\
-         <output_contract>required_keys 只用于核对，不要原样输出 required_keys 数组。最终输出必须是单个 JSON object；必须完整使用 required_keys 中的真实字幕编号；key 和 value 都必须使用英文双引号；禁止遗漏、增加、重命名 key；禁止从 1 重新编号；禁止输出数组、列表、key: value 文本、Markdown、说明文字、思考过程或 XML 标签。</output_contract>\n\
+        "请审核以下同批字幕。最终必须输出 JSON object，key 必须与 current_translation 完全一致。\n\
          <source_subtitle>{source_json}</source_subtitle>\n\
          <current_translation>{translated_json}</current_translation>\n\
-         <output_template>{translated_json}</output_template>\n\
-         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只根据上下文改写 value；不需要优化的 value 原样保留。</template_rule>\n\
-         <translation_paragraph>{paragraph}</translation_paragraph>\n\
+         <output_template>{output_template}</output_template>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改 source/target 下的 text 和 action。</template_rule>\n\
          <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
     );
 
@@ -1349,32 +1445,54 @@ fn build_post_optimization_user_prompt(
     prompt
 }
 
-fn build_json_parse_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
-    let required_keys_json =
-        serde_json::to_string(&sorted_subtitle_keys(entries)).unwrap_or_else(|_| "[]".to_string());
-    let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+fn build_translation_review_json_feedback(
+    source_entries: &BTreeMap<String, String>,
+    translated_entries: &BTreeMap<String, String>,
+    error: &str,
+) -> String {
+    let output_template = translation_review_output_template(source_entries, translated_entries);
 
     format!(
-        "上一次结果不是有效 JSON: {error}\n请只输出一个完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。key 和 value 都必须使用英文双引号。不要输出数组、列表、key: value 文本、Markdown、说明、思考过程或 XML 标签。必须包含这些真实 key: {required_keys_json}。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
+        "上一次结果不是有效 AI 字幕审核 JSON: {error}\n请只输出完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。每个 key 必须包含 source 和 target，二者都必须包含 text 和 action。请复制这个结构: {output_template}"
     )
 }
 
-fn build_key_mismatch_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
-    let required_keys = sorted_subtitle_keys(entries);
-    let required_keys_json =
-        serde_json::to_string(&required_keys).unwrap_or_else(|_| "[]".to_string());
-    let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
-    let key_hint = match (required_keys.first(), required_keys.last()) {
-        (Some(first), Some(last)) if first != last => {
-            format!("本批 key 从 {first} 到 {last}，不能改成 1..N。")
-        }
-        (Some(only), _) => format!("本批唯一 key 是 {only}，不能改成 1。"),
-        _ => String::new(),
-    };
+fn build_translation_review_key_feedback(
+    source_entries: &BTreeMap<String, String>,
+    translated_entries: &BTreeMap<String, String>,
+    error: &str,
+) -> String {
+    let output_template = translation_review_output_template(source_entries, translated_entries);
 
     format!(
-        "上一次结果 key 不匹配: {error}\n{key_hint}请输出完整 JSON，必须且只能包含这些真实 key: {required_keys_json}。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
+        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含当前批次所有真实 key，不能新增、遗漏或重命名。请复制这个结构: {output_template}"
     )
+}
+
+fn translation_review_output_template(
+    source_entries: &BTreeMap<String, String>,
+    translated_entries: &BTreeMap<String, String>,
+) -> String {
+    let template = translated_entries
+        .iter()
+        .map(|(key, target)| {
+            (
+                key.clone(),
+                json!({
+                    "source": {
+                        "text": source_entries.get(key).cloned().unwrap_or_default(),
+                        "action": "keep",
+                    },
+                    "target": {
+                        "text": target,
+                        "action": "keep",
+                    },
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    Value::Object(template).to_string()
 }
 
 fn translation_reference(video_content_type: &str) -> &'static str {
@@ -1384,18 +1502,21 @@ fn translation_reference(video_content_type: &str) -> &'static str {
     }
 }
 
-fn post_optimization_reference() -> &'static str {
-    POST_OPTIMIZATION_REFERENCE
+fn translation_review_reference(video_content_type: &str) -> &'static str {
+    match video_content_type {
+        "trading" => TRADING_TRANSLATION_REFERENCE,
+        _ => AI_REVIEW_REFERENCE,
+    }
 }
 
 const GENERAL_TRANSLATION_REFERENCE: &str =
     "通用视频内容。优先保证准确、自然、口语可读，术语按上下文保持一致。";
 
-const POST_OPTIMIZATION_REFERENCE: &str = r#"译后优化与视频类型无关，只处理已经生成的译文。
-- 优化范围只限相邻字幕之间的衔接、重复开头、语序不顺和机器翻译腔。
-- 不重译、不扩写、不新增解释，不为了风格统一改写已经可接受的译文。
-- 保留原文对应的事实、数字、专有名词、术语、方向性判断和风险提示。
-- 如果上下文不足，优先保留当前译文，不猜测补充。"#;
+const AI_REVIEW_REFERENCE: &str = r#"通用字幕 AI 审核要求：
+- 源文审核：修正上下文高度明确的 ASR 错字、专名误识别、口癖、无意义声音和与主体内容无关的系统噪音。
+- 译文审核：修正错译、漏译、术语不一致、前后不通顺、机器翻译腔和不适合字幕阅读的问题。
+- 噪音移除：支付成功、到账、系统播报、背景提示音、掌声笑声等与主体内容无关的行在专家模式下标记 remove。
+- 保守原则：没有足够上下文时保留当前内容，不猜测补充。"#;
 
 const TRADING_TRANSLATION_REFERENCE: &str = r#"交易视频内容。参考 VideoCaptioner 交易类提示词，以下交易相关规则必须保留并优先执行。
 
@@ -1541,6 +1662,18 @@ fn build_output_segments(
             .collect(),
         _ => translated_segments.to_vec(),
     }
+}
+
+fn filter_removed_translation_pairs(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &[TranscriptionSegment],
+) -> (Vec<TranscriptionSegment>, Vec<TranscriptionSegment>) {
+    source_segments
+        .iter()
+        .zip(translated_segments.iter())
+        .filter(|(source, translated)| source.status != "removed" && translated.status != "removed")
+        .map(|(source, translated)| (source.clone(), translated.clone()))
+        .unzip()
 }
 
 pub(crate) fn load_subtitle_segments(path: &Path) -> Result<Vec<TranscriptionSegment>, String> {
@@ -2040,6 +2173,206 @@ fn parse_json_text_map_value(value: &Value) -> Result<BTreeMap<String, String>, 
     Err(last_error)
 }
 
+fn parse_translation_review_response(
+    text: &str,
+) -> Result<BTreeMap<String, TranslationReviewEntry>, String> {
+    let candidates = extract_json_object_candidates(text);
+    if candidates.is_empty() {
+        return Err("未找到 JSON 对象开始符".to_string());
+    }
+
+    let mut last_error = String::new();
+    for json_text in candidates.iter().rev() {
+        match parse_translation_review_candidate(json_text) {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = error,
+        }
+    }
+
+    Err(last_error)
+}
+
+fn parse_translation_review_candidate(
+    json_text: &str,
+) -> Result<BTreeMap<String, TranslationReviewEntry>, String> {
+    let value = serde_json::from_str::<Value>(json_text)
+        .map_err(|error| format!("JSON 解析失败: {error}"))?;
+    parse_translation_review_value(&value)
+}
+
+fn parse_translation_review_value(
+    value: &Value,
+) -> Result<BTreeMap<String, TranslationReviewEntry>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "LLM 返回内容不是 JSON 对象".to_string())?;
+
+    if let Ok(result) = parse_translation_review_object(object) {
+        return Ok(result);
+    }
+
+    for field in ["reviewed", "reviews", "results", "result", "items", "data", "output"] {
+        let Some(nested) = object.get(field) else {
+            continue;
+        };
+
+        match nested {
+            Value::Object(nested_object) => {
+                if let Ok(result) = parse_translation_review_object(nested_object) {
+                    return Ok(result);
+                }
+            }
+            Value::Array(items) => {
+                if let Ok(result) = parse_translation_review_array(items) {
+                    return Ok(result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err("未找到 AI 字幕审核编号 key".to_string())
+}
+
+fn parse_translation_review_object(
+    object: &serde_json::Map<String, Value>,
+) -> Result<BTreeMap<String, TranslationReviewEntry>, String> {
+    let mut result = BTreeMap::new();
+    let mut last_error = String::new();
+
+    for (key, value) in object {
+        let Some(normalized_key) = normalize_subtitle_key(key) else {
+            continue;
+        };
+
+        match parse_translation_review_entry(value) {
+            Ok(entry) => {
+                result.insert(normalized_key, entry);
+            }
+            Err(error) => {
+                last_error = format!("key {key} {error}");
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        return Ok(result);
+    }
+
+    if last_error.is_empty() {
+        Err("未找到 AI 字幕审核编号 key".to_string())
+    } else {
+        Err(last_error)
+    }
+}
+
+fn parse_translation_review_array(
+    items: &[Value],
+) -> Result<BTreeMap<String, TranslationReviewEntry>, String> {
+    let mut result = BTreeMap::new();
+    let mut last_error = String::new();
+
+    for item in items {
+        let Some(object) = item.as_object() else {
+            last_error = "数组项不是 JSON 对象".to_string();
+            continue;
+        };
+        let Some(key) = extract_subtitle_key_from_object(object) else {
+            last_error = "数组项缺少字幕编号字段".to_string();
+            continue;
+        };
+
+        match parse_translation_review_entry(item) {
+            Ok(entry) => {
+                result.insert(key, entry);
+            }
+            Err(error) => {
+                last_error = error;
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        return Ok(result);
+    }
+
+    if last_error.is_empty() {
+        Err("未找到 AI 字幕审核编号 key".to_string())
+    } else {
+        Err(last_error)
+    }
+}
+
+fn parse_translation_review_entry(value: &Value) -> Result<TranslationReviewEntry, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "的值不是对象".to_string())?;
+
+    let source = object
+        .get("source")
+        .or_else(|| object.get("sourceText"))
+        .or_else(|| object.get("source_text"))
+        .map(parse_reviewed_translation_entry)
+        .transpose()?
+        .unwrap_or_else(|| ReviewedTranslationEntry {
+            text: String::new(),
+            action: "keep".to_string(),
+        });
+    let target = object
+        .get("target")
+        .or_else(|| object.get("translation"))
+        .or_else(|| object.get("targetText"))
+        .or_else(|| object.get("target_text"))
+        .map(parse_reviewed_translation_entry)
+        .transpose()?
+        .unwrap_or_else(|| ReviewedTranslationEntry {
+            text: String::new(),
+            action: "keep".to_string(),
+        });
+
+    Ok(TranslationReviewEntry { source, target })
+}
+
+fn parse_reviewed_translation_entry(value: &Value) -> Result<ReviewedTranslationEntry, String> {
+    if let Some(text) = value.as_str() {
+        return Ok(ReviewedTranslationEntry {
+            text: text.to_string(),
+            action: "revise".to_string(),
+        });
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| "不是字符串或对象".to_string())?;
+    let text = [
+        "text",
+        "value",
+        "content",
+        "subtitle",
+        "caption",
+        "revised",
+        "revised_text",
+        "revisedText",
+    ]
+    .iter()
+    .find_map(|field| object.get(*field).and_then(Value::as_str))
+    .unwrap_or_default()
+    .to_string();
+    let action = object
+        .get("action")
+        .or_else(|| object.get("operation"))
+        .or_else(|| object.get("status"))
+        .and_then(Value::as_str)
+        .map(normalize_review_action)
+        .unwrap_or_else(|| if text.trim().is_empty() { "remove".to_string() } else { "revise".to_string() });
+
+    if !matches!(action.as_str(), "keep" | "revise" | "remove") {
+        return Err("包含不支持的 action".to_string());
+    }
+
+    Ok(ReviewedTranslationEntry { text, action })
+}
+
 fn parse_text_map_object(
     object: &serde_json::Map<String, Value>,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -2174,6 +2507,15 @@ fn extract_subtitle_text_value(value: &Value) -> Result<String, String> {
     }
 
     Err("缺少译文字段字符串".to_string())
+}
+
+fn normalize_review_action(action: &str) -> String {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "remove" | "removed" | "delete" | "deleted" | "noise" | "drop" => "remove".to_string(),
+        "keep" | "kept" | "unchanged" => "keep".to_string(),
+        "revise" | "revised" | "edit" | "edited" | "fix" | "fixed" => "revise".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn extract_subtitle_key_from_object(object: &serde_json::Map<String, Value>) -> Option<String> {
@@ -2357,6 +2699,29 @@ fn validate_keys(
     Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
 }
 
+fn validate_translation_review_keys(
+    expected: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, TranslationReviewEntry>,
+) -> Result<BTreeMap<String, TranslationReviewEntry>, String> {
+    let expected_keys = expected.keys().cloned().collect::<HashSet<_>>();
+    let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
+
+    if expected_keys == actual_keys {
+        return Ok(actual.clone());
+    }
+
+    let missing = expected_keys
+        .difference(&actual_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = actual_keys
+        .difference(&expected_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
+}
+
 fn mark_range_status(
     segments: &mut [TranscriptionSegment],
     start_index: usize,
@@ -2380,9 +2745,29 @@ fn assign_segment_metadata(segments: &mut [TranscriptionSegment], uid_prefix: &s
     }
 }
 
-fn mark_segments_status(segments: &mut [TranscriptionSegment], status: &str) {
+fn mark_finished_segments_status(segments: &mut [TranscriptionSegment], status: &str) {
     for segment in segments {
-        segment.status = status.to_string();
+        if segment.status != "removed" {
+            segment.status = status.to_string();
+        }
+    }
+}
+
+fn mark_unfinished_review_range(
+    segments: &mut [TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+    fallback_status: &str,
+) {
+    if start_index >= segments.len() {
+        return;
+    }
+
+    let end_index = end_index.min(segments.len().saturating_sub(1));
+    for segment in &mut segments[start_index..=end_index] {
+        if segment.status == "reviewing" {
+            segment.status = fallback_status.to_string();
+        }
     }
 }
 
@@ -2413,7 +2798,7 @@ fn stage_progress(start: u8, end: u8, completed: usize, total: usize) -> u8 {
 fn overall_progress(stages: &SubtitleTranslationStageProgress) -> u8 {
     let visible = [
         stages.subtitle_translation.as_ref(),
-        stages.post_translation_optimization.as_ref(),
+        stages.ai_subtitle_review.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -2476,7 +2861,8 @@ fn log_translation_settings(log_session: &LogSession, settings: &AppSettings) {
             "videoContentType": &settings.video_content_type,
             "outputMode": &settings.output_mode,
             "subtitleTranslationEnabled": settings.is_subtitle_translation_enabled,
-            "postTranslationOptimizationEnabled": settings.is_post_translation_optimization_enabled,
+            "aiSubtitleReviewEnabled": settings.is_ai_subtitle_review_enabled,
+            "aiSubtitleReviewMode": &settings.ai_subtitle_review_mode,
             "targetLanguage": &settings.target_language,
             "selectedLlmService": &settings.selected_llm_service,
             "llmBaseUrl": llm_config.map(|config| config.base_url.as_str()).unwrap_or(""),

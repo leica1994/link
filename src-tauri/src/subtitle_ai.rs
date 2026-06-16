@@ -11,6 +11,7 @@ const MAX_SEGMENT_WORDS_ENGLISH: usize = 18;
 const MAX_SPLIT_CHUNK_WORDS: usize = 500;
 const MAX_SPLIT_ATTEMPTS: usize = 2;
 const MAX_CORRECTION_ATTEMPTS: usize = 3;
+const MAX_SOURCE_REVIEW_ATTEMPTS: usize = 3;
 const RULE_SPLIT_GAP_MS: u64 = 500;
 const RULE_MAX_GAP_MS: u64 = 1500;
 const TIME_GAP_WINDOW_SIZE: usize = 5;
@@ -45,6 +46,18 @@ struct CorrectionChunk {
 struct CorrectionChunkResult {
     chunk: CorrectionChunk,
     entries: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceReviewChunkResult {
+    chunk: CorrectionChunk,
+    entries: Vec<(usize, ReviewedSourceEntry)>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewedSourceEntry {
+    text: String,
+    action: String,
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +543,159 @@ where
     }
 }
 
+pub async fn review_source_subtitles<F>(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    log_session: &LogSession,
+    segments: Vec<TranscriptionSegment>,
+    report: &mut F,
+) -> SubtitleProcessingResult
+where
+    F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
+{
+    if segments.is_empty() {
+        return SubtitleProcessingResult {
+            segments,
+            warnings: Vec::new(),
+        };
+    }
+
+    let chunks = build_correction_chunks(&segments, settings.translation_batch_size.max(1) as usize);
+    let mut reviewed_segments = segments;
+    let mut failed_chunks = 0usize;
+    let mut warnings = Vec::new();
+
+    if chunks.is_empty() {
+        return SubtitleProcessingResult {
+            segments: reviewed_segments,
+            warnings,
+        };
+    }
+
+    log_session.info(
+        "source_subtitle_review_stage_prepared",
+        "AI 源文审核批次已准备",
+        json!({
+            "inputSegmentCount": reviewed_segments.len(),
+            "chunkCount": chunks.len(),
+            "batchSize": settings.translation_batch_size.max(1),
+            "videoContentType": &settings.video_content_type,
+            "reviewMode": &settings.ai_subtitle_review_mode,
+            "llmMode": "configured_llm_settings_json_response",
+        }),
+    );
+
+    let total = chunks.len().max(1);
+    let max_active = active_ai_work_count(settings);
+    let mut futures = FuturesUnordered::new();
+    let mut next_chunk_index = 0usize;
+
+    while next_chunk_index < chunks.len() && futures.len() < max_active {
+        let chunk = chunks[next_chunk_index].clone();
+        mark_range_status(
+            &mut reviewed_segments,
+            chunk.start_index,
+            chunk.end_index,
+            "reviewing",
+        );
+        futures.push(run_source_review_chunk(
+            settings,
+            ai_service,
+            chunk,
+            log_session.clone(),
+        ));
+        next_chunk_index += 1;
+    }
+    report(0, "AI 源文审核中", &reviewed_segments, &warnings);
+
+    let mut completed = 0usize;
+    while let Some(result) = futures.next().await {
+        completed += 1;
+
+        match result {
+            Ok(result) => {
+                for (index, entry) in result.entries {
+                    if let Some(segment) = reviewed_segments.get_mut(index) {
+                        segment.text = entry.text;
+                        segment.status = if entry.action == "remove" {
+                            "removed".to_string()
+                        } else {
+                            "reviewed".to_string()
+                        };
+                    }
+                }
+                mark_unfinished_review_range(
+                    &mut reviewed_segments,
+                    result.chunk.start_index,
+                    result.chunk.end_index,
+                    "reviewed",
+                );
+            }
+            Err((chunk, error)) => {
+                mark_range_status(
+                    &mut reviewed_segments,
+                    chunk.start_index,
+                    chunk.end_index,
+                    "kept",
+                );
+                failed_chunks += 1;
+                log_session.warn(
+                    "source_subtitle_review_chunk_failed",
+                    "源文审核批次失败，已保留原文",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "entryCount": chunk.entries.len(),
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+
+        while next_chunk_index < chunks.len() && futures.len() < max_active {
+            let chunk = chunks[next_chunk_index].clone();
+            mark_range_status(
+                &mut reviewed_segments,
+                chunk.start_index,
+                chunk.end_index,
+                "reviewing",
+            );
+            futures.push(run_source_review_chunk(
+                settings,
+                ai_service,
+                chunk,
+                log_session.clone(),
+            ));
+            next_chunk_index += 1;
+        }
+
+        warnings = build_processing_warnings("AI源文审核", failed_chunks, "审核批次");
+        let progress = stage_progress(0, 100, completed, total);
+        let message = if completed == total {
+            "AI 源文审核完成"
+        } else {
+            "AI 源文审核中"
+        };
+        report(progress, message, &reviewed_segments, &warnings);
+    }
+
+    if failed_chunks > 0 {
+        log_session.warn(
+            "source_subtitle_review_stage_partial",
+            "AI 源文审核部分批次失败，已保留原文",
+            json!({
+                "failedChunkCount": failed_chunks,
+                "chunkCount": total,
+            }),
+        );
+    }
+
+    SubtitleProcessingResult {
+        segments: reviewed_segments,
+        warnings,
+    }
+}
+
 fn build_segmentation_blocks(segments: &[TranscriptionSegment]) -> Vec<SegmentationBlock> {
     let mut blocks = Vec::new();
     let mut current_segments = Vec::new();
@@ -720,6 +886,15 @@ async fn run_correction_chunk(
     .await
 }
 
+async fn run_source_review_chunk(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: CorrectionChunk,
+    log_session: LogSession,
+) -> Result<SourceReviewChunkResult, (CorrectionChunk, String)> {
+    review_source_chunk_by_llm(settings, ai_service, chunk, log_session).await
+}
+
 async fn split_chunk_by_llm(
     settings: &AppSettings,
     ai_service: &AiService,
@@ -893,6 +1068,167 @@ async fn correct_chunk_by_llm(
     Err((chunk, "LLM 校正结果多次校验失败".to_string()))
 }
 
+async fn review_source_chunk_by_llm(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: CorrectionChunk,
+    log_session: LogSession,
+) -> Result<SourceReviewChunkResult, (CorrectionChunk, String)> {
+    let system_prompt = build_source_review_system_prompt(settings);
+    let max_output_tokens = estimate_max_output_tokens(
+        &chunk
+            .entries
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let mut feedback = String::new();
+
+    for attempt in 1..=MAX_SOURCE_REVIEW_ATTEMPTS {
+        let user_prompt = build_source_review_user_prompt(&chunk.entries, &feedback);
+        let response = match ai_service
+            .chat_for_json_output(
+                settings,
+                system_prompt.clone(),
+                user_prompt,
+                max_output_tokens,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log_session.warn(
+                    "source_subtitle_review_llm_request_failed",
+                    "源文审核 LLM 请求失败",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": &error,
+                    }),
+                );
+                return Err((chunk, error));
+            }
+        };
+
+        let parsed = match parse_source_review_response(&response) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                feedback = build_source_review_json_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "source_subtitle_review_validation_failed",
+                    "源文审核 LLM 结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "json_parse",
+                        "error": &error,
+                    }),
+                );
+                continue;
+            }
+        };
+
+        match validate_source_review_keys(&chunk.entries, &parsed) {
+            Ok(()) => {
+                let entries = parsed
+                    .into_iter()
+                    .filter_map(|(key, entry)| {
+                        key.parse::<usize>().ok().map(|index| (index - 1, entry))
+                    })
+                    .collect();
+                return Ok(SourceReviewChunkResult { chunk, entries });
+            }
+            Err(error) => {
+                feedback = build_source_review_key_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "source_subtitle_review_validation_failed",
+                    "源文审核 LLM 结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "key_mismatch",
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+    }
+
+    Err((chunk, "LLM 源文审核结果多次校验失败".to_string()))
+}
+
+fn build_source_review_system_prompt(settings: &AppSettings) -> String {
+    let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
+        "保守模式：严格保持每条字幕的独立含义，不删除内容；只有明显 ASR 错字、术语误识别、口癖、标点和非语言声音可修正。"
+    } else {
+        "专家模式：以最终字幕质量为第一目标。可以删除无意义噪音行、支付提示、系统音、背景杂音、重复废话；可以修正上下文高度明确的 ASR 误识别和术语错误。"
+    };
+    let reference = match settings.video_content_type.as_str() {
+        "trading" => "交易视频：重点保护数字、价格、百分比、ticker、交易方向、周期、指标和 Al Brooks 价格行为术语。macro channel/gap、macro E-mini 在交易语境中应修正为 micro channel/gap、micro E-mini。",
+        _ => "通用视频：优先保证语义准确、上下文通顺、字幕可读。术语按上下文最小改动修正。",
+    };
+
+    format!(
+        r#"你是一位专业 AI 字幕审核专家，正在审核 ASR 转录后的源文字幕。
+
+<review_mode>{mode_rule}</review_mode>
+<domain_reference>{reference}</domain_reference>
+
+<rules>
+1. 保持输入 JSON 的所有真实 key，不新增、不删除、不重命名 key。
+2. 每个 key 输出对象，必须包含 text 和 action 两个字段。
+3. action 只能是 keep、revise、remove。
+4. keep 表示原文可接受，text 原样保留；revise 表示修正源文，text 写修正后的原文；remove 表示该行是噪音或无意义内容，text 可保留原文或写空字符串。
+5. 只修正上下文高度明确的问题，不要凭空补充音频中不存在的信息。
+6. 不翻译源文，不改变数字、专有名词、方向性判断、风险提示和事实。
+7. 支付成功、到账、系统通知、背景提示音、无意义拟声词、掌声笑声等与主体内容无关的转录行，在专家模式下标记 remove。
+8. 输出只能是单个 JSON object，第一字符必须是 {{，最后字符必须是 }}；禁止 Markdown、解释、代码块或额外文本。
+</rules>
+
+<output_format>
+{{
+  "1": {{ "text": "审核后的源文", "action": "keep" }}
+}}
+</output_format>"#
+    )
+}
+
+fn build_source_review_user_prompt(entries: &BTreeMap<String, String>, feedback: &str) -> String {
+    let input_json = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+    let output_template = entries
+        .iter()
+        .map(|(key, text)| {
+            (
+                key.clone(),
+                json!({
+                    "text": text,
+                    "action": "keep",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let output_template = Value::Object(output_template).to_string();
+    let mut prompt = format!(
+        "请审核以下源文字幕 JSON。最终必须输出 JSON object，key 必须与输入完全一致。\n\
+         <source_subtitle>{input_json}</source_subtitle>\n\
+         <output_template>{output_template}</output_template>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改每个 key 下的 text 和 action。</template_rule>\n\
+         <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
+    );
+
+    if !feedback.is_empty() {
+        prompt.push_str("\n<feedback>");
+        prompt.push_str(feedback);
+        prompt.push_str("</feedback>");
+    }
+
+    prompt
+}
+
 fn prompt_strategy_for(video_content_type: &str) -> Box<dyn VideoPromptStrategy + Send + Sync> {
     match video_content_type {
         "trading" => Box::new(TradingPromptStrategy),
@@ -959,6 +1295,39 @@ fn build_correction_key_feedback(entries: &BTreeMap<String, String>, error: &str
     format!(
         "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
     )
+}
+
+fn build_source_review_json_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
+    let output_template = source_review_output_template(entries);
+
+    format!(
+        "上一次结果不是有效源文审核 JSON: {error}\n请只输出完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。每个 key 的 value 必须是包含 text 和 action 的对象，action 只能是 keep、revise、remove。请复制这个结构: {output_template}"
+    )
+}
+
+fn build_source_review_key_feedback(entries: &BTreeMap<String, String>, error: &str) -> String {
+    let output_template = source_review_output_template(entries);
+
+    format!(
+        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key，不能新增、遗漏或重命名。请复制这个结构: {output_template}"
+    )
+}
+
+fn source_review_output_template(entries: &BTreeMap<String, String>) -> String {
+    let template = entries
+        .iter()
+        .map(|(key, text)| {
+            (
+                key.clone(),
+                json!({
+                    "text": text,
+                    "action": "keep",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    Value::Object(template).to_string()
 }
 
 fn build_word_units(segments: &[TranscriptionSegment]) -> Vec<WordUnit> {
@@ -1522,6 +1891,210 @@ fn parse_json_text_map(text: &str) -> Result<BTreeMap<String, String>, String> {
     Err(last_error)
 }
 
+fn parse_source_review_response(text: &str) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+    let candidates = extract_json_object_candidates(text);
+    if candidates.is_empty() {
+        return Err("未找到 JSON 对象开始符".to_string());
+    }
+
+    let mut last_error = String::new();
+    for json_text in candidates.iter().rev() {
+        match parse_source_review_candidate(json_text) {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = error,
+        }
+    }
+
+    Err(last_error)
+}
+
+fn parse_source_review_candidate(json_text: &str) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+    let value = serde_json::from_str::<Value>(json_text)
+        .map_err(|error| format!("JSON 解析失败: {error}"))?;
+    parse_source_review_value(&value)
+}
+
+fn parse_source_review_value(value: &Value) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "LLM 返回内容不是 JSON 对象".to_string())?;
+
+    if let Ok(result) = parse_source_review_object(object) {
+        return Ok(result);
+    }
+
+    for field in ["reviewed", "reviews", "results", "result", "items", "data", "output"] {
+        let Some(nested) = object.get(field) else {
+            continue;
+        };
+
+        match nested {
+            Value::Object(nested_object) => {
+                if let Ok(result) = parse_source_review_object(nested_object) {
+                    return Ok(result);
+                }
+            }
+            Value::Array(items) => {
+                if let Ok(result) = parse_source_review_array(items) {
+                    return Ok(result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err("未找到源文审核字幕编号 key".to_string())
+}
+
+fn parse_source_review_object(
+    object: &serde_json::Map<String, Value>,
+) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+    let mut result = BTreeMap::new();
+    let mut last_error = String::new();
+
+    for (key, value) in object {
+        let Some(normalized_key) = normalize_subtitle_key(key) else {
+            continue;
+        };
+
+        match parse_reviewed_source_entry(value) {
+            Ok(entry) => {
+                result.insert(normalized_key, entry);
+            }
+            Err(error) => {
+                last_error = format!("key {key} {error}");
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        return Ok(result);
+    }
+
+    if last_error.is_empty() {
+        Err("未找到源文审核字幕编号 key".to_string())
+    } else {
+        Err(last_error)
+    }
+}
+
+fn mark_unfinished_review_range(
+    segments: &mut [TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+    status: &str,
+) {
+    if start_index >= segments.len() {
+        return;
+    }
+
+    let end_index = end_index.min(segments.len().saturating_sub(1));
+    for segment in &mut segments[start_index..=end_index] {
+        if segment.status == "reviewing" {
+            segment.status = status.to_string();
+        }
+    }
+}
+
+fn parse_source_review_array(items: &[Value]) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+    let mut result = BTreeMap::new();
+    let mut last_error = String::new();
+
+    for item in items {
+        let Some(object) = item.as_object() else {
+            last_error = "数组项不是 JSON 对象".to_string();
+            continue;
+        };
+        let Some(key) = extract_subtitle_key_from_object(object) else {
+            last_error = "数组项缺少字幕编号字段".to_string();
+            continue;
+        };
+
+        match parse_reviewed_source_entry(item) {
+            Ok(entry) => {
+                result.insert(key, entry);
+            }
+            Err(error) => {
+                last_error = error;
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        return Ok(result);
+    }
+
+    if last_error.is_empty() {
+        Err("未找到源文审核字幕编号 key".to_string())
+    } else {
+        Err(last_error)
+    }
+}
+
+fn extract_subtitle_key_from_object(object: &serde_json::Map<String, Value>) -> Option<String> {
+    ["id", "index", "key", "line", "line_number", "number"]
+        .iter()
+        .find_map(|field| {
+            object.get(*field).and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(normalize_subtitle_key)
+                    .or_else(|| value.as_u64().map(|number| number.to_string()))
+            })
+        })
+}
+
+fn normalize_subtitle_key(key: &str) -> Option<String> {
+    let trimmed = key.trim().trim_start_matches('#');
+    let numeric = trimmed.parse::<usize>().ok()?;
+
+    if numeric == 0 {
+        None
+    } else {
+        Some(numeric.to_string())
+    }
+}
+
+fn parse_reviewed_source_entry(value: &Value) -> Result<ReviewedSourceEntry, String> {
+    if let Some(text) = value.as_str() {
+        return Ok(ReviewedSourceEntry {
+            text: text.to_string(),
+            action: "revise".to_string(),
+        });
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| "的值不是字符串或对象".to_string())?;
+    let text = ["text", "source_text", "sourceText", "revised_text", "revisedText", "content", "value", "字幕"]
+        .iter()
+        .find_map(|field| object.get(*field).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    let action = object
+        .get("action")
+        .or_else(|| object.get("operation"))
+        .or_else(|| object.get("status"))
+        .and_then(Value::as_str)
+        .map(normalize_review_action)
+        .unwrap_or_else(|| if text.trim().is_empty() { "remove".to_string() } else { "revise".to_string() });
+
+    if !matches!(action.as_str(), "keep" | "revise" | "remove") {
+        return Err("包含不支持的 action".to_string());
+    }
+
+    Ok(ReviewedSourceEntry { text, action })
+}
+
+fn normalize_review_action(action: &str) -> String {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "remove" | "removed" | "delete" | "deleted" | "noise" | "drop" => "remove".to_string(),
+        "keep" | "kept" | "unchanged" => "keep".to_string(),
+        "revise" | "revised" | "edit" | "edited" | "fix" | "fixed" => "revise".to_string(),
+        _ => action.trim().to_ascii_lowercase(),
+    }
+}
+
 fn parse_json_text_map_candidate(json_text: &str) -> Result<BTreeMap<String, String>, String> {
     let value = serde_json::from_str::<Value>(json_text)
         .map_err(|error| format!("JSON 解析失败: {error}"))?;
@@ -1592,6 +2165,29 @@ fn extract_json_object_candidates(text: &str) -> Vec<&str> {
 fn validate_correction_keys(
     expected: &BTreeMap<String, String>,
     actual: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let expected_keys = expected.keys().cloned().collect::<HashSet<_>>();
+    let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
+
+    if expected_keys == actual_keys {
+        return Ok(());
+    }
+
+    let missing = expected_keys
+        .difference(&actual_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = actual_keys
+        .difference(&expected_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
+}
+
+fn validate_source_review_keys(
+    expected: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, ReviewedSourceEntry>,
 ) -> Result<(), String> {
     let expected_keys = expected.keys().cloned().collect::<HashSet<_>>();
     let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();

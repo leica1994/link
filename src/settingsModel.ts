@@ -30,6 +30,11 @@ export enum VideoContentType {
   Trading = 'trading',
 }
 
+export enum AiSubtitleReviewMode {
+  Expert = 'expert',
+  Conservative = 'conservative',
+}
+
 export enum SubtitleFormat {
   Srt = 'srt',
   Vtt = 'vtt',
@@ -80,7 +85,8 @@ export type AppSettings = {
   outputMode: OutputMode
   isSubtitleCorrectionEnabled: boolean
   isSubtitleTranslationEnabled: boolean
-  isPostTranslationOptimizationEnabled: boolean
+  isAiSubtitleReviewEnabled: boolean
+  aiSubtitleReviewMode: AiSubtitleReviewMode
   targetLanguage: string
   dubbingTtsIntervalMs: number
   dubbingReferenceAudioSource: ReferenceAudioSource
@@ -121,6 +127,11 @@ export const translationServiceOptions = [
 export const videoContentTypeOptions = [
   { value: VideoContentType.General, label: '通用' },
   { value: VideoContentType.Trading, label: '交易' },
+] as const
+
+export const aiSubtitleReviewModeOptions = [
+  { value: AiSubtitleReviewMode.Expert, label: '专家审核' },
+  { value: AiSubtitleReviewMode.Conservative, label: '保守审核' },
 ] as const
 
 export const subtitleFormatOptions = [
@@ -497,10 +508,13 @@ export const normalizeSettings = (settings: Partial<AppSettings>): AppSettings =
     typeof settings.isSubtitleCorrectionEnabled === 'boolean' ? settings.isSubtitleCorrectionEnabled : true,
   isSubtitleTranslationEnabled:
     typeof settings.isSubtitleTranslationEnabled === 'boolean' ? settings.isSubtitleTranslationEnabled : true,
-  isPostTranslationOptimizationEnabled:
-    typeof settings.isPostTranslationOptimizationEnabled === 'boolean'
-      ? settings.isPostTranslationOptimizationEnabled
-      : true,
+  isAiSubtitleReviewEnabled:
+    typeof settings.isAiSubtitleReviewEnabled === 'boolean' ? settings.isAiSubtitleReviewEnabled : true,
+  aiSubtitleReviewMode: readOptionValue(
+    settings.aiSubtitleReviewMode,
+    aiSubtitleReviewModeOptions,
+    AiSubtitleReviewMode.Expert,
+  ),
   targetLanguage:
     typeof settings.targetLanguage === 'string' &&
     targetLanguageOptions.some((option) => option.value === settings.targetLanguage)

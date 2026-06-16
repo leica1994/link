@@ -85,7 +85,8 @@ pub struct HomeWorkbenchOptions {
     pub video_content_type: String,
     pub output_mode: String,
     pub is_subtitle_translation_enabled: bool,
-    pub is_post_translation_optimization_enabled: bool,
+    pub is_ai_subtitle_review_enabled: bool,
+    pub ai_subtitle_review_mode: String,
     pub target_language: String,
     pub dubbing_tts_interval_ms: u32,
     pub dubbing_reference_audio_source: String,
@@ -1793,7 +1794,8 @@ fn default_workbench_options(settings: &AppSettings) -> HomeWorkbenchOptions {
         video_content_type: settings.video_content_type.clone(),
         output_mode: settings.output_mode.clone(),
         is_subtitle_translation_enabled: settings.is_subtitle_translation_enabled,
-        is_post_translation_optimization_enabled: settings.is_post_translation_optimization_enabled,
+        is_ai_subtitle_review_enabled: settings.is_ai_subtitle_review_enabled,
+        ai_subtitle_review_mode: settings.ai_subtitle_review_mode.clone(),
         target_language: settings.target_language.clone(),
         dubbing_tts_interval_ms: settings.dubbing_tts_interval_ms,
         dubbing_reference_audio_source: settings.dubbing_reference_audio_source.clone(),
@@ -1904,8 +1906,8 @@ fn apply_translation_options(settings: &mut AppSettings, options: &HomeWorkbench
     settings.video_content_type = options.video_content_type.clone();
     settings.output_mode = options.output_mode.clone();
     settings.is_subtitle_translation_enabled = options.is_subtitle_translation_enabled;
-    settings.is_post_translation_optimization_enabled =
-        options.is_post_translation_optimization_enabled;
+    settings.is_ai_subtitle_review_enabled = options.is_ai_subtitle_review_enabled;
+    settings.ai_subtitle_review_mode = options.ai_subtitle_review_mode.clone();
     settings.target_language = options.target_language.clone();
 }
 
@@ -2129,7 +2131,8 @@ fn default_workbench_options_from_empty() -> HomeWorkbenchOptions {
         video_content_type: "general".to_string(),
         output_mode: "bilingual".to_string(),
         is_subtitle_translation_enabled: true,
-        is_post_translation_optimization_enabled: true,
+        is_ai_subtitle_review_enabled: true,
+        ai_subtitle_review_mode: "expert".to_string(),
         target_language: "zh-Hans".to_string(),
         dubbing_tts_interval_ms: 150,
         dubbing_reference_audio_source: "existing-dubbing".to_string(),

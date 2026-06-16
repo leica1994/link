@@ -3,7 +3,7 @@ use crate::app_log::{AppLogger, LogSession};
 use crate::app_paths;
 use crate::command_utils::create_command;
 use crate::settings::{AppSettings, SettingsStore};
-use crate::subtitle_ai::{correct_subtitles, smart_segment_subtitles};
+use crate::subtitle_ai::{correct_subtitles, review_source_subtitles, smart_segment_subtitles};
 use crate::subtitle_export::serialize_styled_ass;
 use crate::subtitle_style::get_selected_subtitle_style;
 use reqwest::blocking::Client;
@@ -86,6 +86,8 @@ pub struct TranscriptionStageProgress {
     pub smart_segmentation: Option<TranscriptionProgressStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_correction: Option<TranscriptionProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_review: Option<TranscriptionProgressStage>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +95,7 @@ enum ProgressStage {
     Transcription,
     SmartSegmentation,
     SubtitleCorrection,
+    AiReview,
 }
 
 #[derive(Clone)]
@@ -300,6 +303,7 @@ impl WorkflowProgress {
                 ProgressStage::Transcription => stages.transcription = stage_progress,
                 ProgressStage::SmartSegmentation => stages.smart_segmentation = stage_progress,
                 ProgressStage::SubtitleCorrection => stages.subtitle_correction = stage_progress,
+                ProgressStage::AiReview => stages.ai_review = stage_progress,
             }
         }
     }
@@ -742,6 +746,14 @@ pub(crate) async fn run_transcription_workflow_with_sink(
             "pending",
         );
     }
+    if settings.is_ai_subtitle_review_enabled {
+        workflow_progress.set_stage(
+            ProgressStage::AiReview,
+            0,
+            "等待前置处理完成",
+            "pending",
+        );
+    }
     emit_progress_event(
         &app,
         0,
@@ -938,7 +950,60 @@ pub(crate) async fn run_transcription_workflow_with_sink(
         );
     }
 
-    mark_segments_status(&mut segments, "done");
+    if settings.is_ai_subtitle_review_enabled {
+        let previous_warnings = warnings.clone();
+        workflow_progress.set_stage(ProgressStage::AiReview, 0, "AI 审核源文中", "active");
+        emit_progress_event(
+            &app,
+            overall_progress(&workflow_progress.snapshot()),
+            "AI 审核源文中",
+            Some(workflow_progress.snapshot()),
+            None,
+            None,
+            &warnings,
+            progress_sink.as_ref(),
+            &progress_context,
+        );
+        log_session.info(
+            "source_subtitle_review_start",
+            "开始 AI 源文审核",
+            json!({
+                "segmentCount": segments.len(),
+                "reviewMode": &settings.ai_subtitle_review_mode,
+            }),
+        );
+        let mut report_snapshot = |progress: u8,
+                                   message: &str,
+                                   snapshot_segments: &[TranscriptionSegment],
+                                   snapshot_warnings: &[String]| {
+            let mut combined_warnings = previous_warnings.clone();
+            combined_warnings.extend(snapshot_warnings.iter().cloned());
+            let status = if progress >= 100 { "done" } else { "active" };
+            workflow_progress.set_stage(ProgressStage::AiReview, progress, message, status);
+            emitter.emit(message, snapshot_segments, &combined_warnings);
+        };
+        let review_result = review_source_subtitles(
+            &settings,
+            ai_service,
+            &log_session,
+            segments,
+            &mut report_snapshot,
+        )
+        .await;
+        segments = review_result.segments;
+        warnings.extend(review_result.warnings);
+        workflow_progress.set_stage(ProgressStage::AiReview, 100, "AI 源文审核完成", "done");
+        log_session.info(
+            "source_subtitle_review_completed",
+            "AI 源文审核完成",
+            json!({
+                "segmentCount": segments.len(),
+                "warningCount": warnings.len(),
+            }),
+        );
+    }
+
+    mark_finished_segments_status(&mut segments, "done");
     let subtitle_text = serialize_segments_for_export(
         &segments,
         raw_result.output_format,
@@ -1055,14 +1120,20 @@ pub(crate) fn serialize_segments_for_export(
     settings_store: Option<&SettingsStore>,
     settings: &AppSettings,
 ) -> Result<String, String> {
+    let export_segments = segments
+        .iter()
+        .filter(|segment| segment.status != "removed")
+        .cloned()
+        .collect::<Vec<_>>();
+
     if matches!(output_format, SubtitleFormat::Ass) {
         if let Some(store) = settings_store {
             let style = get_selected_subtitle_style(store, &settings.selected_subtitle_style_id)?;
-            return Ok(serialize_styled_ass(segments, &style));
+            return Ok(serialize_styled_ass(&export_segments, &style));
         }
     }
 
-    Ok(serialize_subtitle(segments, output_format))
+    Ok(serialize_subtitle(&export_segments, output_format))
 }
 
 fn log_transcription_settings(log_session: &LogSession, settings: &AppSettings) {
@@ -1076,6 +1147,8 @@ fn log_transcription_settings(log_session: &LogSession, settings: &AppSettings) 
             "transcriptionFormat": &settings.transcription_format,
             "smartSegmentationEnabled": settings.is_smart_segmentation_enabled,
             "subtitleCorrectionEnabled": settings.is_subtitle_correction_enabled,
+            "aiSubtitleReviewEnabled": settings.is_ai_subtitle_review_enabled,
+            "aiSubtitleReviewMode": &settings.ai_subtitle_review_mode,
             "videoContentType": &settings.video_content_type,
             "translationBatchSize": settings.translation_batch_size,
             "translationThreadCount": settings.translation_thread_count,
@@ -1370,6 +1443,7 @@ fn overall_progress(stages: &TranscriptionStageProgress) -> u8 {
         stages.transcription.as_ref(),
         stages.smart_segmentation.as_ref(),
         stages.subtitle_correction.as_ref(),
+        stages.ai_review.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -1395,9 +1469,11 @@ fn assign_segment_metadata(segments: &mut [TranscriptionSegment], uid_prefix: &s
     }
 }
 
-fn mark_segments_status(segments: &mut [TranscriptionSegment], status: &str) {
+fn mark_finished_segments_status(segments: &mut [TranscriptionSegment], status: &str) {
     for segment in segments {
-        segment.status = status.to_string();
+        if segment.status != "removed" {
+            segment.status = status.to_string();
+        }
     }
 }
 

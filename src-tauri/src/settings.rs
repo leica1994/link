@@ -41,7 +41,8 @@ pub struct AppSettings {
     pub output_mode: String,
     pub is_subtitle_correction_enabled: bool,
     pub is_subtitle_translation_enabled: bool,
-    pub is_post_translation_optimization_enabled: bool,
+    pub is_ai_subtitle_review_enabled: bool,
+    pub ai_subtitle_review_mode: String,
     pub target_language: String,
     pub dubbing_tts_interval_ms: u32,
     pub dubbing_reference_audio_source: String,
@@ -137,10 +138,15 @@ impl SettingsStore {
                 "is_subtitle_translation_enabled",
                 true,
             ),
-            is_post_translation_optimization_enabled: read_bool_setting(
+            is_ai_subtitle_review_enabled: read_bool_setting(
                 &setting_values,
-                "is_post_translation_optimization_enabled",
+                "is_ai_subtitle_review_enabled",
                 true,
+            ),
+            ai_subtitle_review_mode: read_string_setting(
+                &setting_values,
+                "ai_subtitle_review_mode",
+                "expert",
             ),
             target_language: read_string_setting(&setting_values, "target_language", "zh-Hans"),
             dubbing_tts_interval_ms: read_u32_setting(
@@ -292,8 +298,13 @@ impl SettingsStore {
         )?;
         upsert_setting(
             &transaction,
-            "is_post_translation_optimization_enabled",
-            bool_to_text(settings.is_post_translation_optimization_enabled),
+            "is_ai_subtitle_review_enabled",
+            bool_to_text(settings.is_ai_subtitle_review_enabled),
+        )?;
+        upsert_setting(
+            &transaction,
+            "ai_subtitle_review_mode",
+            &settings.ai_subtitle_review_mode,
         )?;
         upsert_setting(&transaction, "target_language", &settings.target_language)?;
         upsert_setting(

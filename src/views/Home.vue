@@ -1388,6 +1388,8 @@ import {
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
+  AiSubtitleReviewMode,
+  aiSubtitleReviewModeOptions,
   getLanguageLabel,
   getOptionLabel,
   outputModeOptions,
@@ -1553,7 +1555,8 @@ type HomeWorkbenchOptions = {
   videoContentType: VideoContentType
   outputMode: OutputMode
   isSubtitleTranslationEnabled: boolean
-  isPostTranslationOptimizationEnabled: boolean
+  isAiSubtitleReviewEnabled: boolean
+  aiSubtitleReviewMode: AiSubtitleReviewMode
   targetLanguage: string
   dubbingTtsIntervalMs: number
   dubbingReferenceAudioSource: ReferenceAudioSource
@@ -1765,7 +1768,8 @@ const workbenchOptions = ref<HomeWorkbenchOptions>({
   videoContentType: VideoContentType.General,
   outputMode: OutputMode.Bilingual,
   isSubtitleTranslationEnabled: true,
-  isPostTranslationOptimizationEnabled: true,
+  isAiSubtitleReviewEnabled: true,
+  aiSubtitleReviewMode: AiSubtitleReviewMode.Expert,
   targetLanguage: 'zh-Hans',
   dubbingTtsIntervalMs: 150,
   dubbingReferenceAudioSource: ReferenceAudioSource.ExistingDubbing,
@@ -2190,6 +2194,7 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     { key: 'transcription', label: '转录', source: stageProgress.transcription },
     { key: 'smartSegmentation', label: '智能断句', source: stageProgress.smartSegmentation },
     { key: 'subtitleCorrection', label: '字幕校正', source: stageProgress.subtitleCorrection },
+    { key: 'aiReview', label: 'AI审核', source: stageProgress.aiReview },
   ]
     .filter((item) => readRecordValue(item.source))
     .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
@@ -2204,9 +2209,9 @@ const workbenchTranslationSteps = computed<WorkbenchDetailStep[]>(() => {
   return [
     { key: 'subtitleTranslation', label: '字幕翻译', source: stageProgress.subtitleTranslation },
     {
-      key: 'postTranslationOptimization',
-      label: '译后优化',
-      source: stageProgress.postTranslationOptimization,
+      key: 'aiSubtitleReview',
+      label: 'AI审核',
+      source: stageProgress.aiSubtitleReview,
     },
   ]
     .filter((item) => readRecordValue(item.source))
@@ -3486,6 +3491,11 @@ const normalizeWorkbenchOptions = (options: HomeWorkbenchOptions): HomeWorkbench
   next.translationService = readOptionValue(next.translationService, translationServiceOptions, TranslationService.Llm)
   next.videoContentType = readOptionValue(next.videoContentType, videoContentTypeOptions, VideoContentType.General)
   next.outputMode = readOptionValue(next.outputMode, outputModeOptions, OutputMode.Bilingual)
+  next.aiSubtitleReviewMode = readOptionValue(
+    next.aiSubtitleReviewMode,
+    aiSubtitleReviewModeOptions,
+    AiSubtitleReviewMode.Expert,
+  )
   if (!targetLanguageOptions.some((option) => option.value === next.targetLanguage)) {
     next.targetLanguage = 'zh-Hans'
   }
@@ -3731,7 +3741,20 @@ const clampProgress = (value: number) => {
 
 const normalizeSegmentStatus = (status?: string) => {
   const value = status || 'raw'
-  return ['raw', 'active', 'done', 'failed', 'translating', 'translated', 'optimizing', 'optimized', 'kept'].includes(value)
+  return [
+    'raw',
+    'active',
+    'done',
+    'failed',
+    'translating',
+    'translated',
+    'optimizing',
+    'optimized',
+    'reviewing',
+    'reviewed',
+    'removed',
+    'kept',
+  ].includes(value)
     ? value
     : 'raw'
 }
@@ -3752,6 +3775,12 @@ const segmentStatusLabel = (status?: string) => {
       return '优化中'
     case 'optimized':
       return '已优化'
+    case 'reviewing':
+      return '审核中'
+    case 'reviewed':
+      return '已审核'
+    case 'removed':
+      return '已移除'
     case 'kept':
       return '保留原文'
     default:
