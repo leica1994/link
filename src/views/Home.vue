@@ -1741,6 +1741,7 @@ const downloadingSubtitleKeys = ref(new Set<string>())
 const addingWorkbenchSubtitleIds = ref(new Set<string>())
 const removingWorkbenchSubtitleIds = ref(new Set<string>())
 const downloadProgressByKey = ref(new Map<string, HomeVideoDownloadProgress>())
+const pendingVideoDownloadReloads = new Map<string, number>()
 const videoSideRef = ref<HTMLElement | null>(null)
 const videoCopyRef = ref<HTMLElement | null>(null)
 const videoTitleLineRef = ref<HTMLElement | null>(null)
@@ -2457,6 +2458,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', scheduleVideoDescriptionMeasure)
   unlistenHomeDownloadProgress?.()
   unlistenHomeWorkbenchProgress?.()
+  clearPendingVideoDownloadReloads()
   videoLayoutObserver?.disconnect()
   clearWorkbenchCopyFeedback()
   if (videoLayoutFrame) {
@@ -2680,6 +2682,7 @@ const registerHomeDownloadProgressListener = async () => {
 
     setDownloadProgress(payload)
     syncWorkbenchDownloadProgress(payload)
+    syncCompletedVideoDownload(payload)
   })
 }
 
@@ -2707,6 +2710,33 @@ const setDownloadProgress = (payload: HomeVideoDownloadProgress) => {
     progress: incomingProgress,
   })
   downloadProgressByKey.value = next
+}
+
+const syncCompletedVideoDownload = (payload: HomeVideoDownloadProgress) => {
+  if (payload.kind !== 'video' || payload.status !== 'done') {
+    return
+  }
+
+  scheduleVideoDownloadReload(payload.taskId)
+}
+
+const scheduleVideoDownloadReload = (taskId: string) => {
+  if (!taskId || pendingVideoDownloadReloads.has(taskId)) {
+    return
+  }
+
+  const timeoutId = window.setTimeout(() => {
+    pendingVideoDownloadReloads.delete(taskId)
+    void reloadTask(taskId)
+  }, 0)
+  pendingVideoDownloadReloads.set(taskId, timeoutId)
+}
+
+const clearPendingVideoDownloadReloads = () => {
+  for (const timeoutId of pendingVideoDownloadReloads.values()) {
+    window.clearTimeout(timeoutId)
+  }
+  pendingVideoDownloadReloads.clear()
 }
 
 const syncWorkbenchDownloadProgress = (payload: HomeVideoDownloadProgress) => {
