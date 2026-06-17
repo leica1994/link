@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use tauri::{AppHandle, Emitter};
+use tempfile::TempDir;
 
 const PROGRESS_EVENT: &str = "subtitle-burn-progress";
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "flv", "wmv", "webm", "m4v"];
@@ -33,6 +34,21 @@ pub struct SubtitleBurnProgress {
 pub struct SubtitleBurnResult {
     pub output_path: String,
     pub duration_ms: Option<u64>,
+}
+
+struct PreparedSubtitleFilterInput {
+    temp_dir: TempDir,
+    file_name: String,
+}
+
+impl PreparedSubtitleFilterInput {
+    fn work_dir(&self) -> &Path {
+        self.temp_dir.path()
+    }
+
+    fn filter_argument(&self) -> String {
+        format!("subtitles={}", self.file_name)
+    }
 }
 
 #[tauri::command]
@@ -171,6 +187,30 @@ fn unique_output_path(base_path: PathBuf) -> PathBuf {
     parent.join(format!("{stem}_latest.mp4"))
 }
 
+fn prepare_subtitle_filter_input(
+    subtitle_path: &Path,
+) -> Result<PreparedSubtitleFilterInput, String> {
+    let extension = subtitle_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "ass".to_string());
+    let file_name = format!("subtitle.{extension}");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("link-subtitle-burn-")
+        .tempdir()
+        .map_err(|error| format!("无法创建字幕烧录临时目录: {error}"))?;
+    let copied_path = temp_dir.path().join(&file_name);
+
+    fs::copy(subtitle_path, &copied_path)
+        .map_err(|error| format!("无法准备字幕烧录临时文件: {error}"))?;
+
+    Ok(PreparedSubtitleFilterInput {
+        temp_dir,
+        file_name,
+    })
+}
+
 fn run_ffmpeg_burn(
     app: &AppHandle,
     video_path: &Path,
@@ -178,12 +218,13 @@ fn run_ffmpeg_burn(
     output_path: &Path,
     duration_ms: Option<u64>,
 ) -> Result<(), String> {
-    let subtitle_filter_path = escape_ffmpeg_filter_path(subtitle_path);
-    let subtitle_filter = format!("subtitles='{subtitle_filter_path}'");
+    let subtitle_filter_input = prepare_subtitle_filter_input(subtitle_path)?;
+    let subtitle_filter = subtitle_filter_input.filter_argument();
     let output_path_string = path_to_string(output_path);
 
     let mut command = create_command("ffmpeg");
     command
+        .current_dir(subtitle_filter_input.work_dir())
         .arg("-hide_banner")
         .arg("-nostdin")
         .arg("-nostats")
@@ -339,13 +380,6 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-fn escape_ffmpeg_filter_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace(':', "\\:")
-        .replace('\'', "\\'")
-}
-
 fn summarize_stderr(stderr: &str) -> String {
     let trimmed = stderr.trim();
     if trimmed.is_empty() {
@@ -381,5 +415,33 @@ fn hide_command_window(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepares_safe_relative_subtitle_filter_input_for_quoted_paths() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let subtitle_path = dir
+            .path()
+            .join("We Didn't Expect Kosovo's Fast Food to Be THIS Good.ass");
+        fs::write(&subtitle_path, "subtitle content").expect("write subtitle");
+
+        let prepared =
+            prepare_subtitle_filter_input(&subtitle_path).expect("prepare subtitle filter input");
+        let copied_path = prepared.work_dir().join(&prepared.file_name);
+
+        assert_eq!(prepared.file_name, "subtitle.ass");
+        assert_eq!(prepared.filter_argument(), "subtitles=subtitle.ass");
+        assert_eq!(
+            fs::read_to_string(copied_path).expect("read copied subtitle"),
+            "subtitle content"
+        );
+        assert!(!prepared.file_name.contains('\''));
+        assert!(!prepared.file_name.contains('\\'));
+        assert!(!prepared.file_name.contains(':'));
     }
 }
