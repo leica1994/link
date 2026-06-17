@@ -1,11 +1,14 @@
 use crate::transcription::{TranscriptionSegment, TranscriptionWord};
 use serde::Serialize;
 
-const ALIGNMENT_VERSION: &str = "downloaded-subtitle-align-v1";
+const ALIGNMENT_VERSION: &str = "downloaded-subtitle-align-v2";
 const MIN_TOKEN_COVERAGE: f64 = 0.55;
 const MIN_SEGMENT_COVERAGE: f64 = 0.60;
 const MIN_SEGMENT_DURATION_MS: u64 = 300;
 const DEFAULT_GAP_MS: u64 = 120;
+const MAX_ALIGNMENT_MATRIX_CELLS: usize = 25_000_000;
+const CHUNK_SUBTITLE_TOKENS: usize = 1_600;
+const CHUNK_ASR_PADDING_TOKENS: usize = 800;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,10 +70,8 @@ pub fn align_downloaded_subtitles(
         .count();
     let token_coverage = ratio(matched_count, subtitle_tokens.len());
 
-    let mut segment_token_counts = vec![0usize; downloaded_segments.len()];
     let mut segment_matched_tokens: Vec<Vec<usize>> = vec![Vec::new(); downloaded_segments.len()];
     for (token_index, token) in subtitle_tokens.iter().enumerate() {
-        segment_token_counts[token.segment_index] += 1;
         if let Some(asr_index) = matches[token_index] {
             segment_matched_tokens[token.segment_index].push(asr_index);
         }
@@ -186,36 +187,133 @@ fn monotonic_match(
     subtitle_tokens: &[SubtitleToken],
     asr_tokens: &[TimedToken],
 ) -> Vec<Option<usize>> {
-    let mut matches = vec![None; subtitle_tokens.len()];
-    let mut search_start = 0usize;
+    if subtitle_tokens.is_empty() || asr_tokens.is_empty() {
+        return vec![None; subtitle_tokens.len()];
+    }
 
-    for (subtitle_index, subtitle_token) in subtitle_tokens.iter().enumerate() {
-        if search_start >= asr_tokens.len() {
+    let matrix_cells = subtitle_tokens
+        .len()
+        .saturating_add(1)
+        .saturating_mul(asr_tokens.len().saturating_add(1));
+    if matrix_cells <= MAX_ALIGNMENT_MATRIX_CELLS {
+        return lcs_match_range(subtitle_tokens, asr_tokens, 0);
+    }
+
+    chunked_lcs_match(subtitle_tokens, asr_tokens)
+}
+
+fn chunked_lcs_match(
+    subtitle_tokens: &[SubtitleToken],
+    asr_tokens: &[TimedToken],
+) -> Vec<Option<usize>> {
+    let mut matches = vec![None; subtitle_tokens.len()];
+    let ratio = asr_tokens.len() as f64 / subtitle_tokens.len().max(1) as f64;
+    let mut asr_cursor = 0usize;
+    let mut subtitle_start = 0usize;
+
+    while subtitle_start < subtitle_tokens.len() {
+        let subtitle_end = (subtitle_start + CHUNK_SUBTITLE_TOKENS).min(subtitle_tokens.len());
+        let estimated_asr_end = ((subtitle_end as f64) * ratio).ceil() as usize;
+        let asr_start = asr_cursor.saturating_sub(CHUNK_ASR_PADDING_TOKENS / 4);
+        let asr_end = estimated_asr_end
+            .max(asr_cursor + CHUNK_SUBTITLE_TOKENS)
+            .saturating_add(CHUNK_ASR_PADDING_TOKENS)
+            .min(asr_tokens.len());
+
+        if asr_start >= asr_end {
             break;
         }
 
-        let window_end = (search_start + 160).min(asr_tokens.len());
-        if let Some(offset) = asr_tokens[search_start..window_end]
-            .iter()
-            .position(|asr_token| tokens_match(&subtitle_token.normalized, &asr_token.normalized))
-        {
-            let asr_index = search_start + offset;
-            matches[subtitle_index] = Some(asr_index);
-            search_start = asr_index.saturating_add(1);
+        let chunk_matches = lcs_match_range(
+            &subtitle_tokens[subtitle_start..subtitle_end],
+            &asr_tokens[asr_start..asr_end],
+            asr_start,
+        );
+        let mut last_match = None;
+        for (offset, matched_asr_index) in chunk_matches.into_iter().enumerate() {
+            if let Some(asr_index) = matched_asr_index {
+                matches[subtitle_start + offset] = Some(asr_index);
+                last_match = Some(asr_index);
+            }
         }
+
+        asr_cursor = last_match
+            .map(|index| index.saturating_add(1))
+            .unwrap_or_else(|| {
+                asr_cursor
+                    .saturating_add(((subtitle_end - subtitle_start) as f64 * ratio) as usize)
+                    .max(asr_start.saturating_add(1))
+            })
+            .min(asr_tokens.len());
+        subtitle_start = subtitle_end;
     }
 
     matches
 }
 
-fn tokens_match(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
+fn lcs_match_range(
+    subtitle_tokens: &[SubtitleToken],
+    asr_tokens: &[TimedToken],
+    asr_offset: usize,
+) -> Vec<Option<usize>> {
+    let asr_len = asr_tokens.len();
+    let stride = asr_len + 1;
+    let mut previous_row = vec![0u32; stride];
+    let mut current_row = vec![0u32; stride];
+    let mut directions = vec![0u8; (subtitle_tokens.len() + 1) * stride];
+
+    for subtitle_index in 1..=subtitle_tokens.len() {
+        current_row[0] = 0;
+        let row_offset = subtitle_index * stride;
+        directions[row_offset] = 2;
+        let subtitle_token = &subtitle_tokens[subtitle_index - 1].normalized;
+
+        for asr_index in 1..=asr_len {
+            let diag = if subtitle_token == &asr_tokens[asr_index - 1].normalized {
+                previous_row[asr_index - 1] + 1
+            } else {
+                0
+            };
+            let up = previous_row[asr_index];
+            let left = current_row[asr_index - 1];
+
+            let (score, direction) = if diag > up && diag > left {
+                (diag, 1)
+            } else if up >= left {
+                (up, 2)
+            } else {
+                (left, 3)
+            };
+
+            current_row[asr_index] = score;
+            directions[row_offset + asr_index] = direction;
+        }
+
+        std::mem::swap(&mut previous_row, &mut current_row);
     }
-    if left.chars().count() <= 2 || right.chars().count() <= 2 {
-        return false;
+
+    let mut matches = vec![None; subtitle_tokens.len()];
+    let mut subtitle_index = subtitle_tokens.len();
+    let mut asr_index = asr_len;
+
+    while subtitle_index > 0 && asr_index > 0 {
+        match directions[subtitle_index * stride + asr_index] {
+            1 => {
+                matches[subtitle_index - 1] = Some(asr_offset + asr_index - 1);
+                subtitle_index -= 1;
+                asr_index -= 1;
+            }
+            2 => {
+                subtitle_index -= 1;
+            }
+            3 => {
+                asr_index -= 1;
+            }
+            _ => break,
+        }
     }
-    left.contains(right) || right.contains(left)
+
+    matches
 }
 
 fn interpolate_unmatched_segments(
@@ -372,10 +470,35 @@ fn display_tokens(text: &str) -> Vec<String> {
 }
 
 fn normalize_char(character: char) -> Option<char> {
-    if character.is_alphanumeric() {
+    if let Some(folded) = fold_latin_char(character) {
+        Some(folded)
+    } else if character.is_ascii_alphanumeric() {
+        Some(character.to_ascii_lowercase())
+    } else if is_cjk(character) {
         Some(character)
+    } else if character.is_alphanumeric() {
+        character.to_lowercase().next()
     } else {
         None
+    }
+}
+
+fn fold_latin_char(character: char) -> Option<char> {
+    match character {
+        'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' | 'ă' | 'ą' => Some('a'),
+        'ç' | 'ć' | 'č' => Some('c'),
+        'ď' | 'đ' => Some('d'),
+        'é' | 'è' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' => Some('e'),
+        'í' | 'ì' | 'î' | 'ï' | 'ī' | 'į' => Some('i'),
+        'ñ' | 'ń' => Some('n'),
+        'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ō' | 'ő' | 'ø' => Some('o'),
+        'ř' | 'ŕ' => Some('r'),
+        'ś' | 'š' | 'ş' | 'ș' => Some('s'),
+        'ť' | 'ţ' | 'ț' => Some('t'),
+        'ú' | 'ù' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => Some('u'),
+        'ý' | 'ÿ' => Some('y'),
+        'ž' | 'ź' | 'ż' => Some('z'),
+        _ => None,
     }
 }
 
@@ -506,5 +629,131 @@ mod tests {
         )];
 
         assert!(align_downloaded_subtitles(&downloaded, &asr).is_err());
+    }
+
+    #[test]
+    fn aligns_overlapping_youtube_subtitles_to_resegmented_asr() {
+        let downloaded = vec![
+            segment(
+                "We are currently in Kosovo and we are so",
+                0,
+                6520,
+                Vec::new(),
+            ),
+            segment(
+                "excited to try a fast food chain that we",
+                3360,
+                9600,
+                Vec::new(),
+            ),
+            segment(
+                "have never ever heard of. We've seen",
+                6520,
+                11720,
+                Vec::new(),
+            ),
+            segment(
+                "Burger King around, we've seen KFC, and",
+                9600,
+                13600,
+                Vec::new(),
+            ),
+            segment(
+                "we try and eat as much local food as we",
+                11720,
+                15680,
+                Vec::new(),
+            ),
+            segment(
+                "can when we're in a country, but we have",
+                13600,
+                17960,
+                Vec::new(),
+            ),
+        ];
+        let asr = vec![
+            segment(
+                "we are currently in kosovo",
+                160,
+                2380,
+                vec![
+                    word("we", 160, 400),
+                    word("are", 430, 650),
+                    word("currently", 690, 1260),
+                    word("in", 1300, 1440),
+                    word("kosovo", 1500, 2380),
+                ],
+            ),
+            segment(
+                "And we are so excited to try a fast food chain that we have never heard of",
+                2480,
+                9050,
+                vec![
+                    word("And", 2480, 2700),
+                    word("we", 2730, 2890),
+                    word("are", 2920, 3090),
+                    word("so", 3120, 3300),
+                    word("excited", 3360, 3840),
+                    word("to", 3880, 4020),
+                    word("try", 4050, 4300),
+                    word("a", 4320, 4400),
+                    word("fast", 4450, 4700),
+                    word("food", 4750, 5000),
+                    word("chain", 5050, 5380),
+                    word("that", 5420, 5630),
+                    word("we", 5680, 5840),
+                    word("have", 5900, 6120),
+                    word("never", 6200, 6600),
+                    word("heard", 6820, 7200),
+                    word("of", 7240, 7400),
+                ],
+            ),
+            segment(
+                "We've seen Burger King around. we've seen KFC",
+                9050,
+                11570,
+                vec![
+                    word("We've", 9050, 9300),
+                    word("seen", 9340, 9650),
+                    word("Burger", 9700, 10150),
+                    word("King", 10200, 10550),
+                    word("around", 10600, 10980),
+                    word("we've", 11020, 11240),
+                    word("seen", 11280, 11430),
+                    word("KFC", 11450, 11570),
+                ],
+            ),
+            segment(
+                "And we try to eat as much local food as we can when we're in a country",
+                11570,
+                15110,
+                vec![
+                    word("And", 11570, 11740),
+                    word("we", 11780, 11920),
+                    word("try", 11950, 12140),
+                    word("to", 12180, 12300),
+                    word("eat", 12350, 12580),
+                    word("as", 12620, 12760),
+                    word("much", 12800, 13100),
+                    word("local", 13140, 13480),
+                    word("food", 13520, 13820),
+                    word("as", 13860, 14000),
+                    word("we", 14030, 14160),
+                    word("can", 14200, 14420),
+                    word("when", 14460, 14700),
+                    word("we're", 14740, 14920),
+                    word("in", 14950, 15020),
+                    word("a", 15030, 15060),
+                    word("country", 15070, 15110),
+                ],
+            ),
+        ];
+
+        let result = align_downloaded_subtitles(&downloaded, &asr).unwrap();
+        assert!(result.report.token_coverage > 0.75);
+        assert!(result.report.segment_coverage > 0.75);
+        assert_eq!(result.segments[0].start_time, 160);
+        assert!(result.segments[2].start_time >= 5900);
+        assert!(result.segments[5].end_time >= 15110);
     }
 }
