@@ -12,13 +12,16 @@ use crate::home_tasks::{
     HomeVideoSubtitle, HomeVideoTask, HomeVideoTaskRequest,
 };
 use crate::settings::{AppSettings, SettingsStore};
+use crate::subtitle_alignment::{align_downloaded_subtitles, alignment_version};
 use crate::subtitle_translation::{
-    run_subtitle_translation_workflow_with_sink, SubtitleTranslationProgress,
-    SubtitleTranslationProgressSink, SubtitleTranslationRequest, SubtitleTranslationResult,
+    load_subtitle_segments, run_subtitle_translation_workflow_with_sink,
+    SubtitleTranslationProgress, SubtitleTranslationProgressSink, SubtitleTranslationRequest,
+    SubtitleTranslationResult,
 };
 use crate::transcription::{
-    run_transcription_workflow_with_sink, save_transcription_file, TranscriptionProgress,
-    TranscriptionProgressSink, TranscriptionRequest,
+    run_transcription_workflow_with_sink, run_transcription_workflow_with_transform,
+    save_transcription_file, RawTranscriptionTransform, RawTranscriptionTransformResult,
+    TranscriptionProgress, TranscriptionProgressSink, TranscriptionRequest,
 };
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Row};
@@ -26,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
@@ -55,6 +58,7 @@ const SUBTITLE_SOURCE_DOWNLOADED: &str = "downloaded";
 
 const ARTIFACT_TRANSCRIPTION_SUBTITLE: &str = "transcription-subtitle";
 const ARTIFACT_SELECTED_SUBTITLE: &str = "selected-subtitle";
+const ARTIFACT_ALIGNED_SELECTED_SUBTITLE: &str = "aligned-selected-subtitle";
 const ARTIFACT_SOURCE_VIDEO: &str = "source-video";
 const ARTIFACT_TRANSLATED_SUBTITLE: &str = "translated-subtitle";
 const ARTIFACT_DUBBED_VIDEO: &str = "dubbed-video";
@@ -287,7 +291,9 @@ pub fn remove_home_workbench_video_input(
         }
 
         delete_workbench_artifact(connection, &request.task_id, ARTIFACT_SOURCE_VIDEO)?;
+        delete_downstream_workbench_artifacts(connection, &request.task_id)?;
         reset_stage_to_pending(&mut record, STAGE_DOWNLOAD_VIDEO, "等待下载视频");
+        reset_stage_to_pending(&mut record, STAGE_PREPARE_SUBTITLE, "等待准备字幕");
         record.status = WORKBENCH_STATUS_IDLE.to_string();
         record.current_stage.clear();
         record.progress = overall_progress(&record.stages);
@@ -357,6 +363,7 @@ pub fn add_home_workbench_subtitle_input(
             });
         record.options.subtitle_source = SUBTITLE_SOURCE_DOWNLOADED.to_string();
         record.options.subtitle_id = subtitle.id.clone();
+        delete_downstream_workbench_artifacts(connection, &request.task_id)?;
         upsert_workbench_record(
             connection,
             &request.task_id,
@@ -379,7 +386,7 @@ pub fn add_home_workbench_subtitle_input(
         &app,
         &request.task_id,
         STAGE_PREPARE_SUBTITLE,
-        "已使用下载字幕",
+        "已添加下载字幕，执行时将重新对齐",
         WORKBENCH_STATUS_IDLE,
         json!({
             "mode": "downloaded",
@@ -389,7 +396,7 @@ pub fn add_home_workbench_subtitle_input(
             "language": &subtitle.language,
             "languageName": &subtitle.language_name,
             "sourceKind": &subtitle.source_kind,
-            "message": "已使用下载字幕",
+            "message": "已添加下载字幕，执行时将重新对齐",
         }),
     )?;
 
@@ -436,6 +443,7 @@ pub fn remove_home_workbench_subtitle_input(
 
         if should_remove {
             delete_workbench_artifact(connection, &request.task_id, ARTIFACT_SELECTED_SUBTITLE)?;
+            delete_downstream_workbench_artifacts(connection, &request.task_id)?;
             reset_stage_to_pending(&mut record, STAGE_PREPARE_SUBTITLE, "等待准备字幕");
             if record.options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED
                 && (record.options.subtitle_id.is_empty()
@@ -782,19 +790,33 @@ async fn prepare_subtitle(
     options: &HomeWorkbenchOptions,
     video: &HomeVideoDownload,
 ) -> Result<PathBuf, String> {
-    if let Some(artifact) = workbench_artifact_file(store, task_id, ARTIFACT_SELECTED_SUBTITLE)? {
+    if let Some(artifact) = reusable_prepared_downloaded_subtitle(store, task_id, options, video)? {
+        let fallback = artifact
+            .metadata
+            .get("fallback")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         update_stage_snapshot_from_app(
             &app,
             task_id,
             STAGE_PREPARE_SUBTITLE,
             99,
-            "复用已加入工作台的字幕",
+            if fallback {
+                "复用自动转录字幕"
+            } else {
+                "复用已对齐下载字幕"
+            },
             json!({
-                "mode": "downloaded",
+                "mode": "downloaded-align",
                 "path": artifact.path,
                 "fileSize": artifact.file_size,
                 "metadata": artifact.metadata,
-                "message": "复用已加入工作台的字幕",
+                "alignment": artifact.metadata.get("alignment").cloned().unwrap_or_else(|| json!({})),
+                "message": if fallback {
+                    "复用自动转录字幕"
+                } else {
+                    "复用已对齐下载字幕"
+                },
             }),
         )?;
         return Ok(artifact_path_value(&artifact));
@@ -803,35 +825,10 @@ async fn prepare_subtitle(
     if options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED {
         if let Some(subtitle) = selected_downloaded_subtitle(store, task_id, &options.subtitle_id)?
         {
-            upsert_artifact_from_path(
-                store,
-                task_id,
-                ARTIFACT_SELECTED_SUBTITLE,
-                Path::new(&subtitle.file_path),
-                json!({
-                    "subtitleId": &subtitle.id,
-                    "language": &subtitle.language,
-                    "sourceKind": &subtitle.source_kind,
-                }),
-            )?;
-            update_stage_snapshot_from_app(
-                &app,
-                task_id,
-                STAGE_PREPARE_SUBTITLE,
-                99,
-                "已使用下载字幕",
-                json!({
-                    "mode": "downloaded",
-                    "path": &subtitle.file_path,
-                    "fileSize": subtitle.file_size,
-                    "format": &subtitle.format,
-                    "language": &subtitle.language,
-                    "languageName": &subtitle.language_name,
-                    "sourceKind": &subtitle.source_kind,
-                    "message": "已使用下载字幕",
-                }),
-            )?;
-            return Ok(PathBuf::from(subtitle.file_path));
+            return prepare_aligned_downloaded_subtitle(
+                app, store, ai_service, app_logger, settings, task_id, options, video, subtitle,
+            )
+            .await;
         }
     }
 
@@ -888,6 +885,185 @@ async fn prepare_subtitle(
             "warnings": result.warnings,
         }),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_aligned_downloaded_subtitle(
+    app: AppHandle,
+    store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings: &AppSettings,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+    video: &HomeVideoDownload,
+    subtitle: HomeVideoSubtitle,
+) -> Result<PathBuf, String> {
+    let downloaded_segments = load_subtitle_segments(Path::new(&subtitle.file_path))?;
+    update_stage_snapshot_from_app(
+        &app,
+        task_id,
+        STAGE_PREPARE_SUBTITLE,
+        5,
+        "读取下载字幕",
+        json!({
+            "mode": "downloaded-align",
+            "message": "读取下载字幕",
+            "alignment": {
+                "status": "active",
+                "message": "等待语音转录"
+            },
+        }),
+    )?;
+
+    let mut run_settings = settings.clone();
+    apply_transcription_options(&mut run_settings, options);
+    let alignment_metadata = Arc::new(Mutex::new(json!({
+        "status": "active",
+        "message": "等待语音转录"
+    })));
+    let progress_sink = workbench_transcription_progress_sink_with_mode(
+        app.clone(),
+        task_id.to_string(),
+        "downloaded-align",
+        alignment_metadata.clone(),
+    );
+    let subtitle_for_transform = subtitle.clone();
+    let alignment_metadata_for_transform = alignment_metadata.clone();
+    let transform: RawTranscriptionTransform = Arc::new(move |raw_segments| {
+        let alignment = align_downloaded_subtitles(&downloaded_segments, &raw_segments);
+        match alignment {
+            Ok(result) => {
+                let mut alignment_value =
+                    serde_json::to_value(&result.report).unwrap_or_else(|_| json!({}));
+                if let Some(object) = alignment_value.as_object_mut() {
+                    object.insert("status".to_string(), json!("done"));
+                }
+                if let Ok(mut value) = alignment_metadata_for_transform.lock() {
+                    *value = alignment_value.clone();
+                }
+                RawTranscriptionTransformResult {
+                    segments: Some(result.segments),
+                    warnings: result.report.warnings.clone(),
+                    metadata: json!({
+                        "mode": "downloaded-align",
+                        "alignment": alignment_value,
+                        "subtitleId": &subtitle_for_transform.id,
+                        "language": &subtitle_for_transform.language,
+                        "languageName": &subtitle_for_transform.language_name,
+                        "sourceKind": &subtitle_for_transform.source_kind,
+                        "format": &subtitle_for_transform.format,
+                        "fallback": false,
+                    }),
+                }
+            }
+            Err(error) => {
+                let alignment_value = json!({
+                    "alignmentVersion": alignment_version(),
+                    "status": "failed",
+                    "error": error,
+                });
+                if let Ok(mut value) = alignment_metadata_for_transform.lock() {
+                    *value = alignment_value.clone();
+                }
+                RawTranscriptionTransformResult {
+                    segments: None,
+                    warnings: vec![format!("下载字幕对齐失败，已改用自动转录字幕：{error}")],
+                    metadata: json!({
+                        "mode": "downloaded-align",
+                        "alignment": alignment_value,
+                        "subtitleId": &subtitle_for_transform.id,
+                        "language": &subtitle_for_transform.language,
+                        "languageName": &subtitle_for_transform.language_name,
+                        "sourceKind": &subtitle_for_transform.source_kind,
+                        "format": &subtitle_for_transform.format,
+                        "fallback": true,
+                    }),
+                }
+            }
+        }
+    });
+    let result = run_transcription_workflow_with_transform(
+        app.clone(),
+        ai_service,
+        app_logger,
+        Some(store),
+        TranscriptionRequest {
+            file_path: video.file_path.clone(),
+            model: options.transcription_model.clone(),
+            source_language: options.source_language.clone(),
+            output_format: options.transcription_format.clone(),
+            client_run_id: task_id.to_string(),
+            progress_source: "home-workbench".to_string(),
+        },
+        run_settings,
+        Some(progress_sink),
+        Some(transform),
+    )
+    .await?;
+
+    let fallback = result
+        .metadata
+        .get("fallback")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let artifact_kind = if fallback {
+        ARTIFACT_TRANSCRIPTION_SUBTITLE
+    } else {
+        ARTIFACT_ALIGNED_SELECTED_SUBTITLE
+    };
+    let mut metadata = result.metadata.clone();
+    metadata["format"] = json!(result.output_format);
+    metadata["segmentCount"] = json!(result.segments.len());
+    metadata["logPath"] = json!(result.log_path);
+    metadata["warnings"] = json!(result.warnings);
+    metadata["input"] = json!(build_downloaded_subtitle_cache_key(
+        &subtitle, video, options
+    ));
+
+    let stem = if fallback {
+        "transcription"
+    } else {
+        "aligned-selected"
+    };
+    let output_path = workbench_file_path(task_id, stem, &result.output_format)?;
+    save_transcription_file(
+        output_path.to_string_lossy().to_string(),
+        result.subtitle_text.clone(),
+    )?;
+    upsert_artifact_from_path(
+        store,
+        task_id,
+        artifact_kind,
+        &output_path,
+        metadata.clone(),
+    )?;
+    update_stage_snapshot_from_app(
+        &app,
+        task_id,
+        STAGE_PREPARE_SUBTITLE,
+        99,
+        if fallback {
+            "下载字幕对齐失败，已改用自动转录字幕"
+        } else {
+            "下载字幕已重新对齐"
+        },
+        json!({
+            "mode": "downloaded-align",
+            "path": output_path.to_string_lossy(),
+            "metadata": metadata,
+            "stageProgress": serde_json::Value::Null,
+            "segments": result.segments,
+            "warnings": result.warnings,
+            "alignment": result.metadata.get("alignment").cloned().unwrap_or_else(|| json!({})),
+            "message": if fallback {
+                "下载字幕对齐失败，已改用自动转录字幕"
+            } else {
+                "下载字幕已重新对齐"
+            },
+        }),
+    )?;
+    Ok(output_path)
 }
 
 async fn translate_subtitle(
@@ -1192,13 +1368,32 @@ fn workbench_transcription_progress_sink(
     app: AppHandle,
     task_id: String,
 ) -> TranscriptionProgressSink {
+    workbench_transcription_progress_sink_with_mode(
+        app,
+        task_id,
+        "transcribe",
+        Arc::new(Mutex::new(json!({}))),
+    )
+}
+
+fn workbench_transcription_progress_sink_with_mode(
+    app: AppHandle,
+    task_id: String,
+    mode: &'static str,
+    alignment_metadata: Arc<Mutex<Value>>,
+) -> TranscriptionProgressSink {
     Arc::new(move |progress: TranscriptionProgress| {
+        let alignment = alignment_metadata
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| json!({}));
         let snapshot = json!({
-            "mode": "transcribe",
+            "mode": mode,
             "message": &progress.message,
             "stageProgress": &progress.stage_progress,
             "segments": &progress.segments,
             "warnings": &progress.warnings,
+            "alignment": alignment,
             "revision": progress.revision,
         });
         let _ = update_stage_snapshot_from_app(
@@ -1370,6 +1565,69 @@ fn selected_downloaded_subtitle(
             .downloaded_subtitles
             .into_iter()
             .find(|subtitle| Path::new(&subtitle.file_path).is_file()))
+    })
+}
+
+fn reusable_prepared_downloaded_subtitle(
+    store: &SettingsStore,
+    task_id: &str,
+    options: &HomeWorkbenchOptions,
+    video: &HomeVideoDownload,
+) -> Result<Option<HomeWorkbenchArtifact>, String> {
+    if options.subtitle_source != SUBTITLE_SOURCE_DOWNLOADED
+        || options.subtitle_id.trim().is_empty()
+    {
+        return Ok(None);
+    }
+
+    let Some(subtitle) = selected_downloaded_subtitle(store, task_id, &options.subtitle_id)? else {
+        return Ok(None);
+    };
+    let expected_key = build_downloaded_subtitle_cache_key(&subtitle, video, options);
+    for artifact_kind in [
+        ARTIFACT_ALIGNED_SELECTED_SUBTITLE,
+        ARTIFACT_TRANSCRIPTION_SUBTITLE,
+    ] {
+        let Some(artifact) = workbench_artifact_file(store, task_id, artifact_kind)? else {
+            continue;
+        };
+        let artifact_key = artifact
+            .metadata
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if artifact_key == expected_key {
+            return Ok(Some(artifact));
+        }
+    }
+
+    Ok(None)
+}
+
+fn build_downloaded_subtitle_cache_key(
+    subtitle: &HomeVideoSubtitle,
+    video: &HomeVideoDownload,
+    options: &HomeWorkbenchOptions,
+) -> Value {
+    json!({
+        "alignmentVersion": alignment_version(),
+        "subtitleId": &subtitle.id,
+        "subtitlePath": &subtitle.file_path,
+        "subtitleFileSize": subtitle.file_size,
+        "subtitleUpdatedAt": &subtitle.updated_at,
+        "videoPath": &video.file_path,
+        "videoFileSize": video.file_size,
+        "videoUpdatedAt": &video.updated_at,
+        "transcriptionModel": &options.transcription_model,
+        "sourceLanguage": &options.source_language,
+        "transcriptionFormat": &options.transcription_format,
+        "smartSegmentationEnabled": options.is_smart_segmentation_enabled,
+        "subtitleCorrectionEnabled": options.is_subtitle_correction_enabled,
+        "aiSubtitleReviewEnabled": options.is_ai_subtitle_review_enabled,
+        "aiSubtitleReviewMode": &options.ai_subtitle_review_mode,
+        "videoContentType": &options.video_content_type,
+        "translationBatchSize": options.translation_batch_size,
+        "translationThreadCount": options.translation_thread_count,
     })
 }
 
@@ -2389,6 +2647,24 @@ fn delete_workbench_artifact(
         )
         .map(|_| ())
         .map_err(|error| format!("无法移除工作台产物: {error}"))
+}
+
+fn delete_downstream_workbench_artifacts(
+    connection: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<(), String> {
+    for kind in [
+        ARTIFACT_TRANSCRIPTION_SUBTITLE,
+        ARTIFACT_ALIGNED_SELECTED_SUBTITLE,
+        ARTIFACT_TRANSLATED_SUBTITLE,
+        ARTIFACT_DUBBED_VIDEO,
+        ARTIFACT_DUBBED_SUBTITLE,
+        ARTIFACT_EXPORTED_VIDEO,
+        ARTIFACT_EXPORTED_SUBTITLE,
+    ] {
+        delete_workbench_artifact(connection, task_id, kind)?;
+    }
+    Ok(())
 }
 
 fn reset_stage_to_pending(record: &mut HomeWorkbenchRecord, stage_key: &str, message: &str) {

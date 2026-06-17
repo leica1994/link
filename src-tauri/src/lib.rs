@@ -11,6 +11,7 @@ mod home_workbench;
 mod htdemucs;
 mod settings;
 mod subtitle_ai;
+mod subtitle_alignment;
 mod subtitle_burn;
 mod subtitle_export;
 mod subtitle_style;

@@ -36,6 +36,15 @@ const BLOB_SUB_CHUNK_DURATION_MS: u64 = 5 * 60 * 1000;
 const PROGRESS_EVENT: &str = "transcription-progress";
 
 pub(crate) type TranscriptionProgressSink = Arc<dyn Fn(TranscriptionProgress) + Send + Sync>;
+pub(crate) type RawTranscriptionTransform =
+    Arc<dyn Fn(Vec<TranscriptionSegment>) -> RawTranscriptionTransformResult + Send + Sync>;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RawTranscriptionTransformResult {
+    pub segments: Option<Vec<TranscriptionSegment>>,
+    pub warnings: Vec<String>,
+    pub metadata: serde_json::Value,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +76,8 @@ pub struct TranscriptionProgress {
     pub segments: Option<Vec<TranscriptionSegment>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +145,8 @@ pub struct TranscriptionResult {
     pub output_format: String,
     pub log_path: String,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -234,6 +247,7 @@ struct SnapshotEmitter {
     workflow_progress: WorkflowProgress,
     progress_sink: Option<TranscriptionProgressSink>,
     progress_context: ProgressContext,
+    metadata: serde_json::Value,
 }
 
 impl SnapshotEmitter {
@@ -249,7 +263,12 @@ impl SnapshotEmitter {
             workflow_progress,
             progress_sink,
             progress_context,
+            metadata: serde_json::Value::Null,
         }
+    }
+
+    fn set_metadata(&mut self, metadata: serde_json::Value) {
+        self.metadata = metadata;
     }
 
     fn emit(&mut self, message: &str, segments: &[TranscriptionSegment], warnings: &[String]) {
@@ -263,6 +282,7 @@ impl SnapshotEmitter {
             warnings,
             self.progress_sink.as_ref(),
             &self.progress_context,
+            &self.metadata,
         );
     }
 }
@@ -713,6 +733,29 @@ pub(crate) async fn run_transcription_workflow_with_sink(
     settings: AppSettings,
     progress_sink: Option<TranscriptionProgressSink>,
 ) -> Result<TranscriptionResult, String> {
+    run_transcription_workflow_with_transform(
+        app,
+        ai_service,
+        app_logger,
+        settings_store,
+        request,
+        settings,
+        progress_sink,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_transcription_workflow_with_transform(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings_store: Option<&SettingsStore>,
+    request: TranscriptionRequest,
+    settings: AppSettings,
+    progress_sink: Option<TranscriptionProgressSink>,
+    transform_raw_segments: Option<RawTranscriptionTransform>,
+) -> Result<TranscriptionResult, String> {
     let progress_context = ProgressContext::from_request(&request);
     let log_session = app_logger.start_session("transcription")?;
     log_session.info(
@@ -747,12 +790,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
         );
     }
     if settings.is_ai_subtitle_review_enabled {
-        workflow_progress.set_stage(
-            ProgressStage::AiReview,
-            0,
-            "等待前置处理完成",
-            "pending",
-        );
+        workflow_progress.set_stage(ProgressStage::AiReview, 0, "等待前置处理完成", "pending");
     }
     emit_progress_event(
         &app,
@@ -801,12 +839,23 @@ pub(crate) async fn run_transcription_workflow_with_sink(
 
     let mut segments = raw_result.segments;
     let mut warnings = Vec::new();
+    let mut metadata = json!({});
     let mut emitter = SnapshotEmitter::new(
         app.clone(),
         workflow_progress.clone(),
         progress_sink.clone(),
         progress_context.clone(),
     );
+
+    if let Some(transform) = transform_raw_segments {
+        let transform_result = transform(segments.clone());
+        if let Some(transformed_segments) = transform_result.segments {
+            segments = transformed_segments;
+        }
+        warnings.extend(transform_result.warnings);
+        metadata = transform_result.metadata;
+        emitter.set_metadata(metadata.clone());
+    }
 
     assign_segment_metadata(&mut segments, "raw", "raw");
     workflow_progress.set_stage(ProgressStage::Transcription, 100, "语音转录完成", "done");
@@ -1039,6 +1088,7 @@ pub(crate) async fn run_transcription_workflow_with_sink(
         output_format: raw_result.output_format.to_string(),
         log_path: log_session.path_string(),
         warnings,
+        metadata,
     })
 }
 
@@ -1396,9 +1446,10 @@ fn emit_progress_snapshot(
     warnings: &[String],
     progress_sink: Option<&TranscriptionProgressSink>,
     progress_context: &ProgressContext,
+    metadata: &serde_json::Value,
 ) {
     let progress = overall_progress(&stage_progress);
-    emit_progress_event(
+    emit_progress_event_with_metadata(
         app,
         progress,
         message,
@@ -1408,6 +1459,7 @@ fn emit_progress_snapshot(
         warnings,
         progress_sink,
         progress_context,
+        metadata.clone(),
     );
 }
 
@@ -1422,6 +1474,33 @@ fn emit_progress_event(
     progress_sink: Option<&TranscriptionProgressSink>,
     progress_context: &ProgressContext,
 ) {
+    emit_progress_event_with_metadata(
+        app,
+        progress,
+        message,
+        stage_progress,
+        revision,
+        segments,
+        warnings,
+        progress_sink,
+        progress_context,
+        serde_json::Value::Null,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_progress_event_with_metadata(
+    app: &AppHandle,
+    progress: u8,
+    message: &str,
+    stage_progress: Option<TranscriptionStageProgress>,
+    revision: Option<u64>,
+    segments: Option<Vec<TranscriptionSegment>>,
+    warnings: &[String],
+    progress_sink: Option<&TranscriptionProgressSink>,
+    progress_context: &ProgressContext,
+    metadata: serde_json::Value,
+) {
     let payload = TranscriptionProgress {
         progress,
         message: message.to_string(),
@@ -1431,6 +1510,7 @@ fn emit_progress_event(
         revision,
         segments,
         warnings: warnings.to_vec(),
+        metadata,
     };
     if let Some(sink) = progress_sink {
         sink(payload.clone());

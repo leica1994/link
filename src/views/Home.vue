@@ -655,18 +655,16 @@
                 </div>
 
                 <template v-else-if="selectedWorkbenchStage.key === 'prepare-subtitle'">
-                  <!-- 模式：使用下载字幕 -->
-                  <div v-if="prepareSubtitleMode === 'downloaded'" class="home-workbench-detail-file">
+                  <div v-if="prepareSubtitleMode === 'downloaded' && workbenchPrepareSubtitleSteps.length === 0" class="home-workbench-detail-file">
                     <CheckCircle2 :stroke-width="2.1" aria-hidden="true" />
                     <span class="home-workbench-artifact-copy">
-                      <span class="home-workbench-artifact-title">等待准备字幕</span>
+                      <span class="home-workbench-artifact-title">{{ workbenchStageMessage(selectedWorkbenchStage) }}</span>
                       <span class="home-workbench-artifact-path">
                         {{ readStringValue(selectedWorkbenchStageSnapshot.path) || '字幕已添加到工作台' }}
                       </span>
                     </span>
                   </div>
 
-                  <!-- 模式：转录生成字幕 -->
                   <template v-else>
                     <div v-if="workbenchPrepareSubtitleSteps.length > 0" class="home-workbench-detail-steps">
                       <div
@@ -2191,7 +2189,8 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     return []
   }
   const stageProgress = readRecordValue(snapshot.stageProgress)
-  return [
+  const alignment = readRecordValue(snapshot.alignment)
+  const steps = [
     { key: 'transcription', label: '转录', source: stageProgress.transcription },
     { key: 'smartSegmentation', label: '智能断句', source: stageProgress.smartSegmentation },
     { key: 'subtitleCorrection', label: '字幕校正', source: stageProgress.subtitleCorrection },
@@ -2199,6 +2198,17 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
   ]
     .filter((item) => readRecordValue(item.source))
     .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
+  if (mode === 'downloaded-align') {
+    const hasCoverage = readNumberValue(alignment.tokenCoverage) !== undefined || readNumberValue(alignment.segmentCoverage) !== undefined
+    steps.splice(1, 0, {
+      key: 'subtitleAlignment',
+      label: '字幕对齐',
+      progress: hasCoverage || readStringValue(alignment.status) === 'failed' ? 100 : 0,
+      status: readStringValue(alignment.status) === 'failed' ? 'failed' : hasCoverage ? 'done' : 'pending',
+      message: subtitleAlignmentMessage(alignment),
+    })
+  }
+  return steps
 })
 
 const workbenchSubtitleSegments = computed<WorkbenchSubtitleSegment[]>(() => {
@@ -3377,6 +3387,21 @@ const detailStepFromRecord = (key: string, label: string, value: Record<string, 
   status: normalizeWorkbenchDetailStatus(readStringValue(value.status)),
   message: readStringValue(value.message) || '等待处理',
 })
+
+const subtitleAlignmentMessage = (alignment: Record<string, unknown>) => {
+  const status = readStringValue(alignment.status)
+  if (status === 'failed') {
+    return '对齐失败，已改用自动转录字幕'
+  }
+  const tokenCoverage = readNumberValue(alignment.tokenCoverage)
+  const segmentCoverage = readNumberValue(alignment.segmentCoverage)
+  if (tokenCoverage !== undefined || segmentCoverage !== undefined) {
+    const tokenText = tokenCoverage !== undefined ? `词覆盖 ${Math.round(tokenCoverage * 100)}%` : ''
+    const segmentText = segmentCoverage !== undefined ? `行覆盖 ${Math.round(segmentCoverage * 100)}%` : ''
+    return [tokenText, segmentText].filter(Boolean).join(' · ') || '字幕已对齐'
+  }
+  return readStringValue(alignment.message) || '等待字幕对齐'
+}
 
 const readSubtitleSegments = (value: unknown): WorkbenchSubtitleSegment[] => {
   if (!Array.isArray(value)) {
