@@ -364,6 +364,34 @@ pub fn add_home_workbench_subtitle_input(
         record.options.subtitle_source = SUBTITLE_SOURCE_DOWNLOADED.to_string();
         record.options.subtitle_id = subtitle.id.clone();
         delete_downstream_workbench_artifacts(connection, &request.task_id)?;
+        reset_stage_to_pending(
+            &mut record,
+            STAGE_PREPARE_SUBTITLE,
+            "已添加下载字幕，执行时将重新对齐",
+        );
+        reset_stage_to_pending(&mut record, STAGE_TRANSLATION, "等待翻译");
+        reset_stage_to_pending(&mut record, STAGE_DUBBING, "等待配音");
+        reset_stage_to_pending(&mut record, STAGE_CONTENT_COPY, "等待生成文案");
+        reset_stage_to_pending(&mut record, STAGE_EXPORT, "等待导出");
+        if let Some(stage) = record
+            .stages
+            .iter_mut()
+            .find(|stage| stage.key == STAGE_PREPARE_SUBTITLE)
+        {
+            stage.snapshot = json!({
+                "mode": "downloaded",
+                "path": &subtitle.file_path,
+                "fileSize": subtitle.file_size,
+                "format": &subtitle.format,
+                "language": &subtitle.language,
+                "languageName": &subtitle.language_name,
+                "sourceKind": &subtitle.source_kind,
+                "message": "已添加下载字幕，执行时将重新对齐",
+            });
+        }
+        record.progress = overall_progress(&record.stages);
+        record.message = "已添加下载字幕，执行时将重新对齐".to_string();
+        record.current_stage = STAGE_PREPARE_SUBTITLE.to_string();
         upsert_workbench_record(
             connection,
             &request.task_id,
@@ -381,28 +409,11 @@ pub fn add_home_workbench_subtitle_input(
         )
     })?;
 
-    set_stage_done_with_snapshot(
-        &store,
-        &app,
-        &request.task_id,
-        STAGE_PREPARE_SUBTITLE,
-        "已添加下载字幕，执行时将重新对齐",
-        WORKBENCH_STATUS_IDLE,
-        json!({
-            "mode": "downloaded",
-            "path": &subtitle.file_path,
-            "fileSize": subtitle.file_size,
-            "format": &subtitle.format,
-            "language": &subtitle.language,
-            "languageName": &subtitle.language_name,
-            "sourceKind": &subtitle.source_kind,
-            "message": "已添加下载字幕，执行时将重新对齐",
-        }),
-    )?;
-
-    store.with_connection(|connection| {
+    let snapshot = store.with_connection(|connection| {
         read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
-    })
+    })?;
+    emit_workbench_progress(&app, &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
