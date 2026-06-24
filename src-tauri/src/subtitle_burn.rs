@@ -1,11 +1,13 @@
+use crate::app_log::{AppLogger, LogSession};
 use crate::command_utils::create_command;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tempfile::TempDir;
 
 const PROGRESS_EVENT: &str = "subtitle-burn-progress";
@@ -65,7 +67,49 @@ fn start_subtitle_burn_blocking(
     app: AppHandle,
     request: SubtitleBurnRequest,
 ) -> Result<SubtitleBurnResult, String> {
-    emit_progress(&app, 0, "准备烧录", None);
+    let app_logger = app.state::<AppLogger>();
+    let log_session = app_logger.start_session("subtitle_burn")?;
+    log_session.info(
+        "request_received",
+        "收到字幕烧录请求",
+        json!({
+            "videoPath": request.video_path.trim(),
+            "subtitlePath": request.subtitle_path.trim(),
+            "outputPath": request.output_path.as_deref().unwrap_or("").trim(),
+        }),
+    );
+
+    let result = start_subtitle_burn_inner(&app, request, &log_session);
+    match result {
+        Ok(result) => {
+            log_session.info(
+                "subtitle_burn_completed",
+                "字幕烧录完成",
+                json!({
+                    "outputPath": &result.output_path,
+                    "durationMs": result.duration_ms,
+                    "logPath": log_session.path_string(),
+                }),
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            log_session.error(
+                "subtitle_burn_failed",
+                "字幕烧录失败",
+                json!({ "error": &error }),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn start_subtitle_burn_inner(
+    app: &AppHandle,
+    request: SubtitleBurnRequest,
+    log_session: &LogSession,
+) -> Result<SubtitleBurnResult, String> {
+    emit_progress(app, 0, "准备烧录", None);
 
     let video_path = PathBuf::from(request.video_path.trim());
     let subtitle_path = PathBuf::from(request.subtitle_path.trim());
@@ -76,15 +120,52 @@ fn start_subtitle_burn_blocking(
     validate_output_path(&video_path, &output_path)?;
     let output_path_string = path_to_string(&output_path);
 
-    emit_progress(&app, 8, "检测视频时长", Some(output_path_string.clone()));
-    let duration_ms = probe_duration_ms(&video_path)
-        .ok()
-        .filter(|duration| *duration > 0);
+    emit_progress(app, 8, "检测视频时长", Some(output_path_string.clone()));
+    let duration_ms = match probe_duration_ms(&video_path) {
+        Ok(duration) if duration > 0 => {
+            log_session.info(
+                "video_duration_detected",
+                "已检测视频时长",
+                json!({ "durationMs": duration }),
+            );
+            Some(duration)
+        }
+        Ok(_) => {
+            log_session.warn(
+                "video_duration_empty",
+                "视频时长检测结果为空，将继续烧录",
+                json!({}),
+            );
+            None
+        }
+        Err(error) => {
+            log_session.warn(
+                "video_duration_probe_failed",
+                "视频时长检测失败，将继续烧录",
+                json!({ "error": &error }),
+            );
+            None
+        }
+    };
 
-    emit_progress(&app, 18, "启动 ffmpeg", Some(output_path_string.clone()));
-    run_ffmpeg_burn(&app, &video_path, &subtitle_path, &output_path, duration_ms)?;
+    emit_progress(app, 18, "启动 ffmpeg", Some(output_path_string.clone()));
+    log_session.info(
+        "ffmpeg_burn_start",
+        "启动 ffmpeg 烧录字幕",
+        json!({
+            "videoPath": video_path.to_string_lossy(),
+            "subtitlePath": subtitle_path.to_string_lossy(),
+            "outputPath": output_path.to_string_lossy(),
+        }),
+    );
+    run_ffmpeg_burn(app, &video_path, &subtitle_path, &output_path, duration_ms)?;
+    log_session.info(
+        "ffmpeg_burn_success",
+        "ffmpeg 字幕烧录成功",
+        json!({ "outputPath": output_path.to_string_lossy() }),
+    );
 
-    emit_progress(&app, 100, "烧录完成", Some(output_path_string.clone()));
+    emit_progress(app, 100, "烧录完成", Some(output_path_string.clone()));
     Ok(SubtitleBurnResult {
         output_path: output_path_string,
         duration_ms,

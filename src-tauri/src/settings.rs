@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use tauri::AppHandle;
 
 use crate::ai::AiService;
+use crate::app_log::AppLogger;
 use crate::app_paths;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
@@ -398,10 +399,54 @@ pub fn load_settings(store: tauri::State<'_, SettingsStore>) -> Result<AppSettin
 pub fn save_settings(
     store: tauri::State<'_, SettingsStore>,
     ai_service: tauri::State<'_, AiService>,
+    app_logger: tauri::State<'_, AppLogger>,
     settings: AppSettings,
 ) -> Result<(), String> {
-    store.save(&settings)?;
-    ai_service.update_thread_count(settings.translation_thread_count)
+    app_logger.info(
+        "settings",
+        "save_start",
+        "开始保存应用设置",
+        serde_json::json!({
+            "selectedLlmService": &settings.selected_llm_service,
+            "translationThreadCount": settings.translation_thread_count,
+            "translationBatchSize": settings.translation_batch_size,
+            "smartSegmentation": settings.is_smart_segmentation_enabled,
+            "subtitleCorrection": settings.is_subtitle_correction_enabled,
+            "subtitleTranslation": settings.is_subtitle_translation_enabled,
+            "aiSubtitleReview": settings.is_ai_subtitle_review_enabled,
+        }),
+    );
+
+    if let Err(error) = store.save(&settings) {
+        app_logger.error(
+            "settings",
+            "save_failed",
+            "保存应用设置失败",
+            serde_json::json!({ "error": &error }),
+        );
+        return Err(error);
+    }
+
+    if let Err(error) = ai_service.update_thread_count(settings.translation_thread_count) {
+        app_logger.error(
+            "settings",
+            "ai_concurrency_update_failed",
+            "保存设置后更新 AI 并发限制失败",
+            serde_json::json!({ "error": &error }),
+        );
+        return Err(error);
+    }
+
+    app_logger.info(
+        "settings",
+        "save_success",
+        "应用设置已保存",
+        serde_json::json!({
+            "selectedLlmService": &settings.selected_llm_service,
+            "translationThreadCount": settings.translation_thread_count,
+        }),
+    );
+    Ok(())
 }
 
 fn initialize_database(connection: &Connection) -> Result<(), String> {

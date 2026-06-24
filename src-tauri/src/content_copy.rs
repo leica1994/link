@@ -189,20 +189,57 @@ pub(crate) async fn generate_content_copy_record(
         }),
     );
 
-    let segments = load_subtitle_segments(&subtitle_path)?;
+    let segments = match load_subtitle_segments(&subtitle_path) {
+        Ok(segments) => segments,
+        Err(error) => {
+            log_session.error(
+                "subtitle_load_failed",
+                "读取文案生成字幕文件失败",
+                json!({ "subtitlePath": subtitle_path.to_string_lossy(), "error": &error }),
+            );
+            return Err(error);
+        }
+    };
     if segments.is_empty() {
-        return Err("字幕文件没有可用文本".to_string());
+        let error = "字幕文件没有可用文本".to_string();
+        log_session.warn(
+            "subtitle_empty",
+            "文案生成字幕内容为空",
+            json!({ "subtitlePath": subtitle_path.to_string_lossy() }),
+        );
+        return Err(error);
     }
 
-    let transcript = build_prompt_transcript(&settings, &ai_service, &segments).await?;
-    let result = generate_result_by_llm(
+    let transcript = match build_prompt_transcript(&settings, &ai_service, &segments).await {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            log_session.error(
+                "transcript_prepare_failed",
+                "文案生成转录文本准备失败",
+                json!({ "segmentCount": segments.len(), "error": &error }),
+            );
+            return Err(error);
+        }
+    };
+    let result = match generate_result_by_llm(
         &settings,
         &ai_service,
         &transcript,
         &request.extra_context,
         &options,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            log_session.error(
+                "content_generation_failed",
+                "AI 文案生成失败",
+                json!({ "segmentCount": segments.len(), "error": &error }),
+            );
+            return Err(error);
+        }
+    };
     let now = Utc::now().to_rfc3339();
     let record = ContentCopyRecord {
         id: Uuid::new_v4().to_string(),
@@ -221,7 +258,16 @@ pub(crate) async fn generate_content_copy_record(
         updated_at: now,
     };
 
-    settings_store.with_connection(|connection| insert_content_copy_record(connection, &record))?;
+    if let Err(error) =
+        settings_store.with_connection(|connection| insert_content_copy_record(connection, &record))
+    {
+        log_session.error(
+            "record_save_failed",
+            "保存文案生成结果失败",
+            json!({ "recordId": &record.id, "error": &error }),
+        );
+        return Err(error);
+    }
     log_session.info(
         "record_saved",
         "文案生成结果已保存",
@@ -242,7 +288,8 @@ pub fn list_content_copy_records(
 ) -> Result<Vec<ContentCopyRecord>, String> {
     let limit = request.limit.unwrap_or(30);
     let source = normalize_source(request.source.as_deref());
-    settings_store.with_connection(|connection| read_content_copy_records(connection, limit, &source))
+    settings_store
+        .with_connection(|connection| read_content_copy_records(connection, limit, &source))
 }
 
 #[tauri::command]
@@ -259,17 +306,45 @@ pub fn get_content_copy_record(
 #[tauri::command]
 pub fn delete_content_copy_record(
     settings_store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: DeleteContentCopyRecordRequest,
 ) -> Result<(), String> {
-    settings_store.with_connection(|connection| {
+    app_logger.info(
+        "content_copy",
+        "record_delete_start",
+        "开始删除文案历史",
+        json!({ "recordId": &request.id }),
+    );
+    let result = settings_store.with_connection(|connection| {
         connection
             .execute(
                 "DELETE FROM content_copy_records WHERE id = ?1",
-                params![request.id],
+                params![&request.id],
             )
-            .map(|_| ())
+            .map(|affected| affected)
             .map_err(|error| format!("无法删除文案历史: {error}"))
-    })
+    });
+
+    match result {
+        Ok(affected) => {
+            app_logger.info(
+                "content_copy",
+                "record_delete_success",
+                "文案历史已删除",
+                json!({ "recordId": &request.id, "affectedRows": affected }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "content_copy",
+                "record_delete_failed",
+                "删除文案历史失败",
+                json!({ "recordId": &request.id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 async fn build_prompt_transcript(
@@ -730,7 +805,10 @@ fn read_content_copy_records(
         )
         .map_err(|error| format!("无法读取文案历史: {error}"))?;
     let rows = statement
-        .query_map(params![source, normalized_limit as i64], map_content_copy_record)
+        .query_map(
+            params![source, normalized_limit as i64],
+            map_content_copy_record,
+        )
         .map_err(|error| format!("无法读取文案历史: {error}"))?;
     let mut records = Vec::new();
     for row in rows {

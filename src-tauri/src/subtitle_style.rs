@@ -1,6 +1,8 @@
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
+use crate::app_log::AppLogger;
 use crate::settings::SettingsStore;
 
 const SUBTITLE_STYLE_COLUMNS: &str = "
@@ -267,13 +269,20 @@ pub fn get_subtitle_style(
 #[tauri::command]
 pub fn select_subtitle_style(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     id: String,
 ) -> Result<(), String> {
+    app_logger.info(
+        "subtitle_style",
+        "select_start",
+        "开始选择字幕样式",
+        json!({ "styleId": &id }),
+    );
     let exists = store.with_connection(|connection| {
         connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM subtitle_styles WHERE id = ?1)",
-                params![id],
+                params![&id],
                 |row| row.get::<_, i64>(0),
             )
             .map(|value| value != 0)
@@ -281,10 +290,36 @@ pub fn select_subtitle_style(
     })?;
 
     if !exists {
-        return Err("字幕样式不存在".to_string());
+        let error = "字幕样式不存在".to_string();
+        app_logger.warn(
+            "subtitle_style",
+            "select_missing",
+            "选择的字幕样式不存在",
+            json!({ "styleId": &id }),
+        );
+        return Err(error);
     }
 
-    store.set_selected_subtitle_style_id(&id)
+    match store.set_selected_subtitle_style_id(&id) {
+        Ok(()) => {
+            app_logger.info(
+                "subtitle_style",
+                "select_success",
+                "字幕样式已选择",
+                json!({ "styleId": &id }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "subtitle_style",
+                "select_failed",
+                "选择字幕样式失败",
+                json!({ "styleId": &id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn get_selected_subtitle_style(
@@ -322,12 +357,22 @@ pub(crate) fn get_selected_subtitle_style(
 #[tauri::command]
 pub fn create_subtitle_style(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: CreateSubtitleStyleRequest,
 ) -> Result<SubtitleStyle, String> {
     let id = uuid::Uuid::new_v4().to_string();
+    let log_id = id.clone();
+    let log_name = request.name.clone();
     let now = chrono::Utc::now().to_rfc3339();
 
-    store.with_connection(|connection| {
+    app_logger.info(
+        "subtitle_style",
+        "create_start",
+        "开始创建字幕样式",
+        json!({ "styleId": &log_id, "name": &log_name }),
+    );
+
+    let result = store.with_connection(|connection| {
         connection
             .execute(
                 "
@@ -448,17 +493,48 @@ pub fn create_subtitle_style(
                 },
             )
             .map_err(|error| format!("无法获取创建的字幕样式: {error}"))
-    })
+    });
+
+    match result {
+        Ok(style) => {
+            app_logger.info(
+                "subtitle_style",
+                "create_success",
+                "字幕样式已创建",
+                json!({ "styleId": &style.id, "name": &style.name }),
+            );
+            Ok(style)
+        }
+        Err(error) => {
+            app_logger.error(
+                "subtitle_style",
+                "create_failed",
+                "创建字幕样式失败",
+                json!({ "styleId": &log_id, "name": &log_name, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 pub fn update_subtitle_style(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: UpdateSubtitleStyleRequest,
 ) -> Result<SubtitleStyle, String> {
     let request_id = request.id.clone();
+    let log_id = request_id.clone();
+    let log_name = request.name.clone();
 
-    store.with_connection(|connection| {
+    app_logger.info(
+        "subtitle_style",
+        "update_start",
+        "开始更新字幕样式",
+        json!({ "styleId": &log_id, "name": &log_name }),
+    );
+
+    let result = store.with_connection(|connection| {
         let now = chrono::Utc::now().to_rfc3339();
 
         connection
@@ -592,41 +668,93 @@ pub fn update_subtitle_style(
                 },
             )
             .map_err(|error| format!("无法获取更新后的字幕样式: {error}"))
-    })
+    });
+
+    match result {
+        Ok(style) => {
+            app_logger.info(
+                "subtitle_style",
+                "update_success",
+                "字幕样式已更新",
+                json!({ "styleId": &style.id, "name": &style.name }),
+            );
+            Ok(style)
+        }
+        Err(error) => {
+            app_logger.error(
+                "subtitle_style",
+                "update_failed",
+                "更新字幕样式失败",
+                json!({ "styleId": &log_id, "name": &log_name, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 pub fn delete_subtitle_style(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     id: String,
 ) -> Result<(), String> {
-    store.with_connection(|connection| {
-        // 检查是否为默认样式
-        let is_default: i64 = connection
-            .query_row(
-                "SELECT is_default FROM subtitle_styles WHERE id = ?1",
-                params![&id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("无法查询字幕样式: {error}"))?;
+    app_logger.info(
+        "subtitle_style",
+        "delete_start",
+        "开始删除字幕样式",
+        json!({ "styleId": &id }),
+    );
 
-        if is_default != 0 {
-            return Err("不能删除默认样式".to_string());
+    let result = (|| {
+        store.with_connection(|connection| {
+            // 检查是否为默认样式
+            let is_default: i64 = connection
+                .query_row(
+                    "SELECT is_default FROM subtitle_styles WHERE id = ?1",
+                    params![&id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("无法查询字幕样式: {error}"))?;
+
+            if is_default != 0 {
+                return Err("不能删除默认样式".to_string());
+            }
+
+            connection
+                .execute("DELETE FROM subtitle_styles WHERE id = ?1", params![&id])
+                .map_err(|error| format!("无法删除字幕样式: {error}"))?;
+
+            Ok(())
+        })?;
+
+        let settings = store.load()?;
+        if settings.selected_subtitle_style_id == id {
+            store.set_selected_subtitle_style_id("default")?;
         }
 
-        connection
-            .execute("DELETE FROM subtitle_styles WHERE id = ?1", params![&id])
-            .map_err(|error| format!("无法删除字幕样式: {error}"))?;
-
         Ok(())
-    })?;
+    })();
 
-    let settings = store.load()?;
-    if settings.selected_subtitle_style_id == id {
-        store.set_selected_subtitle_style_id("default")?;
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "subtitle_style",
+                "delete_success",
+                "字幕样式已删除",
+                json!({ "styleId": &id }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "subtitle_style",
+                "delete_failed",
+                "删除字幕样式失败",
+                json!({ "styleId": &id, "error": &error }),
+            );
+            Err(error)
+        }
     }
-
-    Ok(())
 }
 
 fn subtitle_style_from_row(row: &Row<'_>) -> rusqlite::Result<SubtitleStyle> {

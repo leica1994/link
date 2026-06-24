@@ -85,19 +85,19 @@ pub fn run() {
                     error,
                 ))
             })?;
-            let ai_service =
-                AiService::new(settings.translation_thread_count).map_err(|error| {
-                    Box::<dyn std::error::Error>::from(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        error,
-                    ))
-                })?;
             let app_logger = AppLogger::new(app.handle()).map_err(|error| {
                 Box::<dyn std::error::Error>::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     error,
                 ))
             })?;
+            let ai_service = AiService::new(settings.translation_thread_count, app_logger.clone())
+                .map_err(|error| {
+                    Box::<dyn std::error::Error>::from(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        error,
+                    ))
+                })?;
             let dubbing_tts_scheduler = DubbingTtsScheduler::new();
             let youtube_monitor_service = YoutubeMonitorService::new();
             app.manage(store);

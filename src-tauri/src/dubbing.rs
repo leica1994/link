@@ -945,6 +945,44 @@ pub fn cleanup_dubbing_task_cache(
     app: AppHandle,
     request: CleanupDubbingTaskCacheRequest,
 ) -> Result<Option<DubbingTaskSnapshot>, String> {
+    let app_logger = app.state::<AppLogger>().inner().clone();
+    let task_id = request.task_id.clone();
+    app_logger.info(
+        "dubbing",
+        "task_cache_cleanup_start",
+        "开始清理配音任务缓存",
+        json!({ "taskId": &task_id }),
+    );
+    let result = cleanup_dubbing_task_cache_inner(app, request);
+    match result {
+        Ok(snapshot) => {
+            app_logger.info(
+                "dubbing",
+                "task_cache_cleanup_success",
+                "配音任务缓存已清理",
+                json!({
+                    "taskId": &task_id,
+                    "taskDeleted": snapshot.is_none(),
+                }),
+            );
+            Ok(snapshot)
+        }
+        Err(error) => {
+            app_logger.error(
+                "dubbing",
+                "task_cache_cleanup_failed",
+                "清理配音任务缓存失败",
+                json!({ "taskId": &task_id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_dubbing_task_cache_inner(
+    app: AppHandle,
+    request: CleanupDubbingTaskCacheRequest,
+) -> Result<Option<DubbingTaskSnapshot>, String> {
     let store = app.state::<SettingsStore>();
     let snapshot = store.with_connection(|connection| {
         read_dubbing_task_snapshot_by_id(connection, &request.task_id)
@@ -2157,16 +2195,57 @@ pub fn add_dubbing_model(
     scheduler: tauri::State<'_, DubbingTtsScheduler>,
     request: AddDubbingModelRequest,
 ) -> Result<DubbingModel, String> {
-    let mut voice = engine_for(&request.engine)?
-        .list_voices()?
-        .into_iter()
-        .find(|voice| voice.model_key == request.model_key)
-        .ok_or_else(|| "未找到该语音".to_string())?;
-    apply_dubbing_model_options(&mut voice, request.endpoint.as_deref())?;
+    let app_logger = app.state::<AppLogger>().inner().clone();
+    let log_engine = request.engine.clone();
+    let log_model_key = request.model_key.clone();
+    app_logger.info(
+        "dubbing",
+        "model_add_start",
+        "开始添加配音模型",
+        json!({ "engine": &log_engine, "modelKey": &log_model_key }),
+    );
 
-    let model = insert_dubbing_model(&store, voice, Some(&*scheduler))?;
-    emit_dubbing_models_updated(&app);
-    Ok(model)
+    let result = (|| {
+        let mut voice = engine_for(&request.engine)?
+            .list_voices()?
+            .into_iter()
+            .find(|voice| voice.model_key == request.model_key)
+            .ok_or_else(|| "未找到该语音".to_string())?;
+        apply_dubbing_model_options(&mut voice, request.endpoint.as_deref())?;
+
+        let model = insert_dubbing_model(&store, voice, Some(&*scheduler))?;
+        emit_dubbing_models_updated(&app);
+        Ok(model)
+    })();
+
+    match result {
+        Ok(model) => {
+            app_logger.info(
+                "dubbing",
+                "model_add_success",
+                "配音模型已添加",
+                json!({
+                    "modelId": &model.id,
+                    "engine": &model.engine,
+                    "modelKey": &model.model_key,
+                }),
+            );
+            Ok(model)
+        }
+        Err(error) => {
+            app_logger.error(
+                "dubbing",
+                "model_add_failed",
+                "添加配音模型失败",
+                json!({
+                    "engine": &log_engine,
+                    "modelKey": &log_model_key,
+                    "error": &error,
+                }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -2176,12 +2255,21 @@ pub fn set_dubbing_model_enabled(
     scheduler: tauri::State<'_, DubbingTtsScheduler>,
     request: SetDubbingModelEnabledRequest,
 ) -> Result<DubbingModel, String> {
+    let app_logger = app.state::<AppLogger>().inner().clone();
+    let model_id = request.id.clone();
+    let enabled = request.enabled;
+    app_logger.info(
+        "dubbing",
+        "model_enabled_update_start",
+        "开始更新配音模型启用状态",
+        json!({ "modelId": &model_id, "enabled": enabled }),
+    );
     let updated_at = Utc::now().to_rfc3339();
 
-    let model = store.with_connection(|connection| {
+    let result = store.with_connection(|connection| {
         let changed = connection
             .execute(
-                if request.enabled {
+                if enabled {
                     "
                     UPDATE dubbing_models
                     SET enabled = 1,
@@ -2199,7 +2287,7 @@ pub fn set_dubbing_model_enabled(
                     WHERE id = ?1
                     "
                 },
-                params![request.id, updated_at],
+                params![&model_id, updated_at],
             )
             .map_err(|error| format!("无法更新配音模型: {error}"))?;
 
@@ -2207,10 +2295,30 @@ pub fn set_dubbing_model_enabled(
             return Err("未找到该配音模型".to_string());
         }
 
-        read_dubbing_model_by_id(connection, &request.id, Some(&*scheduler))
-    })?;
-    emit_dubbing_models_updated(&app);
-    Ok(model)
+        read_dubbing_model_by_id(connection, &model_id, Some(&*scheduler))
+    });
+
+    match result {
+        Ok(model) => {
+            emit_dubbing_models_updated(&app);
+            app_logger.info(
+                "dubbing",
+                "model_enabled_update_success",
+                "配音模型启用状态已更新",
+                json!({ "modelId": &model.id, "enabled": model.enabled }),
+            );
+            Ok(model)
+        }
+        Err(error) => {
+            app_logger.error(
+                "dubbing",
+                "model_enabled_update_failed",
+                "更新配音模型启用状态失败",
+                json!({ "modelId": &model_id, "enabled": enabled, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -2220,23 +2328,53 @@ pub fn delete_dubbing_model(
     scheduler: tauri::State<'_, DubbingTtsScheduler>,
     request: DeleteDubbingModelRequest,
 ) -> Result<(), String> {
-    store.with_connection(|connection| {
-        let changed = connection
-            .execute(
-                "DELETE FROM dubbing_models WHERE id = ?1",
-                params![request.id],
-            )
-            .map_err(|error| format!("无法删除配音模型: {error}"))?;
+    let app_logger = app.state::<AppLogger>().inner().clone();
+    app_logger.info(
+        "dubbing",
+        "model_delete_start",
+        "开始删除配音模型",
+        json!({ "modelId": &request.id }),
+    );
+    let result = (|| {
+        store.with_connection(|connection| {
+            let changed = connection
+                .execute(
+                    "DELETE FROM dubbing_models WHERE id = ?1",
+                    params![&request.id],
+                )
+                .map_err(|error| format!("无法删除配音模型: {error}"))?;
 
-        if changed == 0 {
-            return Err("未找到该配音模型".to_string());
-        }
+            if changed == 0 {
+                return Err("未找到该配音模型".to_string());
+            }
 
+            Ok(())
+        })?;
+        scheduler.remove_model(&request.id)?;
+        emit_dubbing_models_updated(&app);
         Ok(())
-    })?;
-    scheduler.remove_model(&request.id)?;
-    emit_dubbing_models_updated(&app);
-    Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "dubbing",
+                "model_delete_success",
+                "配音模型已删除",
+                json!({ "modelId": &request.id }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "dubbing",
+                "model_delete_failed",
+                "删除配音模型失败",
+                json!({ "modelId": &request.id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -3189,13 +3327,13 @@ pub(crate) fn delete_dubbing_task_by_id(
     store: &SettingsStore,
     task_id: &str,
 ) -> Result<(), String> {
-    let snapshot =
-        match store.with_connection(|connection| read_dubbing_task_snapshot_by_id(connection, task_id))
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) if error == "未找到配音任务" => return Ok(()),
-            Err(error) => return Err(error),
-        };
+    let snapshot = match store
+        .with_connection(|connection| read_dubbing_task_snapshot_by_id(connection, task_id))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) if error == "未找到配音任务" => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if snapshot.status == DUBBING_STATUS_RUNNING {
         return Err("配音任务执行中，无法删除缓存".to_string());
     }

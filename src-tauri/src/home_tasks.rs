@@ -16,7 +16,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-use crate::app_log::LogSession;
+use crate::app_log::{AppLogger, LogSession};
 use crate::app_paths;
 use crate::dubbing::delete_dubbing_task_by_id;
 use crate::settings::SettingsStore;
@@ -358,6 +358,7 @@ pub fn list_home_video_tasks(
 #[tauri::command]
 pub fn add_home_video_task(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: AddHomeVideoTaskRequest,
 ) -> Result<HomeVideoTask, String> {
     let url = normalize_youtube_video_url(&request.url)?;
@@ -367,11 +368,23 @@ pub fn add_home_video_task(
     let external_id = youtube_video_id_from_url(&url).unwrap_or_default();
     let now = Utc::now().to_rfc3339();
 
-    store.with_connection(|connection| {
+    app_logger.info(
+        "home_tasks",
+        "task_add_start",
+        "开始添加首页视频任务",
+        json!({
+            "url": &url,
+            "externalId": &external_id,
+            "sourceChannelId": &source_channel_id,
+            "sourceVideoId": &source_video_id,
+        }),
+    );
+
+    let result = store.with_connection(|connection| {
         let existing_id = connection
             .query_row(
                 "SELECT id FROM home_video_tasks WHERE url = ?1 LIMIT 1",
-                params![url],
+                params![&url],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -389,7 +402,14 @@ pub fn add_home_video_task(
                         updated_at = ?6
                     WHERE id = ?1
                     ",
-                    params![existing_id, source_channel_id, source_video_id, external_id, title, now],
+                    params![
+                        &existing_id,
+                        &source_channel_id,
+                        &source_video_id,
+                        &external_id,
+                        &title,
+                        &now
+                    ],
                 )
                 .map_err(|error| format!("无法更新待办任务: {error}"))?;
             return read_home_video_task_by_id(connection, &existing_id);
@@ -406,21 +426,46 @@ pub fn add_home_video_task(
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', '{}', ?8, ?9)
                 ",
                 params![
-                    id,
-                    url,
-                    source_channel_id,
-                    source_video_id,
-                    external_id,
-                    title,
+                    &id,
+                    &url,
+                    &source_channel_id,
+                    &source_video_id,
+                    &external_id,
+                    &title,
                     DETAIL_STATUS_PENDING,
-                    now,
-                    now,
+                    &now,
+                    &now,
                 ],
             )
             .map_err(|error| format!("无法添加待办任务: {error}"))?;
 
         read_home_video_task_by_id(connection, &id)
-    })
+    });
+
+    match result {
+        Ok(task) => {
+            app_logger.info(
+                "home_tasks",
+                "task_add_success",
+                "首页视频任务已添加或更新",
+                json!({
+                    "taskId": &task.id,
+                    "url": &task.url,
+                    "externalId": &task.external_id,
+                }),
+            );
+            Ok(task)
+        }
+        Err(error) => {
+            app_logger.error(
+                "home_tasks",
+                "task_add_failed",
+                "添加首页视频任务失败",
+                json!({ "url": &url, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -433,6 +478,42 @@ pub fn get_home_video_task(
 
 #[tauri::command]
 pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> Result<(), String> {
+    let app_logger = app.state::<AppLogger>().inner().clone();
+    let task_id = request.task_id.clone();
+    app_logger.info(
+        "home_tasks",
+        "task_delete_start",
+        "开始删除首页视频任务",
+        json!({ "taskId": &task_id }),
+    );
+
+    let result = delete_home_video_task_inner(app, request);
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "home_tasks",
+                "task_delete_success",
+                "首页视频任务已删除",
+                json!({ "taskId": &task_id }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "home_tasks",
+                "task_delete_failed",
+                "删除首页视频任务失败",
+                json!({ "taskId": &task_id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn delete_home_video_task_inner(
+    app: AppHandle,
+    request: HomeVideoTaskRequest,
+) -> Result<(), String> {
     let store = app.state::<SettingsStore>();
     let task_id = request.task_id.clone();
     let dubbing_task_ids = store.with_connection(|connection| {
@@ -475,37 +556,37 @@ pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> 
         transaction
             .execute(
                 "DELETE FROM home_video_task_subtitles WHERE task_id = ?1",
-                params![request.task_id],
+                params![&task_id],
             )
             .map_err(|error| format!("无法删除字幕记录: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM home_video_task_videos WHERE task_id = ?1",
-                params![request.task_id],
+                params![&task_id],
             )
             .map_err(|error| format!("无法删除视频记录: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM home_video_task_download_states WHERE task_id = ?1",
-                params![request.task_id],
+                params![&task_id],
             )
             .map_err(|error| format!("无法删除视频下载状态: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM home_workbench_artifacts WHERE task_id = ?1",
-                params![request.task_id],
+                params![&task_id],
             )
             .map_err(|error| format!("无法删除工作台产物记录: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM home_workbench_tasks WHERE task_id = ?1",
-                params![request.task_id],
+                params![&task_id],
             )
             .map_err(|error| format!("无法删除工作台记录: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM home_video_tasks WHERE id = ?1",
-                params![request.task_id],
+                params![&task_id],
             )
             .map_err(|error| format!("无法删除待办任务: {error}"))?;
         transaction
@@ -514,7 +595,7 @@ pub fn delete_home_video_task(app: AppHandle, request: HomeVideoTaskRequest) -> 
         Ok(())
     })?;
 
-    remove_home_task_dir(&request.task_id)?;
+    remove_home_task_dir(&task_id)?;
 
     Ok(())
 }
@@ -591,6 +672,13 @@ fn refresh_home_video_task_detail_blocking(
     })?;
 
     let log_session = ytdlp::start_log_session(&app, "home_video_detail");
+    if let Some(log_session) = log_session.as_ref() {
+        log_session.info(
+            "video_detail_start",
+            "开始读取首页视频详情",
+            json!({ "taskId": &task.id, "url": &task.url }),
+        );
+    }
     match fetch_video_detail(&task.url, &ytdlp_config, log_session.as_ref()) {
         Ok(detail) => {
             let checked_at = Utc::now().to_rfc3339();
@@ -598,7 +686,7 @@ fn refresh_home_video_task_detail_blocking(
                 .unwrap_or_else(|_| "[]".to_string());
             let metadata =
                 serde_json::to_string(&detail.metadata).unwrap_or_else(|_| "{}".to_string());
-            store.with_connection(|connection| {
+            let result = store.with_connection(|connection| {
                 connection
                     .execute(
                         "
@@ -646,11 +734,44 @@ fn refresh_home_video_task_detail_blocking(
                     )
                     .map_err(|error| format!("无法保存视频详情: {error}"))?;
                 read_home_video_task_by_id(connection, &request.task_id)
-            })
+            });
+            match result {
+                Ok(task) => {
+                    if let Some(log_session) = log_session.as_ref() {
+                        log_session.info(
+                            "video_detail_success",
+                            "首页视频详情读取完成",
+                            json!({
+                                "taskId": &task.id,
+                                "externalId": &task.external_id,
+                                "subtitleOptionCount": task.subtitle_options.len(),
+                            }),
+                        );
+                    }
+                    Ok(task)
+                }
+                Err(error) => {
+                    if let Some(log_session) = log_session.as_ref() {
+                        log_session.error(
+                            "video_detail_save_failed",
+                            "保存首页视频详情失败",
+                            json!({ "taskId": &task.id, "error": &error }),
+                        );
+                    }
+                    Err(error)
+                }
+            }
         }
         Err(error) => {
             let checked_at = Utc::now().to_rfc3339();
             let compact = ytdlp::compact_error(&error);
+            if let Some(log_session) = log_session.as_ref() {
+                log_session.warn(
+                    "video_detail_failed",
+                    "首页视频详情读取失败",
+                    json!({ "taskId": &task.id, "error": &compact }),
+                );
+            }
             let _ = store.with_connection(|connection| {
                 connection
                     .execute(
@@ -708,6 +829,17 @@ pub(crate) fn download_home_video_task_subtitle_internal(
 
     progress.emit_active(2, "准备下载字幕");
     let log_session = ytdlp::start_log_session(&app, "home_subtitle_download");
+    if let Some(log_session) = log_session.as_ref() {
+        log_session.info(
+            "subtitle_download_start",
+            "开始下载首页任务字幕",
+            json!({
+                "taskId": &task.id,
+                "language": &option.language,
+                "sourceKind": &option.source_kind,
+            }),
+        );
+    }
     let output = match download_subtitle_file(
         &task,
         &option,
@@ -718,10 +850,20 @@ pub(crate) fn download_home_video_task_subtitle_internal(
     ) {
         Ok(output) => output,
         Err(error) => {
+            if let Some(log_session) = log_session.as_ref() {
+                log_session.warn(
+                    "subtitle_download_failed",
+                    "首页任务字幕下载失败",
+                    json!({ "taskId": &task.id, "error": &error }),
+                );
+            }
             progress.emit_failed(&error);
             return Err(error);
         }
     };
+    let output_path = output.path.to_string_lossy().to_string();
+    let output_format = output.format.clone();
+    let output_size = output.file_size;
     let now = Utc::now().to_rfc3339();
     let updated_task = match store.with_connection(|connection| {
         upsert_home_video_subtitle(connection, &task.id, &option, output, &now)?;
@@ -729,10 +871,29 @@ pub(crate) fn download_home_video_task_subtitle_internal(
     }) {
         Ok(task) => task,
         Err(error) => {
+            if let Some(log_session) = log_session.as_ref() {
+                log_session.error(
+                    "subtitle_download_save_failed",
+                    "保存首页任务字幕下载结果失败",
+                    json!({ "taskId": &task.id, "error": &error }),
+                );
+            }
             progress.emit_failed(&error);
             return Err(error);
         }
     };
+    if let Some(log_session) = log_session.as_ref() {
+        log_session.info(
+            "subtitle_download_success",
+            "首页任务字幕下载完成",
+            json!({
+                "taskId": &task.id,
+                "path": output_path,
+                "format": output_format,
+                "fileSize": output_size,
+            }),
+        );
+    }
     progress.emit_done("字幕下载完成");
     Ok(updated_task)
 }
@@ -760,6 +921,13 @@ pub(crate) fn download_home_video_task_video_internal(
 
     progress.emit_active(2, "准备下载视频");
     let log_session = ytdlp::start_log_session(&app, "home_video_download");
+    if let Some(log_session) = log_session.as_ref() {
+        log_session.info(
+            "video_download_start",
+            "开始下载首页任务视频",
+            json!({ "taskId": &task.id, "url": &task.url }),
+        );
+    }
     let output = match download_video_file(
         &task,
         &ytdlp_config,
@@ -770,10 +938,21 @@ pub(crate) fn download_home_video_task_video_internal(
         Ok(output) => output,
         Err(error) => {
             persist_interrupted_video_download_state(&store, &task.id, &progress, &error);
+            if let Some(log_session) = log_session.as_ref() {
+                log_session.warn(
+                    "video_download_failed",
+                    "首页任务视频下载失败",
+                    json!({ "taskId": &task.id, "error": &error }),
+                );
+            }
             progress.emit_failed(&error);
             return Err(error);
         }
     };
+    let output_path = output.path.to_string_lossy().to_string();
+    let output_file_name = output.file_name.clone();
+    let output_format = output.format.clone();
+    let output_size = output.file_size;
     let now = Utc::now().to_rfc3339();
     let updated_task = match store.with_connection(|connection| {
         delete_home_video_download_state(connection, &task.id)?;
@@ -782,10 +961,30 @@ pub(crate) fn download_home_video_task_video_internal(
     }) {
         Ok(task) => task,
         Err(error) => {
+            if let Some(log_session) = log_session.as_ref() {
+                log_session.error(
+                    "video_download_save_failed",
+                    "保存首页任务视频下载结果失败",
+                    json!({ "taskId": &task.id, "error": &error }),
+                );
+            }
             progress.emit_failed(&error);
             return Err(error);
         }
     };
+    if let Some(log_session) = log_session.as_ref() {
+        log_session.info(
+            "video_download_success",
+            "首页任务视频下载完成",
+            json!({
+                "taskId": &task.id,
+                "path": output_path,
+                "fileName": output_file_name,
+                "format": output_format,
+                "fileSize": output_size,
+            }),
+        );
+    }
     progress.emit_done("视频下载完成");
     Ok(updated_task)
 }
@@ -1647,7 +1846,6 @@ fn run_ytdlp_download_command(
     Ok(())
 }
 
-
 fn format_strategy_label(strategy: &YoutubeVideoFormatStrategy) -> &'static str {
     match strategy.label {
         "preferred_mp4" => "优先 MP4",
@@ -2110,7 +2308,6 @@ fn normalize_downloaded_video_file(
     Ok(path.to_path_buf())
 }
 
-
 #[derive(Debug, Clone)]
 struct PartialVideoFiles {
     downloaded_bytes: u64,
@@ -2347,7 +2544,6 @@ fn is_video_output_path(path: &Path) -> bool {
         .to_ascii_lowercase();
     matches!(extension.as_str(), "mp4" | "mkv" | "webm" | "mov" | "m4v")
 }
-
 
 fn home_video_prefix(task_id: &str) -> String {
     format!("{}.video", sanitize_file_segment(task_id))

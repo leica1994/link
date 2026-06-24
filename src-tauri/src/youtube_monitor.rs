@@ -10,7 +10,7 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-use crate::app_log::LogSession;
+use crate::app_log::{AppLogger, LogSession};
 use crate::settings::SettingsStore;
 use crate::ytdlp::{self, YoutubeClientStrategy, YtdlpStatus};
 
@@ -196,38 +196,71 @@ pub fn list_youtube_channels(
 #[tauri::command]
 pub fn add_youtube_channel(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: AddYoutubeChannelRequest,
 ) -> Result<YoutubeChannel, String> {
     let normalized_url = normalize_youtube_channel_url(&request.url)?;
     let probe = channel_probe_from_url(&normalized_url);
-    insert_youtube_channel(&store, probe)
+    app_logger.info(
+        "youtube_monitor",
+        "channel_add_start",
+        "开始添加监控博主",
+        json!({ "url": &normalized_url }),
+    );
+    match insert_youtube_channel(&store, probe) {
+        Ok(channel) => {
+            app_logger.info(
+                "youtube_monitor",
+                "channel_add_success",
+                "监控博主已添加",
+                json!({ "channelId": &channel.id, "url": &channel.url }),
+            );
+            Ok(channel)
+        }
+        Err(error) => {
+            app_logger.error(
+                "youtube_monitor",
+                "channel_add_failed",
+                "添加监控博主失败",
+                json!({ "url": &normalized_url, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
 pub fn delete_youtube_channel(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: YoutubeChannelRequest,
 ) -> Result<(), String> {
-    store.with_connection(|connection| {
+    app_logger.info(
+        "youtube_monitor",
+        "channel_delete_start",
+        "开始删除监控博主",
+        json!({ "channelId": &request.channel_id }),
+    );
+    let result = store.with_connection(|connection| {
         let transaction = connection
             .unchecked_transaction()
             .map_err(|error| format!("无法删除监控博主: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM youtube_videos WHERE channel_id = ?1",
-                params![request.channel_id],
+                params![&request.channel_id],
             )
             .map_err(|error| format!("无法删除监控视频: {error}"))?;
         transaction
             .execute(
                 "DELETE FROM youtube_refresh_runs WHERE channel_id = ?1",
-                params![request.channel_id],
+                params![&request.channel_id],
             )
             .map_err(|error| format!("无法删除检查记录: {error}"))?;
         let changed = transaction
             .execute(
                 "DELETE FROM youtube_channels WHERE id = ?1",
-                params![request.channel_id],
+                params![&request.channel_id],
             )
             .map_err(|error| format!("无法删除监控博主: {error}"))?;
         transaction
@@ -239,7 +272,28 @@ pub fn delete_youtube_channel(
         }
 
         Ok(())
-    })
+    });
+
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "youtube_monitor",
+                "channel_delete_success",
+                "监控博主已删除",
+                json!({ "channelId": &request.channel_id }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "youtube_monitor",
+                "channel_delete_failed",
+                "删除监控博主失败",
+                json!({ "channelId": &request.channel_id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -284,10 +338,17 @@ pub fn list_youtube_videos(
 #[tauri::command]
 pub fn mark_youtube_channel_seen(
     store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     request: YoutubeChannelRequest,
 ) -> Result<YoutubeChannel, String> {
     let now = Utc::now().to_rfc3339();
-    store.with_connection(|connection| {
+    app_logger.info(
+        "youtube_monitor",
+        "channel_mark_seen_start",
+        "开始标记监控博主视频为已读",
+        json!({ "channelId": &request.channel_id }),
+    );
+    let result = store.with_connection(|connection| {
         connection
             .execute(
                 "
@@ -295,12 +356,33 @@ pub fn mark_youtube_channel_seen(
                 SET is_unread = 0
                 WHERE channel_id = ?1
                 ",
-                params![request.channel_id],
+                params![&request.channel_id],
             )
             .map_err(|error| format!("无法标记视频已读: {error}"))?;
         update_channel_counts(connection, &request.channel_id, &now)?;
         read_youtube_channel_by_id(connection, &request.channel_id)
-    })
+    });
+
+    match result {
+        Ok(channel) => {
+            app_logger.info(
+                "youtube_monitor",
+                "channel_mark_seen_success",
+                "监控博主视频已标记为已读",
+                json!({ "channelId": &channel.id, "unreadCount": channel.unread_count }),
+            );
+            Ok(channel)
+        }
+        Err(error) => {
+            app_logger.error(
+                "youtube_monitor",
+                "channel_mark_seen_failed",
+                "标记监控博主视频已读失败",
+                json!({ "channelId": &request.channel_id, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -312,9 +394,8 @@ pub fn refresh_youtube_channel(
 ) -> Result<YoutubeRefreshRun, String> {
     let channel_id = request.channel_id.clone();
     let guard = service.acquire_channel(&channel_id)?;
-    let channel = store.with_connection(|connection| {
-        read_youtube_channel_by_id(connection, &channel_id)
-    })?;
+    let channel =
+        store.with_connection(|connection| read_youtube_channel_by_id(connection, &channel_id))?;
     let settings = store.load()?;
     let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let run = create_refresh_run(&store, &channel.id)?;
@@ -338,7 +419,20 @@ pub fn refresh_youtube_channel(
         );
 
         if let Err(error) = result {
-            if let Ok(failed_run) = fail_refresh_run(&store, &background_channel_id, &background_run_id, &error) {
+            if let Some(log_session) = log_session.as_ref() {
+                log_session.error(
+                    "youtube_monitor_refresh_failed",
+                    "监控博主刷新失败",
+                    json!({
+                        "channelId": &background_channel_id,
+                        "runId": &background_run_id,
+                        "error": ytdlp::compact_error(&error),
+                    }),
+                );
+            }
+            if let Ok(failed_run) =
+                fail_refresh_run(&store, &background_channel_id, &background_run_id, &error)
+            {
                 emit_refresh(&background_app, &failed_run);
             }
         }
@@ -358,6 +452,17 @@ fn run_ytdlp_refresh(
     config: &ytdlp::YtdlpConfig,
     log_session: Option<&LogSession>,
 ) -> Result<YoutubeRefreshRun, String> {
+    if let Some(log_session) = log_session {
+        log_session.info(
+            "youtube_monitor_refresh_start",
+            "开始刷新监控博主",
+            json!({
+                "channelId": &channel.id,
+                "runId": &run.id,
+                "url": &channel.url,
+            }),
+        );
+    }
     let latest_known_video_id = store.with_connection(|connection| {
         read_latest_youtube_video_external_id(connection, &channel.id)
     })?;
@@ -440,6 +545,20 @@ fn run_ytdlp_refresh(
         Ok(())
     })?;
     emit_refresh(app, &run);
+
+    if let Some(log_session) = log_session {
+        log_session.info(
+            "youtube_monitor_refresh_success",
+            "监控博主刷新完成",
+            json!({
+                "channelId": &channel.id,
+                "runId": &run.id,
+                "processedCount": run.processed_count,
+                "insertedCount": run.inserted_count,
+                "updatedCount": run.updated_count,
+            }),
+        );
+    }
 
     Ok(run)
 }
@@ -548,7 +667,10 @@ fn is_ytdlp_error_line(line: &str) -> bool {
         || lower.contains("unable to extract")
 }
 
-fn create_refresh_run(store: &SettingsStore, channel_id: &str) -> Result<YoutubeRefreshRun, String> {
+fn create_refresh_run(
+    store: &SettingsStore,
+    channel_id: &str,
+) -> Result<YoutubeRefreshRun, String> {
     let run = YoutubeRefreshRun {
         id: Uuid::new_v4().to_string(),
         channel_id: channel_id.to_string(),
@@ -564,7 +686,14 @@ fn create_refresh_run(store: &SettingsStore, channel_id: &str) -> Result<Youtube
 
     store.with_connection(|connection| {
         insert_refresh_run(connection, &run)?;
-        update_channel_after_refresh(connection, channel_id, CHANNEL_STATUS_CHECKING, "", None, None)
+        update_channel_after_refresh(
+            connection,
+            channel_id,
+            CHANNEL_STATUS_CHECKING,
+            "",
+            None,
+            None,
+        )
     })?;
 
     Ok(run)
@@ -653,7 +782,15 @@ fn update_channel_metadata_from_value(
                     updated_at = ?7
                 WHERE id = ?1
                 ",
-                params![channel_id, canonical_url, external_id, title, handle, thumbnail_url, now],
+                params![
+                    channel_id,
+                    canonical_url,
+                    external_id,
+                    title,
+                    handle,
+                    thumbnail_url,
+                    now
+                ],
             )
             .map(|_| ())
             .map_err(|error| format!("无法更新博主信息: {error}"))
@@ -667,7 +804,8 @@ fn insert_youtube_channel(
     let now = Utc::now().to_rfc3339();
     let id = Uuid::new_v4().to_string();
     store.with_connection(|connection| {
-        if let Some(existing) = read_channel_duplicate(connection, &probe.url, &probe.external_id)? {
+        if let Some(existing) = read_channel_duplicate(connection, &probe.url, &probe.external_id)?
+        {
             return Ok(existing);
         }
 
@@ -1253,7 +1391,12 @@ fn update_channel_counts(
                 updated_at = ?3
             WHERE id = ?4
             ",
-            params![video_count as i64, unread_count as i64, updated_at, channel_id],
+            params![
+                video_count as i64,
+                unread_count as i64,
+                updated_at,
+                channel_id
+            ],
         )
         .map(|_| ())
         .map_err(|error| format!("无法更新监控博主统计: {error}"))
@@ -1371,7 +1514,12 @@ fn thumbnail_from_list(value: &Value) -> Option<String> {
     value
         .get("thumbnails")
         .and_then(Value::as_array)
-        .and_then(|items| items.iter().rev().find_map(|item| string_field(item, "url")))
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find_map(|item| string_field(item, "url"))
+        })
 }
 
 fn first_non_empty(values: &[String]) -> String {

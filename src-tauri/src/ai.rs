@@ -1,3 +1,4 @@
+use crate::app_log::AppLogger;
 use crate::settings::{AppSettings, LlmConfig};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::Serialize;
@@ -16,6 +17,7 @@ const DEFAULT_AI_REQUEST_ATTEMPTS: usize = 3;
 const RATE_LIMIT_BACKOFF_MIN_SECONDS: u64 = 15;
 const RATE_LIMIT_BACKOFF_MAX_SECONDS: u64 = 90;
 const RAW_RESPONSE_LOG_CHARS: usize = 8_000;
+const LOG_ERROR_CHARS: usize = 600;
 const DEFAULT_AI_CONNECT_TIMEOUT_SECONDS: u64 = 60;
 const CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const TEST_SYSTEM_PROMPT: &str = "你是一个连接测试助手。";
@@ -63,10 +65,11 @@ pub struct AiService {
     limiter: Arc<AiConcurrencyLimiter>,
     connection_check_timeout: Duration,
     rate_limit_cooldown_until: Arc<Mutex<Option<Instant>>>,
+    logger: AppLogger,
 }
 
 impl AiService {
-    pub fn new(thread_count: u32) -> Result<Self, String> {
+    pub fn new(thread_count: u32, logger: AppLogger) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(DEFAULT_AI_CONNECT_TIMEOUT_SECONDS))
             .build()
@@ -77,11 +80,19 @@ impl AiService {
             limiter: Arc::new(AiConcurrencyLimiter::new(thread_count)),
             connection_check_timeout: Duration::from_secs(CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS),
             rate_limit_cooldown_until: Arc::new(Mutex::new(None)),
+            logger,
         })
     }
 
     pub fn update_thread_count(&self, thread_count: u32) -> Result<(), String> {
-        self.limiter.update_limit(thread_count)
+        self.limiter.update_limit(thread_count)?;
+        self.logger.info(
+            "ai",
+            "concurrency_limit_updated",
+            "AI 并发限制已更新",
+            json!({ "threadCount": normalize_thread_count(thread_count) }),
+        );
+        Ok(())
     }
 
     pub async fn check_llm_connection(
@@ -89,7 +100,20 @@ impl AiService {
         settings: &AppSettings,
     ) -> Result<LlmConnectionCheckResult, String> {
         let started_at = Instant::now();
-        let response = tokio::time::timeout(
+        let selected = selected_llm_config(settings);
+        if let Ok((service, config)) = selected {
+            self.logger.info(
+                "ai",
+                "connection_check_start",
+                "LLM 连接检查开始",
+                json!({
+                    "service": service,
+                    "model": config.model.trim(),
+                }),
+            );
+        }
+
+        let response_result = tokio::time::timeout(
             self.connection_check_timeout,
             self.chat_for_connection_check(
                 settings,
@@ -104,9 +128,41 @@ impl AiService {
                 "LLM 连接检查超时（{} 秒）",
                 self.connection_check_timeout.as_secs()
             )
-        })??;
+        })
+        .and_then(|result| result);
+
         let latency_ms = started_at.elapsed().as_millis();
         let (service, config) = selected_llm_config(settings)?;
+
+        let response = match response_result {
+            Ok(response) => {
+                self.logger.info(
+                    "ai",
+                    "connection_check_success",
+                    "LLM 连接检查成功",
+                    json!({
+                        "service": service,
+                        "model": config.model.trim(),
+                        "latencyMs": latency_ms,
+                    }),
+                );
+                response
+            }
+            Err(error) => {
+                self.logger.error(
+                    "ai",
+                    "connection_check_failed",
+                    "LLM 连接检查失败",
+                    json!({
+                        "service": service,
+                        "model": config.model.trim(),
+                        "latencyMs": latency_ms,
+                        "error": compact_log_error(&error),
+                    }),
+                );
+                return Err(error);
+            }
+        };
 
         Ok(LlmConnectionCheckResult {
             service: service.to_string(),
@@ -198,12 +254,50 @@ impl AiService {
         request: &AiChatRequest,
         request_timeout: Option<Duration>,
     ) -> Result<String, String> {
-        validate_llm_config(config)?;
+        if let Err(error) = validate_llm_config(config) {
+            self.logger.warn(
+                "ai",
+                "request_config_invalid",
+                "LLM 请求配置无效",
+                json!({
+                    "service": service,
+                    "model": config.model.trim(),
+                    "error": &error,
+                }),
+            );
+            return Err(error);
+        }
 
         let mut last_error = String::new();
+        let request_started_at = Instant::now();
+        self.logger.info(
+            "ai",
+            "request_start",
+            "LLM 请求开始",
+            json!({
+                "service": service,
+                "model": config.model.trim(),
+                "streaming": is_streaming_enabled(config, request),
+                "jsonResponse": request.json_response,
+                "maxOutputTokens": request.max_output_tokens,
+                "timeoutSeconds": request_timeout.map(|timeout| timeout.as_secs()),
+            }),
+        );
 
         for attempt in 1..=DEFAULT_AI_REQUEST_ATTEMPTS {
             self.wait_for_rate_limit_cooldown().await?;
+            let attempt_started_at = Instant::now();
+            self.logger.info(
+                "ai",
+                "request_attempt_start",
+                "LLM 请求尝试开始",
+                json!({
+                    "service": service,
+                    "model": config.model.trim(),
+                    "attempt": attempt,
+                    "maxAttempts": DEFAULT_AI_REQUEST_ATTEMPTS,
+                }),
+            );
 
             let result = {
                 let _permit = self.limiter.clone().acquire().await?;
@@ -225,17 +319,71 @@ impl AiService {
             };
 
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    self.logger.info(
+                        "ai",
+                        "request_success",
+                        "LLM 请求成功",
+                        json!({
+                            "service": service,
+                            "model": config.model.trim(),
+                            "attempt": attempt,
+                            "attemptLatencyMs": attempt_started_at.elapsed().as_millis(),
+                            "totalLatencyMs": request_started_at.elapsed().as_millis(),
+                        }),
+                    );
+                    return Ok(response);
+                }
                 Err(error) => {
                     last_error = error;
                     if attempt < DEFAULT_AI_REQUEST_ATTEMPTS {
                         let delay = retry_delay(attempt, &last_error);
                         if is_rate_limit_error(&last_error) {
                             self.extend_rate_limit_cooldown(delay)?;
+                            self.logger.warn(
+                                "ai",
+                                "rate_limit_cooldown_set",
+                                "检测到 LLM 限流，已设置冷却等待",
+                                json!({
+                                    "service": service,
+                                    "model": config.model.trim(),
+                                    "attempt": attempt,
+                                    "delayMs": delay.as_millis(),
+                                    "error": compact_log_error(&last_error),
+                                }),
+                            );
                         }
+                        self.logger.warn(
+                            "ai",
+                            "request_attempt_failed",
+                            "LLM 请求尝试失败，准备重试",
+                            json!({
+                                "service": service,
+                                "model": config.model.trim(),
+                                "attempt": attempt,
+                                "nextAttempt": attempt + 1,
+                                "delayMs": delay.as_millis(),
+                                "attemptLatencyMs": attempt_started_at.elapsed().as_millis(),
+                                "error": compact_log_error(&last_error),
+                            }),
+                        );
                         sleep(delay).await;
                         continue;
                     }
+                    self.logger.error(
+                        "ai",
+                        "request_failed",
+                        "LLM 请求最终失败",
+                        json!({
+                            "service": service,
+                            "model": config.model.trim(),
+                            "attempt": attempt,
+                            "maxAttempts": DEFAULT_AI_REQUEST_ATTEMPTS,
+                            "attemptLatencyMs": attempt_started_at.elapsed().as_millis(),
+                            "totalLatencyMs": request_started_at.elapsed().as_millis(),
+                            "error": compact_log_error(&last_error),
+                        }),
+                    );
                 }
             }
         }
@@ -263,6 +411,12 @@ impl AiService {
                 return Ok(());
             }
 
+            self.logger.info(
+                "ai",
+                "rate_limit_cooldown_wait",
+                "AI 限流冷却等待中",
+                json!({ "delayMs": delay.as_millis() }),
+            );
             sleep(delay).await;
         }
     }
@@ -991,6 +1145,10 @@ fn parse_sse_json_values(body: &str) -> Vec<Value> {
 
 fn summarize_response_text(text: &str) -> String {
     truncate_text(text.trim(), 80)
+}
+
+fn compact_log_error(error: &str) -> String {
+    truncate_text(error, LOG_ERROR_CHARS)
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {

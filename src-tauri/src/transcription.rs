@@ -1093,7 +1093,41 @@ pub(crate) async fn run_transcription_workflow_with_transform(
 }
 
 #[tauri::command]
-pub fn save_transcription_file(path: String, content: String) -> Result<(), String> {
+pub fn save_transcription_file(
+    app_logger: tauri::State<'_, AppLogger>,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    app_logger.info(
+        "transcription",
+        "file_save_start",
+        "开始保存转录字幕文件",
+        json!({ "path": &path, "contentBytes": content.len() }),
+    );
+    let result = write_text_file(&path, content);
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "transcription",
+                "file_save_success",
+                "转录字幕文件已保存",
+                json!({ "path": &path }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "transcription",
+                "file_save_failed",
+                "保存转录字幕文件失败",
+                json!({ "path": &path, "error": &error }),
+            );
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn write_text_file(path: &str, content: String) -> Result<(), String> {
     let output_path = PathBuf::from(path);
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建字幕目录: {error}"))?;
@@ -1103,9 +1137,40 @@ pub fn save_transcription_file(path: String, content: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub fn cleanup_transcription_temp_cache() -> Result<CleanupResult, String> {
-    let temp_dir = app_paths::existing_temp_dir()?;
-    cleanup_directory_contents(&temp_dir)
+pub fn cleanup_transcription_temp_cache(
+    app_logger: tauri::State<'_, AppLogger>,
+) -> Result<CleanupResult, String> {
+    app_logger.info(
+        "transcription",
+        "temp_cache_cleanup_start",
+        "开始清理转录临时缓存",
+        json!({}),
+    );
+    let result =
+        app_paths::existing_temp_dir().and_then(|temp_dir| cleanup_directory_contents(&temp_dir));
+    match result {
+        Ok(result) => {
+            app_logger.info(
+                "transcription",
+                "temp_cache_cleanup_success",
+                "转录临时缓存清理完成",
+                json!({
+                    "deletedFiles": result.deleted_files,
+                    "deletedDirs": result.deleted_dirs,
+                }),
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            app_logger.error(
+                "transcription",
+                "temp_cache_cleanup_failed",
+                "清理转录临时缓存失败",
+                json!({ "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn cleanup_directory_contents(dir: &Path) -> Result<CleanupResult, String> {
@@ -1149,19 +1214,57 @@ fn cleanup_directory_contents(dir: &Path) -> Result<CleanupResult, String> {
 #[tauri::command]
 pub fn save_subtitle_segments_file(
     settings_store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     path: String,
     output_format: String,
     segments: Vec<TranscriptionSegment>,
 ) -> Result<(), String> {
+    app_logger.info(
+        "transcription",
+        "segments_file_save_start",
+        "开始导出字幕片段文件",
+        json!({
+            "path": &path,
+            "outputFormat": &output_format,
+            "segmentCount": segments.len(),
+        }),
+    );
     if segments.is_empty() {
-        return Err("没有可导出的字幕内容".to_string());
+        let error = "没有可导出的字幕内容".to_string();
+        app_logger.warn(
+            "transcription",
+            "segments_file_save_empty",
+            "没有可导出的字幕内容",
+            json!({ "path": &path }),
+        );
+        return Err(error);
     }
 
     let settings = settings_store.load()?;
     let output_format = normalize_subtitle_format(&output_format);
     let subtitle_text =
         serialize_segments_for_export(&segments, output_format, Some(&settings_store), &settings)?;
-    save_transcription_file(path, subtitle_text)
+    let result = write_text_file(&path, subtitle_text);
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "transcription",
+                "segments_file_save_success",
+                "字幕片段文件已导出",
+                json!({ "path": &path, "segmentCount": segments.len() }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "transcription",
+                "segments_file_save_failed",
+                "导出字幕片段文件失败",
+                json!({ "path": &path, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn serialize_segments_for_export(

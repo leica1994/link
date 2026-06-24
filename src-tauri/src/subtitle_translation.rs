@@ -5,8 +5,8 @@ use crate::subtitle_ai::SubtitleProcessingResult;
 use crate::subtitle_export::serialize_styled_bilingual_ass;
 use crate::subtitle_style::get_selected_subtitle_style;
 use crate::transcription::{
-    normalize_subtitle_format, save_transcription_file, serialize_segments_for_export,
-    SubtitleFormat, TranscriptionSegment,
+    normalize_subtitle_format, serialize_segments_for_export, write_text_file, SubtitleFormat,
+    TranscriptionSegment,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -163,8 +163,8 @@ struct TranslationChunkResult {
 
 #[derive(Debug, Clone)]
 enum TranslationChunkError {
-    NetworkError(String),      // 网络/API错误，不重试翻译
-    ValidationError(String),   // 校验失败，可以重试翻译
+    NetworkError(String),    // 网络/API错误，不重试翻译
+    ValidationError(String), // 校验失败，可以重试翻译
 }
 
 #[derive(Debug)]
@@ -449,7 +449,12 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
         &settings,
     )?;
 
-    emitter.emit("翻译与AI审核完成", &source_segments, &translated_segments, &warnings);
+    emitter.emit(
+        "翻译与AI审核完成",
+        &source_segments,
+        &translated_segments,
+        &warnings,
+    );
     log_session.info(
         "subtitle_translation_completed",
         "字幕翻译与AI审核流程完成",
@@ -480,14 +485,34 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
 #[tauri::command]
 pub fn save_subtitle_translation_file(
     settings_store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
     path: String,
     output_format: String,
     output_mode: String,
     source_segments: Vec<TranscriptionSegment>,
     translated_segments: Vec<TranscriptionSegment>,
 ) -> Result<(), String> {
+    app_logger.info(
+        "subtitle_translation",
+        "file_save_start",
+        "开始导出字幕翻译文件",
+        json!({
+            "path": &path,
+            "outputFormat": &output_format,
+            "outputMode": &output_mode,
+            "sourceSegmentCount": source_segments.len(),
+            "translatedSegmentCount": translated_segments.len(),
+        }),
+    );
     if source_segments.is_empty() || translated_segments.is_empty() {
-        return Err("没有可导出的字幕内容".to_string());
+        let error = "没有可导出的字幕内容".to_string();
+        app_logger.warn(
+            "subtitle_translation",
+            "file_save_empty",
+            "没有可导出的字幕翻译内容",
+            json!({ "path": &path }),
+        );
+        return Err(error);
     }
 
     let settings = settings_store.load()?;
@@ -500,7 +525,27 @@ pub fn save_subtitle_translation_file(
         Some(&settings_store),
         &settings,
     )?;
-    save_transcription_file(path, subtitle_text)
+    let result = write_text_file(&path, subtitle_text);
+    match result {
+        Ok(()) => {
+            app_logger.info(
+                "subtitle_translation",
+                "file_save_success",
+                "字幕翻译文件已导出",
+                json!({ "path": &path }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            app_logger.error(
+                "subtitle_translation",
+                "file_save_failed",
+                "导出字幕翻译文件失败",
+                json!({ "path": &path, "error": &error }),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn serialize_translation_for_export(
@@ -730,7 +775,10 @@ where
                         format!("网络/API错误: {}", msg)
                     }
                     TranslationChunkError::ValidationError(ref msg) => {
-                        format!("校验失败（已重试{}次翻译）: {}", MAX_TRANSLATION_ATTEMPTS, msg)
+                        format!(
+                            "校验失败（已重试{}次翻译）: {}",
+                            MAX_TRANSLATION_ATTEMPTS, msg
+                        )
                     }
                 };
 
@@ -897,13 +945,7 @@ where
         source_segments: source_segments.clone(),
         translated_segments: translated_segments.clone(),
     };
-    report(
-        0,
-        "AI 字幕审核中",
-        "active",
-        &snapshot,
-        &warnings,
-    );
+    report(0, "AI 字幕审核中", "active", &snapshot, &warnings);
 
     let mut completed = 0usize;
     while let Some(result) = futures.next().await {
@@ -1093,7 +1135,10 @@ async fn translate_chunk_by_llm(
                         if translation_attempt < MAX_TRANSLATION_ATTEMPTS {
                             log_session.warn(
                                 "subtitle_translation_retry_translation",
-                                &format!("字幕翻译第{}次尝试校验失败，准备重新翻译", translation_attempt),
+                                &format!(
+                                    "字幕翻译第{}次尝试校验失败，准备重新翻译",
+                                    translation_attempt
+                                ),
                                 json!({
                                     "translationAttempt": translation_attempt,
                                     "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
@@ -1257,9 +1302,10 @@ async fn try_translate_with_validation(
     }
 
     // 所有校验重试都失败
-    Err(TranslationChunkError::ValidationError(
-        format!("LLM 翻译结果{}次校验失败", MAX_VALIDATION_ATTEMPTS),
-    ))
+    Err(TranslationChunkError::ValidationError(format!(
+        "LLM 翻译结果{}次校验失败",
+        MAX_VALIDATION_ATTEMPTS
+    )))
 }
 
 async fn review_translation_chunk_by_llm(
@@ -1280,7 +1326,8 @@ async fn review_translation_chunk_by_llm(
     let mut feedback = String::new();
 
     for attempt in 1..=MAX_AI_SUBTITLE_REVIEW_ATTEMPTS {
-        let user_prompt = build_translation_review_user_prompt(&source_entries, &chunk.entries, &feedback);
+        let user_prompt =
+            build_translation_review_user_prompt(&source_entries, &chunk.entries, &feedback);
         let response = match ai_service
             .chat_for_json_output(
                 settings,
@@ -1309,7 +1356,8 @@ async fn review_translation_chunk_by_llm(
         let parsed = match parse_translation_review_response(&response) {
             Ok(parsed) => parsed,
             Err(error) => {
-                feedback = build_translation_review_json_feedback(&source_entries, &chunk.entries, &error);
+                feedback =
+                    build_translation_review_json_feedback(&source_entries, &chunk.entries, &error);
                 log_translation_review_validation_failure(
                     &log_session,
                     attempt,
@@ -1346,7 +1394,8 @@ async fn review_translation_chunk_by_llm(
                 });
             }
             Err(error) => {
-                feedback = build_translation_review_key_feedback(&source_entries, &chunk.entries, &error);
+                feedback =
+                    build_translation_review_key_feedback(&source_entries, &chunk.entries, &error);
                 log_translation_review_validation_failure(
                     &log_session,
                     attempt,
@@ -2356,7 +2405,9 @@ fn parse_translation_review_value(
         return Ok(result);
     }
 
-    for field in ["reviewed", "reviews", "results", "result", "items", "data", "output"] {
+    for field in [
+        "reviewed", "reviews", "results", "result", "items", "data", "output",
+    ] {
         let Some(nested) = object.get(field) else {
             continue;
         };
@@ -2509,7 +2560,13 @@ fn parse_reviewed_translation_entry(value: &Value) -> Result<ReviewedTranslation
         .or_else(|| object.get("status"))
         .and_then(Value::as_str)
         .map(normalize_review_action)
-        .unwrap_or_else(|| if text.trim().is_empty() { "remove".to_string() } else { "revise".to_string() });
+        .unwrap_or_else(|| {
+            if text.trim().is_empty() {
+                "remove".to_string()
+            } else {
+                "revise".to_string()
+            }
+        });
 
     if !matches!(action.as_str(), "keep" | "revise" | "remove") {
         return Err("包含不支持的 action".to_string());

@@ -1,5 +1,5 @@
 use crate::ai::AiService;
-use crate::app_log::AppLogger;
+use crate::app_log::{AppLogger, LogSession};
 use crate::app_paths;
 use crate::content_copy::{generate_content_copy_record, GenerateContentCopyRequest};
 use crate::dubbing::{
@@ -20,7 +20,7 @@ use crate::subtitle_translation::{
 };
 use crate::transcription::{
     run_transcription_workflow_with_sink, run_transcription_workflow_with_transform,
-    save_transcription_file, RawTranscriptionTransform, RawTranscriptionTransformResult,
+    write_text_file, RawTranscriptionTransform, RawTranscriptionTransformResult,
     TranscriptionProgress, TranscriptionProgressSink, TranscriptionRequest,
 };
 use chrono::Utc;
@@ -506,12 +506,23 @@ async fn run_home_workbench(
     let store = app.state::<SettingsStore>();
     let ai_service = app.state::<AiService>();
     let app_logger = app.state::<AppLogger>();
+    let log_session = app_logger.start_session("home_workbench")?;
     let mut settings = store.load()?;
     let mut options = normalize_options(request.options, &settings);
     apply_workbench_options_to_settings(&mut settings, &options);
     store.save(&settings)?;
     ai_service.update_thread_count(settings.translation_thread_count)?;
     let task_id = request.task_id;
+    log_session.info(
+        "workbench_start",
+        "开始执行首页工作台任务",
+        json!({
+            "taskId": &task_id,
+            "subtitleSource": &options.subtitle_source,
+            "translationEnabled": options.translation_enabled,
+            "dubbingEnabled": options.dubbing_enabled,
+        }),
+    );
     initialize_run(&store, &task_id, &options)?;
 
     let run_result = run_home_workbench_inner(
@@ -522,12 +533,29 @@ async fn run_home_workbench(
         &settings,
         &task_id,
         &mut options,
+        &log_session,
     )
     .await;
 
     match run_result {
-        Ok(snapshot) => Ok(snapshot),
+        Ok(snapshot) => {
+            log_session.info(
+                "workbench_completed",
+                "首页工作台任务完成",
+                json!({
+                    "taskId": &task_id,
+                    "status": &snapshot.status,
+                    "logPath": log_session.path_string(),
+                }),
+            );
+            Ok(snapshot)
+        }
         Err(error) => {
+            log_session.error(
+                "workbench_failed",
+                "首页工作台任务失败",
+                json!({ "taskId": &task_id, "error": &error }),
+            );
             let snapshot = mark_workbench_failed(&store, &task_id, &error)?;
             emit_workbench_progress(&app, &snapshot);
             Err(error)
@@ -543,8 +571,18 @@ async fn run_home_workbench_inner(
     settings: &AppSettings,
     task_id: &str,
     options: &mut HomeWorkbenchOptions,
+    log_session: &LogSession,
 ) -> Result<HomeWorkbenchSnapshot, String> {
     let video = ensure_workbench_video(app.clone(), store, task_id)?;
+    log_session.info(
+        "video_ready",
+        "工作台视频文件已就绪",
+        json!({
+            "taskId": task_id,
+            "videoPath": &video.file_path,
+            "fileSize": video.file_size,
+        }),
+    );
 
     set_stage_active(
         store,
@@ -565,6 +603,11 @@ async fn run_home_workbench_inner(
         &video,
     )
     .await?;
+    log_session.info(
+        "subtitle_ready",
+        "工作台字幕文件已就绪",
+        json!({ "taskId": task_id, "subtitlePath": subtitle_path.to_string_lossy() }),
+    );
     set_stage_done(
         store,
         &app,
@@ -574,6 +617,11 @@ async fn run_home_workbench_inner(
     )?;
 
     let final_subtitle_path = if options.translation_enabled {
+        log_session.info(
+            "translation_start",
+            "工作台开始翻译字幕",
+            json!({ "taskId": task_id, "subtitlePath": subtitle_path.to_string_lossy() }),
+        );
         let translated = translate_subtitle(
             app.clone(),
             store,
@@ -586,13 +634,28 @@ async fn run_home_workbench_inner(
         )
         .await?;
         set_stage_done(store, &app, task_id, STAGE_TRANSLATION, "翻译完成")?;
+        log_session.info(
+            "translation_completed",
+            "工作台字幕翻译完成",
+            json!({ "taskId": task_id, "subtitlePath": translated.to_string_lossy() }),
+        );
         translated
     } else {
         set_stage_skipped(store, &app, task_id, STAGE_TRANSLATION, "已跳过翻译")?;
+        log_session.info(
+            "translation_skipped",
+            "工作台已跳过字幕翻译",
+            json!({ "taskId": task_id }),
+        );
         subtitle_path
     };
 
     let final_video_path = if options.dubbing_enabled {
+        log_session.info(
+            "dubbing_start",
+            "工作台开始配音",
+            json!({ "taskId": task_id }),
+        );
         let (dubbed_video, dubbed_subtitle) = run_dubbing(
             app.clone(),
             store,
@@ -611,12 +674,31 @@ async fn run_home_workbench_inner(
         )?;
         set_stage_done(store, &app, task_id, STAGE_DUBBING, "配音完成")?;
         let _ = final_subtitle_path;
+        log_session.info(
+            "dubbing_completed",
+            "工作台配音完成",
+            json!({
+                "taskId": task_id,
+                "videoPath": dubbed_video.to_string_lossy(),
+                "subtitlePath": dubbed_subtitle.to_string_lossy(),
+            }),
+        );
         (dubbed_video, dubbed_subtitle)
     } else {
         set_stage_skipped(store, &app, task_id, STAGE_DUBBING, "已跳过配音")?;
+        log_session.info(
+            "dubbing_skipped",
+            "工作台已跳过配音",
+            json!({ "taskId": task_id }),
+        );
         (PathBuf::from(&video.file_path), final_subtitle_path)
     };
 
+    log_session.info(
+        "content_copy_stage_start",
+        "工作台开始处理文案生成阶段",
+        json!({ "taskId": task_id }),
+    );
     generate_workbench_content_copy(
         app.clone(),
         store,
@@ -626,6 +708,11 @@ async fn run_home_workbench_inner(
         &final_video_path.1,
     )
     .await?;
+    log_session.info(
+        "content_copy_stage_completed",
+        "工作台文案生成阶段完成",
+        json!({ "taskId": task_id }),
+    );
 
     let exported = if let Some(exported) = reusable_exported_artifacts(store, task_id)? {
         update_stage_snapshot_from_app(
@@ -641,9 +728,23 @@ async fn run_home_workbench_inner(
                 "message": "复用已导出产物",
             }),
         )?;
+        log_session.info(
+            "export_reused",
+            "工作台复用已导出产物",
+            json!({
+                "taskId": task_id,
+                "videoPath": exported.video_path.to_string_lossy(),
+                "subtitlePath": exported.subtitle_path.to_string_lossy(),
+            }),
+        );
         exported
     } else {
         set_stage_active(store, &app, task_id, STAGE_EXPORT, "导出最终产物", 5)?;
+        log_session.info(
+            "export_start",
+            "工作台开始导出最终产物",
+            json!({ "taskId": task_id, "exportDir": &options.export_dir }),
+        );
         let exported = export_final_artifacts(
             store,
             task_id,
@@ -665,6 +766,15 @@ async fn run_home_workbench_inner(
             &exported.subtitle_path,
             json!({ "scope": "final", "exportDir": &options.export_dir }),
         )?;
+        log_session.info(
+            "export_completed",
+            "工作台最终产物导出完成",
+            json!({
+                "taskId": task_id,
+                "videoPath": exported.video_path.to_string_lossy(),
+                "subtitlePath": exported.subtitle_path.to_string_lossy(),
+            }),
+        );
         exported
     };
     set_stage_done_with_snapshot(
@@ -1038,10 +1148,8 @@ async fn prepare_aligned_downloaded_subtitle(
         "aligned-selected"
     };
     let output_path = workbench_file_path(task_id, stem, &result.output_format)?;
-    save_transcription_file(
-        output_path.to_string_lossy().to_string(),
-        result.subtitle_text.clone(),
-    )?;
+    let output_path_string = output_path.to_string_lossy().to_string();
+    write_text_file(&output_path_string, result.subtitle_text.clone())?;
     upsert_artifact_from_path(
         store,
         task_id,
@@ -1452,10 +1560,8 @@ fn save_workbench_subtitle(
     metadata: Value,
 ) -> Result<PathBuf, String> {
     let output_path = workbench_subtitle_path(store, task_id, suggested_path)?;
-    save_transcription_file(
-        output_path.to_string_lossy().to_string(),
-        content.to_string(),
-    )?;
+    let output_path_string = output_path.to_string_lossy().to_string();
+    write_text_file(&output_path_string, content.to_string())?;
     upsert_artifact_from_path(store, task_id, kind, &output_path, metadata)?;
     Ok(output_path)
 }
@@ -1466,10 +1572,8 @@ fn save_translation_result(
     result: &SubtitleTranslationResult,
 ) -> Result<PathBuf, String> {
     let path = workbench_file_path(task_id, "translated", &result.output_format)?;
-    save_transcription_file(
-        path.to_string_lossy().to_string(),
-        result.subtitle_text.clone(),
-    )?;
+    let path_string = path.to_string_lossy().to_string();
+    write_text_file(&path_string, result.subtitle_text.clone())?;
     upsert_artifact_from_path(
         store,
         task_id,
