@@ -24,6 +24,16 @@
         <button
           class="settings-action youtube-monitor-action"
           type="button"
+          :disabled="!canMarkAllChannelsSeen"
+          @click="markAllChannelsSeen"
+        >
+          <LoaderCircle v-if="isMarkingAllSeen" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+          <CheckCheck v-else :stroke-width="2.1" aria-hidden="true" />
+          <span>{{ isMarkingAllSeen ? '标记中' : '全部已读' }}</span>
+        </button>
+        <button
+          class="settings-action youtube-monitor-action"
+          type="button"
           :disabled="isPageRefreshing"
           @click="refreshPage"
         >
@@ -567,6 +577,7 @@ const unreadOnly = ref(false)
 const isLoadingChannels = ref(false)
 const isLoadingVideos = ref(false)
 const isPageRefreshing = ref(false)
+const isMarkingAllSeen = ref(false)
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
 const draftChannelUrl = ref('')
@@ -636,6 +647,13 @@ const totalUnreadCount = computed(() => channels.value.reduce((total, channel) =
 const totalVideoCount = computed(() => channels.value.reduce((total, channel) => total + channel.videoCount, 0))
 const checkingChannelCount = computed(() => {
   return channels.value.filter((channel) => channel.status === 'checking' || isChannelRefreshing(channel.id)).length
+})
+const canMarkAllChannelsSeen = computed(() => {
+  return isTauriRuntime() &&
+    totalUnreadCount.value > 0 &&
+    !isLoadingChannels.value &&
+    !isPageRefreshing.value &&
+    !isMarkingAllSeen.value
 })
 
 const toolStatusClass = computed(() => ({
@@ -903,6 +921,23 @@ const markChannelSeen = async () => {
     videos.value = videos.value.map((video) => ({ ...video, isUnread: false }))
   } catch (error) {
     videosError.value = stringifyError(error, '标记已读失败')
+  }
+}
+
+const markAllChannelsSeen = async () => {
+  if (!canMarkAllChannelsSeen.value) {
+    return
+  }
+
+  isMarkingAllSeen.value = true
+  channelError.value = ''
+
+  try {
+    channels.value = await invoke<YoutubeChannel[]>('mark_all_youtube_channels_seen')
+  } catch (error) {
+    channelError.value = stringifyError(error, '标记全部已读失败')
+  } finally {
+    isMarkingAllSeen.value = false
   }
 }
 

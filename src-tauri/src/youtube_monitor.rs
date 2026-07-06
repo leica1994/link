@@ -386,6 +386,83 @@ pub fn mark_youtube_channel_seen(
 }
 
 #[tauri::command]
+pub fn mark_all_youtube_channels_seen(
+    store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
+) -> Result<Vec<YoutubeChannel>, String> {
+    let now = Utc::now().to_rfc3339();
+    app_logger.info(
+        "youtube_monitor",
+        "all_channels_mark_seen_start",
+        "开始标记全部监控博主视频为已读",
+        json!({}),
+    );
+
+    let result = store.with_connection(|connection| {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| format!("无法开始标记全部已读: {error}"))?;
+        let updated_channels = transaction
+            .execute(
+                "
+                UPDATE youtube_channels
+                SET unread_count = 0,
+                    updated_at = ?1
+                WHERE unread_count != 0
+                   OR EXISTS (
+                       SELECT 1
+                       FROM youtube_videos
+                       WHERE youtube_videos.channel_id = youtube_channels.id
+                         AND youtube_videos.is_unread = 1
+                   )
+                ",
+                params![&now],
+            )
+            .map_err(|error| format!("无法更新监控博主未读统计: {error}"))?;
+        let marked_videos = transaction
+            .execute(
+                "
+                UPDATE youtube_videos
+                SET is_unread = 0
+                WHERE is_unread = 1
+                ",
+                [],
+            )
+            .map_err(|error| format!("无法标记全部视频已读: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交全部已读操作: {error}"))?;
+        let channels = read_youtube_channels(connection)?;
+
+        Ok((channels, updated_channels, marked_videos))
+    });
+
+    match result {
+        Ok((channels, updated_channels, marked_videos)) => {
+            app_logger.info(
+                "youtube_monitor",
+                "all_channels_mark_seen_success",
+                "全部监控博主视频已标记为已读",
+                json!({
+                    "channelCount": updated_channels,
+                    "videoCount": marked_videos,
+                }),
+            );
+            Ok(channels)
+        }
+        Err(error) => {
+            app_logger.error(
+                "youtube_monitor",
+                "all_channels_mark_seen_failed",
+                "标记全部监控博主视频已读失败",
+                json!({ "error": &error }),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
 pub fn refresh_youtube_channel(
     app: AppHandle,
     store: tauri::State<'_, SettingsStore>,
