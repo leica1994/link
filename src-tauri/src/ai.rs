@@ -19,6 +19,8 @@ const RATE_LIMIT_BACKOFF_MAX_SECONDS: u64 = 90;
 const RAW_RESPONSE_LOG_CHARS: usize = 8_000;
 const LOG_ERROR_CHARS: usize = 600;
 const DEFAULT_AI_CONNECT_TIMEOUT_SECONDS: u64 = 60;
+// Normal jobs can request large subtitle/content batches; this is a stuck-request guard.
+const DEFAULT_AI_REQUEST_TIMEOUT_SECONDS: u64 = 10 * 60;
 const CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const TEST_SYSTEM_PROMPT: &str = "你是一个连接测试助手。";
 const TEST_USER_PROMPT: &str = "请只回复 OK。";
@@ -63,6 +65,7 @@ struct AiPermit {
 pub struct AiService {
     client: reqwest::Client,
     limiter: Arc<AiConcurrencyLimiter>,
+    default_request_timeout: Duration,
     connection_check_timeout: Duration,
     rate_limit_cooldown_until: Arc<Mutex<Option<Instant>>>,
     logger: AppLogger,
@@ -78,6 +81,7 @@ impl AiService {
         Ok(Self {
             client,
             limiter: Arc::new(AiConcurrencyLimiter::new(thread_count)),
+            default_request_timeout: Duration::from_secs(DEFAULT_AI_REQUEST_TIMEOUT_SECONDS),
             connection_check_timeout: Duration::from_secs(CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS),
             rate_limit_cooldown_until: Arc::new(Mutex::new(None)),
             logger,
@@ -191,7 +195,13 @@ impl AiService {
             json_response: false,
         };
 
-        self.send_chat(service, config, &request, None).await
+        self.send_chat(
+            service,
+            config,
+            &request,
+            Some(self.default_request_timeout),
+        )
+        .await
     }
 
     pub async fn chat_for_json_output(
@@ -212,7 +222,13 @@ impl AiService {
             json_response: true,
         };
 
-        self.send_chat(service, config, &request, None).await
+        self.send_chat(
+            service,
+            config,
+            &request,
+            Some(self.default_request_timeout),
+        )
+        .await
     }
 
     pub(crate) fn validate_selected_llm_config(settings: &AppSettings) -> Result<(), String> {
