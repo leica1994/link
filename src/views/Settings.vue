@@ -560,6 +560,36 @@
             </div>
           </div>
 
+          <div class="setting-row">
+            <FileJson class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
+            <div class="setting-copy">
+              <div class="setting-title">设置备份</div>
+              <div class="setting-subtitle" :class="settingsBackupSubtitleClass">
+                {{ settingsBackupSubtitle }}
+              </div>
+            </div>
+            <div class="settings-action-group" aria-label="设置备份">
+              <button
+                class="settings-action"
+                type="button"
+                :disabled="isSettingsBackupBusy"
+                @click="exportSettingsBackup"
+              >
+                <Download :stroke-width="2.1" aria-hidden="true" />
+                {{ isExportingSettingsBackup ? '导出中' : '导出设置' }}
+              </button>
+              <button
+                class="settings-action"
+                type="button"
+                :disabled="isSettingsBackupBusy"
+                @click="importSettingsBackup"
+              >
+                <Upload :stroke-width="2.1" aria-hidden="true" />
+                {{ isImportingSettingsBackup ? '导入中' : '导入设置' }}
+              </button>
+            </div>
+          </div>
+
           <button class="setting-row setting-row-button" type="button">
             <CircleHelp class="setting-icon" :stroke-width="2.1" aria-hidden="true" />
             <span class="setting-copy">
@@ -861,7 +891,7 @@
 
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import {
@@ -871,8 +901,10 @@ import {
   Captions,
   ChevronRight,
   CircleHelp,
+  Download,
   Eye,
   EyeOff,
+  FileJson,
   FileMusic,
   Film,
   FolderOpen,
@@ -893,6 +925,7 @@ import {
   SlidersHorizontal,
   Sun,
   Timer,
+  Upload,
   Volume2,
   WandSparkles,
   Workflow,
@@ -1015,6 +1048,15 @@ type LlmConnectionCheckResult = {
 }
 
 type LlmConnectionStatus = 'idle' | 'success' | 'error'
+
+type SettingsBackupSummary = {
+  settingCount: number
+  channelCount: number
+  addedChannelCount: number
+  updatedChannelCount: number
+}
+
+type SettingsBackupStatus = 'idle' | 'success' | 'error'
 
 const languageDisplayNames = new Intl.DisplayNames(['zh-Hans'], { type: 'language' })
 
@@ -1488,6 +1530,10 @@ const homeWorkbenchDubbingEnabled = ref(false)
 const homeWorkbenchExportDir = ref('')
 const ytdlpProxy = ref('')
 const logDirectoryError = ref('')
+const isExportingSettingsBackup = ref(false)
+const isImportingSettingsBackup = ref(false)
+const settingsBackupStatus = ref<SettingsBackupStatus>('idle')
+const settingsBackupMessage = ref('')
 const isSettingsLoaded = ref(false)
 let isApplyingStoredSettings = false
 let saveSettingsTimer: ReturnType<typeof window.setTimeout> | undefined
@@ -1560,6 +1606,25 @@ const llmConnectionSubtitle = computed(() => {
 const llmConnectionSubtitleClass = computed(() => ({
   'setting-subtitle-success': llmConnectionStatus.value === 'success',
   'setting-subtitle-error': llmConnectionStatus.value === 'error',
+}))
+
+const isSettingsBackupBusy = computed(() => isExportingSettingsBackup.value || isImportingSettingsBackup.value)
+
+const settingsBackupSubtitle = computed(() => {
+  if (isExportingSettingsBackup.value) {
+    return '正在导出设置和监控博主'
+  }
+
+  if (isImportingSettingsBackup.value) {
+    return '正在导入设置并合并监控博主'
+  }
+
+  return settingsBackupMessage.value || '导出或导入配置 JSON，包含 API Key 和监控博主'
+})
+
+const settingsBackupSubtitleClass = computed(() => ({
+  'setting-subtitle-success': settingsBackupStatus.value === 'success',
+  'setting-subtitle-error': settingsBackupStatus.value === 'error',
 }))
 
 const reasoningEffortLabel = computed(() => {
@@ -1762,6 +1827,95 @@ const openLogDirectory = async () => {
   }
 }
 
+const exportSettingsBackup = async () => {
+  if (isSettingsBackupBusy.value) {
+    return
+  }
+
+  settingsBackupStatus.value = 'idle'
+  settingsBackupMessage.value = ''
+
+  if (!isTauriRuntime()) {
+    settingsBackupStatus.value = 'error'
+    settingsBackupMessage.value = '请在桌面应用中导出设置'
+    return
+  }
+
+  const selected = await save({
+    title: '导出设置备份',
+    defaultPath: `link-settings-${formatBackupTimestamp(new Date())}.json`,
+    filters: [
+      {
+        name: 'JSON 文件',
+        extensions: ['json'],
+      },
+    ],
+  })
+
+  if (typeof selected !== 'string') {
+    return
+  }
+
+  isExportingSettingsBackup.value = true
+
+  try {
+    await flushPendingSave()
+    const summary = await invoke<SettingsBackupSummary>('export_settings_backup', { path: selected })
+    settingsBackupStatus.value = 'success'
+    settingsBackupMessage.value = `已导出 ${summary.settingCount} 项设置，${summary.channelCount} 个博主`
+  } catch (error) {
+    settingsBackupStatus.value = 'error'
+    settingsBackupMessage.value = stringifyError(error, '导出设置失败')
+  } finally {
+    isExportingSettingsBackup.value = false
+  }
+}
+
+const importSettingsBackup = async () => {
+  if (isSettingsBackupBusy.value) {
+    return
+  }
+
+  settingsBackupStatus.value = 'idle'
+  settingsBackupMessage.value = ''
+
+  if (!isTauriRuntime()) {
+    settingsBackupStatus.value = 'error'
+    settingsBackupMessage.value = '请在桌面应用中导入设置'
+    return
+  }
+
+  const selected = await open({
+    title: '导入设置备份',
+    multiple: false,
+    filters: [
+      {
+        name: 'JSON 文件',
+        extensions: ['json'],
+      },
+    ],
+  })
+
+  if (typeof selected !== 'string') {
+    return
+  }
+
+  isImportingSettingsBackup.value = true
+
+  try {
+    await flushPendingSave()
+    const summary = await invoke<SettingsBackupSummary>('import_settings_backup', { path: selected })
+    await loadStoredSettings()
+    settingsBackupStatus.value = 'success'
+    settingsBackupMessage.value = `已导入 ${summary.settingCount} 项设置，新增 ${summary.addedChannelCount} 个博主，更新 ${summary.updatedChannelCount} 个博主`
+  } catch (error) {
+    settingsBackupStatus.value = 'error'
+    settingsBackupMessage.value = stringifyError(error, '导入设置失败')
+  } finally {
+    isImportingSettingsBackup.value = false
+  }
+}
+
 const loadStoredSettings = async () => {
   if (!isTauriRuntime()) {
     applySettings(normalizeSettings({}))
@@ -1954,6 +2108,19 @@ const selectTargetLanguage = (language: string) => {
 const fileNameFromPath = (path: string) => {
   const normalizedPath = path.replace(/\\/g, '/')
   return normalizedPath.split('/').filter(Boolean).pop() ?? path
+}
+
+const formatBackupTimestamp = (date: Date) => {
+  const pad = (value: number) => value.toString().padStart(2, '0')
+
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join('')
 }
 
 const handleKeydown = (event: KeyboardEvent) => {

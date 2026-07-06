@@ -41,7 +41,9 @@ use home_workbench::{
     remove_home_workbench_subtitle_input, remove_home_workbench_video_input,
     save_home_workbench_options, start_home_workbench,
 };
-use settings::{load_settings, save_settings, SettingsStore};
+use settings::{
+    export_settings_backup, import_settings_backup, load_settings, save_settings, SettingsStore,
+};
 use subtitle_burn::start_subtitle_burn;
 use subtitle_style::{
     create_subtitle_style, delete_subtitle_style, get_subtitle_style, list_subtitle_styles,
@@ -124,6 +126,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
+            export_settings_backup,
+            import_settings_backup,
             check_llm_connection,
             open_log_directory,
             generate_content_copy,

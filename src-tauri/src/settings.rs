@@ -1,8 +1,12 @@
-use rusqlite::{params, Connection};
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::AppHandle;
+use uuid::Uuid;
 
 use crate::ai::AiService;
 use crate::app_log::AppLogger;
@@ -10,6 +14,8 @@ use crate::app_paths;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
 const LLM_SERVICES: [&str; 3] = ["openai", "openai-responses", "anthropic"];
+const SETTINGS_BACKUP_SCHEMA_VERSION: u32 = 1;
+const YOUTUBE_CHANNEL_STATUS_IDLE: &str = "idle";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +60,51 @@ pub struct AppSettings {
     pub home_workbench_dubbing_enabled: bool,
     pub home_workbench_export_dir: String,
     pub ytdlp_proxy: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsBackup {
+    schema_version: u32,
+    exported_at: String,
+    settings: AppSettings,
+    youtube_monitor: SettingsBackupYoutubeMonitor,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsBackupYoutubeMonitor {
+    channels: Vec<BackupYoutubeChannel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupYoutubeChannel {
+    id: String,
+    url: String,
+    canonical_url: String,
+    external_id: String,
+    title: String,
+    handle: String,
+    description: String,
+    thumbnail_url: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsBackupSummary {
+    pub setting_count: usize,
+    pub channel_count: usize,
+    pub added_channel_count: usize,
+    pub updated_channel_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct YoutubeChannelImportSummary {
+    added_channel_count: usize,
+    updated_channel_count: usize,
 }
 
 pub struct SettingsStore {
@@ -234,159 +285,48 @@ impl SettingsStore {
             .transaction()
             .map_err(|error| format!("无法开始保存设置: {error}"))?;
 
-        upsert_setting(&transaction, "theme", &settings.theme)?;
-        upsert_setting(
-            &transaction,
-            "transcription_model",
-            &settings.transcription_model,
-        )?;
-        upsert_setting(&transaction, "source_language", &settings.source_language)?;
-        upsert_setting(
-            &transaction,
-            "transcription_format",
-            &settings.transcription_format,
-        )?;
-        upsert_setting(
-            &transaction,
-            "translation_format",
-            &settings.translation_format,
-        )?;
-        upsert_setting(
-            &transaction,
-            "is_smart_segmentation_enabled",
-            bool_to_text(settings.is_smart_segmentation_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "selected_llm_service",
-            &settings.selected_llm_service,
-        )?;
-        upsert_setting(
-            &transaction,
-            "translation_service",
-            &settings.translation_service,
-        )?;
-        upsert_setting(
-            &transaction,
-            "needs_reflection_translation",
-            bool_to_text(settings.needs_reflection_translation),
-        )?;
-        upsert_setting(
-            &transaction,
-            "translation_batch_size",
-            &settings.translation_batch_size.to_string(),
-        )?;
-        upsert_setting(
-            &transaction,
-            "translation_thread_count",
-            &settings.translation_thread_count.to_string(),
-        )?;
-        upsert_setting(
-            &transaction,
-            "video_content_type",
-            &settings.video_content_type,
-        )?;
-        upsert_setting(&transaction, "output_mode", &settings.output_mode)?;
-        upsert_setting(
-            &transaction,
-            "is_subtitle_correction_enabled",
-            bool_to_text(settings.is_subtitle_correction_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "is_subtitle_translation_enabled",
-            bool_to_text(settings.is_subtitle_translation_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "is_ai_subtitle_review_enabled",
-            bool_to_text(settings.is_ai_subtitle_review_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "ai_subtitle_review_mode",
-            &settings.ai_subtitle_review_mode,
-        )?;
-        upsert_setting(&transaction, "target_language", &settings.target_language)?;
-        upsert_setting(
-            &transaction,
-            "dubbing_tts_interval_ms",
-            &settings.dubbing_tts_interval_ms.to_string(),
-        )?;
-        upsert_setting(
-            &transaction,
-            "dubbing_reference_audio_source",
-            &settings.dubbing_reference_audio_source,
-        )?;
-        upsert_setting(
-            &transaction,
-            "dubbing_custom_reference_audio_path",
-            &settings.dubbing_custom_reference_audio_path,
-        )?;
-        upsert_setting(
-            &transaction,
-            "dubbing_is_background_music_enabled",
-            bool_to_text(settings.dubbing_is_background_music_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "dubbing_background_music_volume",
-            &settings.dubbing_background_music_volume.to_string(),
-        )?;
-        upsert_setting(
-            &transaction,
-            "home_workbench_translation_enabled",
-            bool_to_text(settings.home_workbench_translation_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "home_workbench_dubbing_enabled",
-            bool_to_text(settings.home_workbench_dubbing_enabled),
-        )?;
-        upsert_setting(
-            &transaction,
-            "home_workbench_export_dir",
-            &settings.home_workbench_export_dir,
-        )?;
-        upsert_setting(&transaction, "ytdlp_proxy", &settings.ytdlp_proxy)?;
-
-        for (service, config) in normalize_llm_configs(&settings.llm_configs) {
-            transaction
-                .execute(
-                    "
-                    INSERT INTO llm_configs (
-                        service,
-                        base_url,
-                        api_key,
-                        model,
-                        reasoning_effort,
-                        is_streaming
-                    )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    ON CONFLICT(service) DO UPDATE SET
-                        base_url = excluded.base_url,
-                        api_key = excluded.api_key,
-                        model = excluded.model,
-                        reasoning_effort = excluded.reasoning_effort,
-                        is_streaming = excluded.is_streaming
-                    ",
-                    params![
-                        service,
-                        config.base_url,
-                        config.api_key,
-                        config.model,
-                        config.reasoning_effort,
-                        if config.is_streaming { 1 } else { 0 },
-                    ],
-                )
-                .map_err(|error| format!("无法保存 LLM 配置: {error}"))?;
-        }
+        save_settings_in_transaction(&transaction, settings)?;
 
         transaction
             .commit()
             .map_err(|error| format!("无法提交设置: {error}"))?;
 
         Ok(())
+    }
+
+    fn export_backup(&self) -> Result<SettingsBackup, String> {
+        let settings = self.load()?;
+        let channels = self.with_connection(read_backup_youtube_channels)?;
+
+        Ok(SettingsBackup {
+            schema_version: SETTINGS_BACKUP_SCHEMA_VERSION,
+            exported_at: Utc::now().to_rfc3339(),
+            settings,
+            youtube_monitor: SettingsBackupYoutubeMonitor { channels },
+        })
+    }
+
+    fn import_backup(
+        &self,
+        backup: &SettingsBackup,
+    ) -> Result<YoutubeChannelImportSummary, String> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|error| format!("设置数据库锁定失败: {error}"))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("无法开始导入设置备份: {error}"))?;
+
+        save_settings_in_transaction(&transaction, &backup.settings)?;
+        let summary =
+            import_backup_youtube_channels(&transaction, &backup.youtube_monitor.channels)?;
+
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交设置备份导入: {error}"))?;
+
+        Ok(summary)
     }
 }
 
@@ -447,6 +387,160 @@ pub fn save_settings(
         }),
     );
     Ok(())
+}
+
+#[tauri::command]
+pub fn export_settings_backup(
+    store: tauri::State<'_, SettingsStore>,
+    app_logger: tauri::State<'_, AppLogger>,
+    path: String,
+) -> Result<SettingsBackupSummary, String> {
+    let path = settings_backup_path(&path)?;
+    app_logger.info(
+        "settings",
+        "backup_export_start",
+        "开始导出设置备份",
+        serde_json::json!({ "path": path.display().to_string() }),
+    );
+
+    let backup = match store.export_backup() {
+        Ok(backup) => backup,
+        Err(error) => {
+            app_logger.error(
+                "settings",
+                "backup_export_failed",
+                "读取设置备份数据失败",
+                serde_json::json!({ "error": &error }),
+            );
+            return Err(error);
+        }
+    };
+    let summary = SettingsBackupSummary {
+        setting_count: backup_setting_count(),
+        channel_count: backup.youtube_monitor.channels.len(),
+        added_channel_count: 0,
+        updated_channel_count: 0,
+    };
+    let content = serde_json::to_string_pretty(&backup)
+        .map_err(|error| format!("无法生成设置备份 JSON: {error}"))?;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| format!("无法创建备份目录: {error}"))?;
+        }
+    }
+
+    if let Err(error) = fs::write(&path, content) {
+        let message = format!("无法写入设置备份文件: {error}");
+        app_logger.error(
+            "settings",
+            "backup_export_failed",
+            "写入设置备份文件失败",
+            serde_json::json!({ "error": &message }),
+        );
+        return Err(message);
+    }
+
+    app_logger.info(
+        "settings",
+        "backup_export_success",
+        "设置备份已导出",
+        serde_json::json!({
+            "settingCount": summary.setting_count,
+            "channelCount": summary.channel_count,
+        }),
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn import_settings_backup(
+    store: tauri::State<'_, SettingsStore>,
+    ai_service: tauri::State<'_, AiService>,
+    app_logger: tauri::State<'_, AppLogger>,
+    path: String,
+) -> Result<SettingsBackupSummary, String> {
+    let path = settings_backup_path(&path)?;
+    app_logger.info(
+        "settings",
+        "backup_import_start",
+        "开始导入设置备份",
+        serde_json::json!({ "path": path.display().to_string() }),
+    );
+
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            let message = format!("无法读取设置备份文件: {error}");
+            app_logger.error(
+                "settings",
+                "backup_import_failed",
+                "读取设置备份文件失败",
+                serde_json::json!({ "error": &message }),
+            );
+            return Err(message);
+        }
+    };
+    let backup: SettingsBackup = match serde_json::from_str(&content) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let message = format!("设置备份 JSON 格式无效: {error}");
+            app_logger.error(
+                "settings",
+                "backup_import_failed",
+                "解析设置备份失败",
+                serde_json::json!({ "error": &message }),
+            );
+            return Err(message);
+        }
+    };
+    if backup.schema_version != SETTINGS_BACKUP_SCHEMA_VERSION {
+        return Err(format!("不支持的设置备份版本: {}", backup.schema_version));
+    }
+
+    let channel_count = backup.youtube_monitor.channels.len();
+    let translation_thread_count = backup.settings.translation_thread_count;
+    let import_summary = match store.import_backup(&backup) {
+        Ok(summary) => summary,
+        Err(error) => {
+            app_logger.error(
+                "settings",
+                "backup_import_failed",
+                "写入设置备份数据失败",
+                serde_json::json!({ "error": &error }),
+            );
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = ai_service.update_thread_count(translation_thread_count) {
+        app_logger.error(
+            "settings",
+            "backup_import_ai_concurrency_update_failed",
+            "导入设置备份后更新 AI 并发限制失败",
+            serde_json::json!({ "error": &error }),
+        );
+        return Err(error);
+    }
+
+    let summary = SettingsBackupSummary {
+        setting_count: backup_setting_count(),
+        channel_count,
+        added_channel_count: import_summary.added_channel_count,
+        updated_channel_count: import_summary.updated_channel_count,
+    };
+    app_logger.info(
+        "settings",
+        "backup_import_success",
+        "设置备份已导入",
+        serde_json::json!({
+            "settingCount": summary.setting_count,
+            "channelCount": summary.channel_count,
+            "addedChannelCount": summary.added_channel_count,
+            "updatedChannelCount": summary.updated_channel_count,
+        }),
+    );
+    Ok(summary)
 }
 
 fn initialize_database(connection: &Connection) -> Result<(), String> {
@@ -1231,6 +1325,365 @@ fn mark_workbench_content_copy_records(connection: &Connection) -> Result<(), St
         )
         .map(|_| ())
         .map_err(|error| format!("无法迁移工作台文案历史: {error}"))
+}
+
+fn save_settings_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    upsert_setting(transaction, "theme", &settings.theme)?;
+    upsert_setting(
+        transaction,
+        "transcription_model",
+        &settings.transcription_model,
+    )?;
+    upsert_setting(transaction, "source_language", &settings.source_language)?;
+    upsert_setting(
+        transaction,
+        "transcription_format",
+        &settings.transcription_format,
+    )?;
+    upsert_setting(
+        transaction,
+        "translation_format",
+        &settings.translation_format,
+    )?;
+    upsert_setting(
+        transaction,
+        "selected_subtitle_style_id",
+        &settings.selected_subtitle_style_id,
+    )?;
+    upsert_setting(
+        transaction,
+        "is_smart_segmentation_enabled",
+        bool_to_text(settings.is_smart_segmentation_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "selected_llm_service",
+        &settings.selected_llm_service,
+    )?;
+    upsert_setting(
+        transaction,
+        "translation_service",
+        &settings.translation_service,
+    )?;
+    upsert_setting(
+        transaction,
+        "needs_reflection_translation",
+        bool_to_text(settings.needs_reflection_translation),
+    )?;
+    upsert_setting(
+        transaction,
+        "translation_batch_size",
+        &settings.translation_batch_size.to_string(),
+    )?;
+    upsert_setting(
+        transaction,
+        "translation_thread_count",
+        &settings.translation_thread_count.to_string(),
+    )?;
+    upsert_setting(
+        transaction,
+        "video_content_type",
+        &settings.video_content_type,
+    )?;
+    upsert_setting(transaction, "output_mode", &settings.output_mode)?;
+    upsert_setting(
+        transaction,
+        "is_subtitle_correction_enabled",
+        bool_to_text(settings.is_subtitle_correction_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "is_subtitle_translation_enabled",
+        bool_to_text(settings.is_subtitle_translation_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "is_ai_subtitle_review_enabled",
+        bool_to_text(settings.is_ai_subtitle_review_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "ai_subtitle_review_mode",
+        &settings.ai_subtitle_review_mode,
+    )?;
+    upsert_setting(transaction, "target_language", &settings.target_language)?;
+    upsert_setting(
+        transaction,
+        "dubbing_tts_interval_ms",
+        &settings.dubbing_tts_interval_ms.to_string(),
+    )?;
+    upsert_setting(
+        transaction,
+        "dubbing_reference_audio_source",
+        &settings.dubbing_reference_audio_source,
+    )?;
+    upsert_setting(
+        transaction,
+        "dubbing_custom_reference_audio_path",
+        &settings.dubbing_custom_reference_audio_path,
+    )?;
+    upsert_setting(
+        transaction,
+        "dubbing_is_background_music_enabled",
+        bool_to_text(settings.dubbing_is_background_music_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "dubbing_background_music_volume",
+        &settings.dubbing_background_music_volume.to_string(),
+    )?;
+    upsert_setting(
+        transaction,
+        "home_workbench_translation_enabled",
+        bool_to_text(settings.home_workbench_translation_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "home_workbench_dubbing_enabled",
+        bool_to_text(settings.home_workbench_dubbing_enabled),
+    )?;
+    upsert_setting(
+        transaction,
+        "home_workbench_export_dir",
+        &settings.home_workbench_export_dir,
+    )?;
+    upsert_setting(transaction, "ytdlp_proxy", &settings.ytdlp_proxy)?;
+
+    for (service, config) in normalize_llm_configs(&settings.llm_configs) {
+        transaction
+            .execute(
+                "
+                INSERT INTO llm_configs (
+                    service,
+                    base_url,
+                    api_key,
+                    model,
+                    reasoning_effort,
+                    is_streaming
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(service) DO UPDATE SET
+                    base_url = excluded.base_url,
+                    api_key = excluded.api_key,
+                    model = excluded.model,
+                    reasoning_effort = excluded.reasoning_effort,
+                    is_streaming = excluded.is_streaming
+                ",
+                params![
+                    service,
+                    config.base_url,
+                    config.api_key,
+                    config.model,
+                    config.reasoning_effort,
+                    if config.is_streaming { 1 } else { 0 },
+                ],
+            )
+            .map_err(|error| format!("无法保存 LLM 配置: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn read_backup_youtube_channels(
+    connection: &Connection,
+) -> Result<Vec<BackupYoutubeChannel>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT id, url, canonical_url, external_id, title, handle, description,
+                   thumbnail_url, created_at, updated_at
+            FROM youtube_channels
+            ORDER BY datetime(created_at) ASC, title COLLATE NOCASE ASC
+            ",
+        )
+        .map_err(|error| format!("无法读取监控博主: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(BackupYoutubeChannel {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                canonical_url: row.get(2)?,
+                external_id: row.get(3)?,
+                title: row.get(4)?,
+                handle: row.get(5)?,
+                description: row.get(6)?,
+                thumbnail_url: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .map_err(|error| format!("无法读取监控博主: {error}"))?;
+
+    let mut channels = Vec::new();
+    for row in rows {
+        channels.push(row.map_err(|error| format!("无法解析监控博主: {error}"))?);
+    }
+
+    Ok(channels)
+}
+
+fn import_backup_youtube_channels(
+    transaction: &rusqlite::Transaction<'_>,
+    channels: &[BackupYoutubeChannel],
+) -> Result<YoutubeChannelImportSummary, String> {
+    let mut summary = YoutubeChannelImportSummary::default();
+
+    for channel in channels {
+        let prepared = prepare_backup_youtube_channel(channel)?;
+        let existing_id = find_existing_backup_youtube_channel(transaction, &prepared)?;
+
+        if let Some(existing_id) = existing_id {
+            transaction
+                .execute(
+                    "
+                    UPDATE youtube_channels
+                    SET url = ?1,
+                        canonical_url = ?2,
+                        external_id = ?3,
+                        title = ?4,
+                        handle = ?5,
+                        description = ?6,
+                        thumbnail_url = ?7,
+                        status = ?8,
+                        last_error = '',
+                        updated_at = ?9
+                    WHERE id = ?10
+                    ",
+                    params![
+                        prepared.url,
+                        prepared.canonical_url,
+                        prepared.external_id,
+                        prepared.title,
+                        prepared.handle,
+                        prepared.description,
+                        prepared.thumbnail_url,
+                        YOUTUBE_CHANNEL_STATUS_IDLE,
+                        prepared.updated_at,
+                        existing_id,
+                    ],
+                )
+                .map_err(|error| format!("无法更新监控博主备份数据: {error}"))?;
+            summary.updated_channel_count += 1;
+            continue;
+        }
+
+        transaction
+            .execute(
+                "
+                INSERT INTO youtube_channels (
+                    id, url, canonical_url, external_id, title, handle, description,
+                    thumbnail_url, status, last_checked_at, last_success_at, last_error,
+                    latest_video_external_id, video_count, unread_count, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, '', '', 0, 0, ?10, ?11)
+                ",
+                params![
+                    prepared.id,
+                    prepared.url,
+                    prepared.canonical_url,
+                    prepared.external_id,
+                    prepared.title,
+                    prepared.handle,
+                    prepared.description,
+                    prepared.thumbnail_url,
+                    YOUTUBE_CHANNEL_STATUS_IDLE,
+                    prepared.created_at,
+                    prepared.updated_at,
+                ],
+            )
+            .map_err(|error| format!("无法新增监控博主备份数据: {error}"))?;
+        summary.added_channel_count += 1;
+    }
+
+    Ok(summary)
+}
+
+fn find_existing_backup_youtube_channel(
+    transaction: &rusqlite::Transaction<'_>,
+    channel: &BackupYoutubeChannel,
+) -> Result<Option<String>, String> {
+    for (column, value) in [
+        ("url", channel.url.as_str()),
+        ("canonical_url", channel.canonical_url.as_str()),
+        ("external_id", channel.external_id.as_str()),
+        ("id", channel.id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            continue;
+        }
+
+        let existing_id = transaction
+            .query_row(
+                &format!("SELECT id FROM youtube_channels WHERE {column} = ?1 LIMIT 1"),
+                params![value],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法检查监控博主是否已存在: {error}"))?;
+
+        if existing_id.is_some() {
+            return Ok(existing_id);
+        }
+    }
+
+    Ok(None)
+}
+
+fn prepare_backup_youtube_channel(
+    channel: &BackupYoutubeChannel,
+) -> Result<BackupYoutubeChannel, String> {
+    let url = channel.url.trim();
+    if url.is_empty() {
+        return Err("设置备份中存在缺少 URL 的监控博主".to_string());
+    }
+
+    let now = Utc::now().to_rfc3339();
+    Ok(BackupYoutubeChannel {
+        id: read_backup_id(&channel.id),
+        url: url.to_string(),
+        canonical_url: channel.canonical_url.trim().to_string(),
+        external_id: channel.external_id.trim().to_string(),
+        title: channel.title.trim().to_string(),
+        handle: channel.handle.trim().to_string(),
+        description: channel.description.trim().to_string(),
+        thumbnail_url: channel.thumbnail_url.trim().to_string(),
+        created_at: read_backup_timestamp(&channel.created_at, &now),
+        updated_at: read_backup_timestamp(&channel.updated_at, &now),
+    })
+}
+
+fn read_backup_id(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn read_backup_timestamp(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn settings_backup_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("请选择设置备份文件".to_string());
+    }
+
+    Ok(PathBuf::from(trimmed))
+}
+
+fn backup_setting_count() -> usize {
+    29
 }
 
 fn read_settings_map(connection: &Connection) -> Result<HashMap<String, String>, String> {
