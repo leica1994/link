@@ -611,6 +611,7 @@
                   <span class="home-workbench-stage-mark">
                     <CheckCircle2 v-if="stage.status === 'done' || stage.status === 'skipped'" :stroke-width="2.1" aria-hidden="true" />
                     <CircleAlert v-else-if="stage.status === 'failed'" :stroke-width="2.1" aria-hidden="true" />
+                    <CirclePause v-else-if="stage.status === 'interrupted'" :stroke-width="2.1" aria-hidden="true" />
                     <LoaderCircle v-else-if="stage.status === 'active'" class="spinning" :stroke-width="2.1" aria-hidden="true" />
                     <span v-else aria-hidden="true">{{ stageOrderLabel(stage.key) }}</span>
                   </span>
@@ -1356,6 +1357,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleAlert,
+  CirclePause,
   Clock,
   Copy,
   Download,
@@ -1412,8 +1414,8 @@ defineOptions({ name: 'Home' })
 type TaskStatusFilter = 'all' | 'pending' | 'ready' | 'failed'
 type DownloadProgressStatus = 'active' | 'done' | 'failed'
 type DownloadProgressKind = 'video' | 'subtitle'
-type WorkbenchStatus = 'idle' | 'running' | 'done' | 'failed'
-type WorkbenchStageStatus = 'pending' | 'active' | 'done' | 'skipped' | 'failed'
+type WorkbenchStatus = 'idle' | 'running' | 'done' | 'failed' | 'interrupted'
+type WorkbenchStageStatus = 'pending' | 'active' | 'done' | 'skipped' | 'failed' | 'interrupted'
 type WorkbenchSubtitleSource = 'transcribe' | 'downloaded'
 type WorkbenchDetailStageStatus = WorkbenchStageStatus | 'interrupted'
 
@@ -2064,6 +2066,7 @@ const selectedWorkbenchStageSnapshot = computed(() => {
 const preferredWorkbenchStage = computed(() => {
   return (
     workbenchStages.value.find((stage) => stage.status === 'active') ??
+    workbenchStages.value.find((stage) => stage.status === 'interrupted') ??
     workbenchStages.value.find((stage) => stage.status === 'failed') ??
     workbenchStages.value.find((stage) => stage.status === 'pending') ??
     workbenchStages.value[0] ??
@@ -2088,11 +2091,15 @@ const workbenchStatusText = computed(() => {
   if (workbenchSnapshot.value?.status === 'done') {
     return '工作台已完成'
   }
+  if (workbenchSnapshot.value?.status === 'interrupted') {
+    return '工作台已中断'
+  }
   return '等待执行'
 })
 
 const workbenchMessageClass = computed(() => ({
   ready: workbenchSnapshot.value?.status === 'done' && !workbenchSnapshot.value?.errorMessage,
+  warning: workbenchSnapshot.value?.status === 'interrupted' && !workbenchSnapshot.value?.errorMessage,
   error: Boolean(workbenchSnapshot.value?.errorMessage),
 }))
 
@@ -2169,7 +2176,7 @@ const workbenchRunLabel = computed(() => {
   if (isWorkbenchCompleted.value) {
     return '开始执行'
   }
-  if (workbenchSnapshot.value?.status === 'failed') {
+  if (workbenchSnapshot.value?.status === 'failed' || workbenchSnapshot.value?.status === 'interrupted') {
     return '继续执行'
   }
   if (workbenchSnapshot.value?.stages.some((stage) => ['done', 'skipped'].includes(stage.status))) {
@@ -3817,6 +3824,7 @@ const normalizeSegmentStatus = (status?: string) => {
     'reviewed',
     'removed',
     'kept',
+    'interrupted',
   ].includes(value)
     ? value
     : 'raw'
@@ -3830,6 +3838,8 @@ const segmentStatusLabel = (status?: string) => {
       return '完成'
     case 'failed':
       return '失败'
+    case 'interrupted':
+      return '已中断'
     case 'segmenting':
       return '断句中'
     case 'segmented':

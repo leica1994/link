@@ -3,6 +3,10 @@ use crate::app_log::AppLogger;
 use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_translation::load_subtitle_segments;
 use crate::transcription::TranscriptionSegment;
+use crate::workbench_checkpoint::{
+    load_checkpoint, mark_checkpoint_active, mark_checkpoint_done, mark_checkpoint_failed,
+    WorkbenchCheckpointContext,
+};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -138,7 +142,7 @@ pub struct ListContentCopyRecordsRequest {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ContentChunkSummary {
     summary: String,
@@ -168,6 +172,34 @@ pub(crate) async fn generate_content_copy_record(
     ai_service: &AiService,
     app_logger: &AppLogger,
     request: GenerateContentCopyRequest,
+) -> Result<ContentCopyRecord, String> {
+    generate_content_copy_record_internal(settings_store, ai_service, app_logger, request, None)
+        .await
+}
+
+pub(crate) async fn generate_content_copy_record_with_checkpoint(
+    settings_store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: GenerateContentCopyRequest,
+    checkpoint: WorkbenchCheckpointContext,
+) -> Result<ContentCopyRecord, String> {
+    generate_content_copy_record_internal(
+        settings_store,
+        ai_service,
+        app_logger,
+        request,
+        Some(checkpoint),
+    )
+    .await
+}
+
+async fn generate_content_copy_record_internal(
+    settings_store: &SettingsStore,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    request: GenerateContentCopyRequest,
+    checkpoint: Option<WorkbenchCheckpointContext>,
 ) -> Result<ContentCopyRecord, String> {
     let settings = settings_store.load()?;
     let log_session = app_logger.start_session("content_copy")?;
@@ -210,7 +242,16 @@ pub(crate) async fn generate_content_copy_record(
         return Err(error);
     }
 
-    let transcript = match build_prompt_transcript(&settings, &ai_service, &segments).await {
+    let summary_checkpoint = checkpoint.as_ref().map(|context| context.child("summary"));
+    let transcript = match build_prompt_transcript(
+        &settings,
+        &ai_service,
+        &segments,
+        Some(settings_store),
+        summary_checkpoint.as_ref(),
+    )
+    .await
+    {
         Ok(transcript) => transcript,
         Err(error) => {
             log_session.error(
@@ -221,12 +262,17 @@ pub(crate) async fn generate_content_copy_record(
             return Err(error);
         }
     };
-    let result = match generate_result_by_llm(
+    let result_checkpoint = checkpoint
+        .as_ref()
+        .map(|context| context.child("final-result"));
+    let result = match generate_result_by_llm_with_checkpoint(
         &settings,
         &ai_service,
         &transcript,
         &request.extra_context,
         &options,
+        Some(settings_store),
+        result_checkpoint.as_ref(),
     )
     .await
     {
@@ -351,6 +397,8 @@ async fn build_prompt_transcript(
     settings: &AppSettings,
     ai_service: &AiService,
     segments: &[TranscriptionSegment],
+    checkpoint_store: Option<&SettingsStore>,
+    checkpoint_context: Option<&WorkbenchCheckpointContext>,
 ) -> Result<String, String> {
     let transcript = format_segments_for_prompt(segments);
     if transcript.chars().count() <= DIRECT_TRANSCRIPT_CHAR_LIMIT {
@@ -360,8 +408,39 @@ async fn build_prompt_transcript(
     let chunks = chunk_segments_for_summary(segments, SUMMARY_CHUNK_CHAR_LIMIT);
     let mut summaries = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.iter().enumerate() {
-        let summary =
-            summarize_chunk_by_llm(settings, ai_service, index + 1, chunks.len(), chunk).await?;
+        let checkpoint_key = format!("summary-chunk-{index}");
+        let summary = if let (Some(store), Some(context)) = (checkpoint_store, checkpoint_context) {
+            match load_checkpoint::<ContentChunkSummary>(store, context, &checkpoint_key) {
+                Ok(Some(summary)) => summary,
+                Ok(None) => {
+                    mark_checkpoint_active(store, context, &checkpoint_key)?;
+                    match summarize_chunk_by_llm(
+                        settings,
+                        ai_service,
+                        index + 1,
+                        chunks.len(),
+                        chunk,
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            mark_checkpoint_done(store, context, &checkpoint_key, &summary)?;
+                            summary
+                        }
+                        Err(error) => {
+                            let _ = mark_checkpoint_failed(store, context, &checkpoint_key, &error);
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(_) => {
+                    summarize_chunk_by_llm(settings, ai_service, index + 1, chunks.len(), chunk)
+                        .await?
+                }
+            }
+        } else {
+            summarize_chunk_by_llm(settings, ai_service, index + 1, chunks.len(), chunk).await?
+        };
         summaries.push(summary);
     }
 
@@ -437,6 +516,47 @@ async fn generate_result_by_llm(
     }
 
     Err("文案生成失败".to_string())
+}
+
+async fn generate_result_by_llm_with_checkpoint(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    transcript: &str,
+    extra_context: &str,
+    options: &ContentCopyOptions,
+    checkpoint_store: Option<&SettingsStore>,
+    checkpoint_context: Option<&WorkbenchCheckpointContext>,
+) -> Result<ContentCopyResult, String> {
+    let Some(store) = checkpoint_store else {
+        return generate_result_by_llm(settings, ai_service, transcript, extra_context, options)
+            .await;
+    };
+    let Some(context) = checkpoint_context else {
+        return generate_result_by_llm(settings, ai_service, transcript, extra_context, options)
+            .await;
+    };
+    let checkpoint_key = "final-result";
+    match load_checkpoint::<ContentCopyResult>(store, context, checkpoint_key) {
+        Ok(Some(result)) => Ok(result),
+        Ok(None) => {
+            mark_checkpoint_active(store, context, checkpoint_key)?;
+            match generate_result_by_llm(settings, ai_service, transcript, extra_context, options)
+                .await
+            {
+                Ok(result) => {
+                    mark_checkpoint_done(store, context, checkpoint_key, &result)?;
+                    Ok(result)
+                }
+                Err(error) => {
+                    let _ = mark_checkpoint_failed(store, context, checkpoint_key, &error);
+                    Err(error)
+                }
+            }
+        }
+        Err(_) => {
+            generate_result_by_llm(settings, ai_service, transcript, extra_context, options).await
+        }
+    }
 }
 
 fn build_summary_system_prompt() -> String {

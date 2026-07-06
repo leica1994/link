@@ -1,9 +1,13 @@
 use crate::ai::AiService;
 use crate::app_log::LogSession;
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, SettingsStore};
 use crate::transcription::{TranscriptionSegment, TranscriptionWord};
+use crate::workbench_checkpoint::{
+    load_checkpoint, mark_checkpoint_active, mark_checkpoint_done, mark_checkpoint_failed,
+    WorkbenchCheckpointContext,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
@@ -81,6 +85,7 @@ struct ReferenceCorrectionPromptEntry {
 
 #[derive(Debug, Clone)]
 struct ReferenceCorrectionChunkResult {
+    chunk: ReferenceCorrectionChunk,
     entries: Vec<(usize, ReviewedSourceEntry)>,
 }
 
@@ -96,6 +101,12 @@ struct SegmentationBlock {
     original_segments: Vec<TranscriptionSegment>,
     display_segments: Vec<TranscriptionSegment>,
     words: Vec<WordUnit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentRangeCheckpoint {
+    segments: Vec<TranscriptionSegment>,
 }
 
 trait VideoPromptStrategy {
@@ -226,6 +237,7 @@ pub async fn smart_segment_subtitles<F>(
     log_session: &LogSession,
     segments: Vec<TranscriptionSegment>,
     report: &mut F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
 ) -> SubtitleProcessingResult
 where
     F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
@@ -270,8 +282,44 @@ where
     let max_active = active_ai_work_count(settings);
     let mut split_futures = FuturesUnordered::new();
     let mut next_block_index = 0usize;
+    let mut completed = 0usize;
+    let mut checkpoint_done_blocks = HashSet::new();
+    for block in &mut blocks {
+        let checkpoint_key = block_checkpoint_key(block.block_id);
+        if !block_needs_split_ai(block) {
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_done(
+                    store,
+                    context,
+                    &checkpoint_key,
+                    &SegmentRangeCheckpoint {
+                        segments: block.display_segments.clone(),
+                    },
+                );
+            }
+            completed += 1;
+            continue;
+        }
+        if let Some((store, context)) = checkpoint {
+            match load_checkpoint::<SegmentRangeCheckpoint>(store, context, &checkpoint_key) {
+                Ok(Some(payload)) if !payload.segments.is_empty() => {
+                    block.display_segments = payload.segments;
+                    checkpoint_done_blocks.insert(block.block_id);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "smart_segmentation_checkpoint_load_failed",
+                    "读取智能断句检查点失败，将重新执行批次",
+                    json!({ "blockIndex": block.block_id + 1, "error": error }),
+                ),
+            }
+        }
+    }
     while next_block_index < blocks.len() && split_futures.len() < max_active {
-        if !block_needs_split_ai(&blocks[next_block_index]) {
+        if !block_needs_split_ai(&blocks[next_block_index])
+            || checkpoint_done_blocks.contains(&blocks[next_block_index].block_id)
+        {
             next_block_index += 1;
             continue;
         }
@@ -280,6 +328,9 @@ where
         set_segments_status(&mut block.display_segments, "segmenting");
 
         let block_id = block.block_id;
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(store, context, &block_checkpoint_key(block_id));
+        }
         let words = block.words.clone();
         let block_system_prompt = system_prompt.clone();
         let block_reference = reference.clone();
@@ -297,7 +348,6 @@ where
         next_block_index += 1;
     }
 
-    let mut completed = skipped_blocks;
     let snapshot = render_segmentation_blocks(&blocks);
     report(
         stage_progress(0, 100, completed, total),
@@ -325,11 +375,29 @@ where
                         "segmented",
                     );
                     block.display_segments = processed_segments;
+                    if let Some((store, context)) = checkpoint {
+                        let _ = mark_checkpoint_done(
+                            store,
+                            context,
+                            &block_checkpoint_key(block_id),
+                            &SegmentRangeCheckpoint {
+                                segments: block.display_segments.clone(),
+                            },
+                        );
+                    }
                 }
                 Ok(_) => {
                     block.display_segments = block.original_segments.clone();
                     set_segments_status(&mut block.display_segments, "kept");
                     failed_blocks += 1;
+                    if let Some((store, context)) = checkpoint {
+                        let _ = mark_checkpoint_failed(
+                            store,
+                            context,
+                            &block_checkpoint_key(block_id),
+                            "智能断句批次未返回可用结果",
+                        );
+                    }
                     log_session.warn(
                         "smart_segmentation_block_empty",
                         "智能断句批次未返回可用结果，已保留原文",
@@ -343,6 +411,14 @@ where
                     block.display_segments = block.original_segments.clone();
                     set_segments_status(&mut block.display_segments, "kept");
                     failed_blocks += 1;
+                    if let Some((store, context)) = checkpoint {
+                        let _ = mark_checkpoint_failed(
+                            store,
+                            context,
+                            &block_checkpoint_key(block_id),
+                            &error,
+                        );
+                    }
                     log_session.warn(
                         "smart_segmentation_block_failed",
                         "智能断句批次失败，已保留原文",
@@ -357,7 +433,9 @@ where
         }
 
         while next_block_index < blocks.len() && split_futures.len() < max_active {
-            if !block_needs_split_ai(&blocks[next_block_index]) {
+            if !block_needs_split_ai(&blocks[next_block_index])
+                || checkpoint_done_blocks.contains(&blocks[next_block_index].block_id)
+            {
                 next_block_index += 1;
                 continue;
             }
@@ -366,6 +444,9 @@ where
             set_segments_status(&mut block.display_segments, "segmenting");
 
             let block_id = block.block_id;
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(store, context, &block_checkpoint_key(block_id));
+            }
             let words = block.words.clone();
             let block_system_prompt = system_prompt.clone();
             let block_reference = reference.clone();
@@ -418,6 +499,7 @@ pub async fn correct_subtitles<F>(
     log_session: &LogSession,
     segments: Vec<TranscriptionSegment>,
     report: &mut F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
 ) -> SubtitleProcessingResult
 where
     F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
@@ -461,14 +543,53 @@ where
     let max_active = active_ai_work_count(settings);
     let mut correction_futures = FuturesUnordered::new();
     let mut next_chunk_index = 0usize;
+    let mut completed = 0usize;
+    let mut checkpoint_done_chunks = HashSet::new();
+    if let Some((store, context)) = checkpoint {
+        for chunk in &chunks {
+            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
+            match load_checkpoint::<SegmentRangeCheckpoint>(store, context, &checkpoint_key) {
+                Ok(Some(payload)) if !payload.segments.is_empty() => {
+                    apply_checkpoint_segments(
+                        &mut corrected_segments,
+                        chunk.start_index,
+                        payload.segments,
+                    );
+                    checkpoint_done_chunks.insert(chunk.start_index);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "subtitle_correction_checkpoint_load_failed",
+                    "读取字幕校正检查点失败，将重新执行批次",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
+    }
     while next_chunk_index < chunks.len() && correction_futures.len() < max_active {
         let chunk = chunks[next_chunk_index].clone();
+        if checkpoint_done_chunks.contains(&chunk.start_index) {
+            next_chunk_index += 1;
+            continue;
+        }
         mark_range_status(
             &mut corrected_segments,
             chunk.start_index,
             chunk.end_index,
             "correcting",
         );
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(
+                store,
+                context,
+                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+            );
+        }
         let chunk_system_prompt = system_prompt.clone();
         let chunk_reference = reference.clone();
         let chunk_log_session = log_session.clone();
@@ -482,9 +603,12 @@ where
         ));
         next_chunk_index += 1;
     }
-    report(0, "AI 字幕校正中", &corrected_segments, &warnings);
-
-    let mut completed = 0usize;
+    report(
+        stage_progress(0, 100, completed, total),
+        "AI 字幕校正中",
+        &corrected_segments,
+        &warnings,
+    );
 
     while let Some(result) = correction_futures.next().await {
         completed += 1;
@@ -502,6 +626,18 @@ where
                     result.chunk.end_index,
                     "corrected",
                 );
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &segment_range_checkpoint(
+                            &corrected_segments,
+                            result.chunk.start_index,
+                            result.chunk.end_index,
+                        ),
+                    );
+                }
             }
             Err((chunk, error)) => {
                 mark_range_status(
@@ -511,6 +647,14 @@ where
                     "kept",
                 );
                 failed_chunks += 1;
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                        &error,
+                    );
+                }
                 log_session.warn(
                     "subtitle_correction_chunk_failed",
                     "字幕校正批次失败，已保留原文",
@@ -526,12 +670,23 @@ where
 
         while next_chunk_index < chunks.len() && correction_futures.len() < max_active {
             let chunk = chunks[next_chunk_index].clone();
+            if checkpoint_done_chunks.contains(&chunk.start_index) {
+                next_chunk_index += 1;
+                continue;
+            }
             mark_range_status(
                 &mut corrected_segments,
                 chunk.start_index,
                 chunk.end_index,
                 "correcting",
             );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                );
+            }
             let chunk_system_prompt = system_prompt.clone();
             let chunk_reference = reference.clone();
             let chunk_log_session = log_session.clone();
@@ -579,6 +734,7 @@ pub async fn review_source_subtitles<F>(
     log_session: &LogSession,
     segments: Vec<TranscriptionSegment>,
     report: &mut F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
 ) -> SubtitleProcessingResult
 where
     F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
@@ -590,7 +746,8 @@ where
         };
     }
 
-    let chunks = build_correction_chunks(&segments, settings.translation_batch_size.max(1) as usize);
+    let chunks =
+        build_correction_chunks(&segments, settings.translation_batch_size.max(1) as usize);
     let mut reviewed_segments = segments;
     let mut failed_chunks = 0usize;
     let mut warnings = Vec::new();
@@ -619,15 +776,55 @@ where
     let max_active = active_ai_work_count(settings);
     let mut futures = FuturesUnordered::new();
     let mut next_chunk_index = 0usize;
+    let mut completed = 0usize;
+    let mut checkpoint_done_chunks = HashSet::new();
+
+    if let Some((store, context)) = checkpoint {
+        for chunk in &chunks {
+            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
+            match load_checkpoint::<SegmentRangeCheckpoint>(store, context, &checkpoint_key) {
+                Ok(Some(payload)) if !payload.segments.is_empty() => {
+                    apply_checkpoint_segments(
+                        &mut reviewed_segments,
+                        chunk.start_index,
+                        payload.segments,
+                    );
+                    checkpoint_done_chunks.insert(chunk.start_index);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "source_subtitle_review_checkpoint_load_failed",
+                    "读取源文审核检查点失败，将重新执行批次",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
+    }
 
     while next_chunk_index < chunks.len() && futures.len() < max_active {
         let chunk = chunks[next_chunk_index].clone();
+        if checkpoint_done_chunks.contains(&chunk.start_index) {
+            next_chunk_index += 1;
+            continue;
+        }
         mark_range_status(
             &mut reviewed_segments,
             chunk.start_index,
             chunk.end_index,
             "reviewing",
         );
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(
+                store,
+                context,
+                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+            );
+        }
         futures.push(run_source_review_chunk(
             settings,
             ai_service,
@@ -636,9 +833,13 @@ where
         ));
         next_chunk_index += 1;
     }
-    report(0, "AI 源文审核中", &reviewed_segments, &warnings);
+    report(
+        stage_progress(0, 100, completed, total),
+        "AI 源文审核中",
+        &reviewed_segments,
+        &warnings,
+    );
 
-    let mut completed = 0usize;
     while let Some(result) = futures.next().await {
         completed += 1;
 
@@ -660,6 +861,18 @@ where
                     result.chunk.end_index,
                     "reviewed",
                 );
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &segment_range_checkpoint(
+                            &reviewed_segments,
+                            result.chunk.start_index,
+                            result.chunk.end_index,
+                        ),
+                    );
+                }
             }
             Err((chunk, error)) => {
                 mark_range_status(
@@ -669,6 +882,14 @@ where
                     "kept",
                 );
                 failed_chunks += 1;
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                        &error,
+                    );
+                }
                 log_session.warn(
                     "source_subtitle_review_chunk_failed",
                     "源文审核批次失败，已保留原文",
@@ -684,12 +905,23 @@ where
 
         while next_chunk_index < chunks.len() && futures.len() < max_active {
             let chunk = chunks[next_chunk_index].clone();
+            if checkpoint_done_chunks.contains(&chunk.start_index) {
+                next_chunk_index += 1;
+                continue;
+            }
             mark_range_status(
                 &mut reviewed_segments,
                 chunk.start_index,
                 chunk.end_index,
                 "reviewing",
             );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                );
+            }
             futures.push(run_source_review_chunk(
                 settings,
                 ai_service,
@@ -733,6 +965,7 @@ pub async fn correct_subtitles_with_downloaded_reference<F>(
     segments: Vec<TranscriptionSegment>,
     references: &[SubtitleReferenceCorrectionReference],
     report: &mut F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
 ) -> SubtitleProcessingResult
 where
     F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
@@ -776,15 +1009,55 @@ where
     let max_active = active_ai_work_count(settings);
     let mut futures = FuturesUnordered::new();
     let mut next_chunk_index = 0usize;
+    let mut completed = 0usize;
+    let mut checkpoint_done_chunks = HashSet::new();
+
+    if let Some((store, context)) = checkpoint {
+        for chunk in &chunks {
+            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
+            match load_checkpoint::<SegmentRangeCheckpoint>(store, context, &checkpoint_key) {
+                Ok(Some(payload)) if !payload.segments.is_empty() => {
+                    apply_checkpoint_segments(
+                        &mut corrected_segments,
+                        chunk.start_index,
+                        payload.segments,
+                    );
+                    checkpoint_done_chunks.insert(chunk.start_index);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "subtitle_reference_correction_checkpoint_load_failed",
+                    "读取参考校正检查点失败，将重新执行批次",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
+    }
 
     while next_chunk_index < chunks.len() && futures.len() < max_active {
         let chunk = chunks[next_chunk_index].clone();
+        if checkpoint_done_chunks.contains(&chunk.start_index) {
+            next_chunk_index += 1;
+            continue;
+        }
         mark_range_status(
             &mut corrected_segments,
             chunk.start_index,
             chunk.end_index,
             "correcting",
         );
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(
+                store,
+                context,
+                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+            );
+        }
         futures.push(run_reference_correction_chunk(
             settings,
             ai_service,
@@ -793,9 +1066,13 @@ where
         ));
         next_chunk_index += 1;
     }
-    report(0, "AI 参考校正中", &corrected_segments, &warnings);
+    report(
+        stage_progress(0, 100, completed, total),
+        "AI 参考校正中",
+        &corrected_segments,
+        &warnings,
+    );
 
-    let mut completed = 0usize;
     while let Some(result) = futures.next().await {
         completed += 1;
 
@@ -812,6 +1089,18 @@ where
                         .to_string();
                     }
                 }
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &segment_range_checkpoint(
+                            &corrected_segments,
+                            result.chunk.start_index,
+                            result.chunk.end_index,
+                        ),
+                    );
+                }
             }
             Err((chunk, error)) => {
                 mark_range_status(
@@ -821,6 +1110,14 @@ where
                     "kept",
                 );
                 failed_chunks += 1;
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                        &error,
+                    );
+                }
                 log_session.warn(
                     "subtitle_reference_correction_chunk_failed",
                     "参考校正批次失败，已保留转录字幕",
@@ -836,12 +1133,23 @@ where
 
         while next_chunk_index < chunks.len() && futures.len() < max_active {
             let chunk = chunks[next_chunk_index].clone();
+            if checkpoint_done_chunks.contains(&chunk.start_index) {
+                next_chunk_index += 1;
+                continue;
+            }
             mark_range_status(
                 &mut corrected_segments,
                 chunk.start_index,
                 chunk.end_index,
                 "correcting",
             );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                );
+            }
             futures.push(run_reference_correction_chunk(
                 settings,
                 ai_service,
@@ -992,6 +1300,42 @@ fn mark_range_status(
     let end_index = end_index.min(segments.len().saturating_sub(1));
     for segment in &mut segments[start_index..=end_index] {
         segment.status = status.to_string();
+    }
+}
+
+fn block_checkpoint_key(block_id: usize) -> String {
+    format!("block-{block_id}")
+}
+
+fn chunk_checkpoint_key(start_index: usize, end_index: usize) -> String {
+    format!("chunk-{start_index}-{end_index}")
+}
+
+fn segment_range_checkpoint(
+    segments: &[TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+) -> SegmentRangeCheckpoint {
+    if start_index >= segments.len() {
+        return SegmentRangeCheckpoint {
+            segments: Vec::new(),
+        };
+    }
+    let end_index = end_index.min(segments.len().saturating_sub(1));
+    SegmentRangeCheckpoint {
+        segments: segments[start_index..=end_index].to_vec(),
+    }
+}
+
+fn apply_checkpoint_segments(
+    segments: &mut [TranscriptionSegment],
+    start_index: usize,
+    checkpoint_segments: Vec<TranscriptionSegment>,
+) {
+    for (offset, checkpoint_segment) in checkpoint_segments.into_iter().enumerate() {
+        if let Some(segment) = segments.get_mut(start_index + offset) {
+            *segment = checkpoint_segment;
+        }
     }
 }
 
@@ -1429,7 +1773,7 @@ async fn correct_reference_chunk_by_llm(
                         key.parse::<usize>().ok().map(|index| (index - 1, entry))
                     })
                     .collect();
-                return Ok(ReferenceCorrectionChunkResult { entries });
+                return Ok(ReferenceCorrectionChunkResult { chunk, entries });
             }
             Err(error) => {
                 feedback = build_reference_correction_key_feedback(&chunk.entries, &error);
@@ -2335,7 +2679,9 @@ fn parse_json_text_map(text: &str) -> Result<BTreeMap<String, String>, String> {
     Err(last_error)
 }
 
-fn parse_source_review_response(text: &str) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+fn parse_source_review_response(
+    text: &str,
+) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
     let candidates = extract_json_object_candidates(text);
     if candidates.is_empty() {
         return Err("未找到 JSON 对象开始符".to_string());
@@ -2352,13 +2698,17 @@ fn parse_source_review_response(text: &str) -> Result<BTreeMap<String, ReviewedS
     Err(last_error)
 }
 
-fn parse_source_review_candidate(json_text: &str) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+fn parse_source_review_candidate(
+    json_text: &str,
+) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
     let value = serde_json::from_str::<Value>(json_text)
         .map_err(|error| format!("JSON 解析失败: {error}"))?;
     parse_source_review_value(&value)
 }
 
-fn parse_source_review_value(value: &Value) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+fn parse_source_review_value(
+    value: &Value,
+) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "LLM 返回内容不是 JSON 对象".to_string())?;
@@ -2367,7 +2717,9 @@ fn parse_source_review_value(value: &Value) -> Result<BTreeMap<String, ReviewedS
         return Ok(result);
     }
 
-    for field in ["reviewed", "reviews", "results", "result", "items", "data", "output"] {
+    for field in [
+        "reviewed", "reviews", "results", "result", "items", "data", "output",
+    ] {
         let Some(nested) = object.get(field) else {
             continue;
         };
@@ -2440,7 +2792,9 @@ fn mark_unfinished_review_range(
     }
 }
 
-fn parse_source_review_array(items: &[Value]) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
+fn parse_source_review_array(
+    items: &[Value],
+) -> Result<BTreeMap<String, ReviewedSourceEntry>, String> {
     let mut result = BTreeMap::new();
     let mut last_error = String::new();
 
@@ -2510,18 +2864,33 @@ fn parse_reviewed_source_entry(value: &Value) -> Result<ReviewedSourceEntry, Str
     let object = value
         .as_object()
         .ok_or_else(|| "的值不是字符串或对象".to_string())?;
-    let text = ["text", "source_text", "sourceText", "revised_text", "revisedText", "content", "value", "字幕"]
-        .iter()
-        .find_map(|field| object.get(*field).and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_string();
+    let text = [
+        "text",
+        "source_text",
+        "sourceText",
+        "revised_text",
+        "revisedText",
+        "content",
+        "value",
+        "字幕",
+    ]
+    .iter()
+    .find_map(|field| object.get(*field).and_then(Value::as_str))
+    .unwrap_or_default()
+    .to_string();
     let action = object
         .get("action")
         .or_else(|| object.get("operation"))
         .or_else(|| object.get("status"))
         .and_then(Value::as_str)
         .map(normalize_review_action)
-        .unwrap_or_else(|| if text.trim().is_empty() { "remove".to_string() } else { "revise".to_string() });
+        .unwrap_or_else(|| {
+            if text.trim().is_empty() {
+                "remove".to_string()
+            } else {
+                "revise".to_string()
+            }
+        });
 
     if !matches!(action.as_str(), "keep" | "revise" | "remove") {
         return Err("包含不支持的 action".to_string());

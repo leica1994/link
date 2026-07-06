@@ -8,6 +8,10 @@ use crate::transcription::{
     normalize_subtitle_format, serialize_segments_for_export, write_text_file, SubtitleFormat,
     TranscriptionSegment,
 };
+use crate::workbench_checkpoint::{
+    load_checkpoint, mark_checkpoint_active, mark_checkpoint_done, mark_checkpoint_failed,
+    WorkbenchCheckpointContext,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -161,6 +165,19 @@ struct TranslationChunkResult {
     entries: Vec<(usize, String)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationRangeCheckpoint {
+    segments: Vec<TranscriptionSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationReviewRangeCheckpoint {
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+}
+
 #[derive(Debug, Clone)]
 enum TranslationChunkError {
     NetworkError(String),    // 网络/API错误，不重试翻译
@@ -225,10 +242,12 @@ pub(crate) async fn run_subtitle_translation_workflow(
         request,
         settings,
         None,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_subtitle_translation_workflow_with_sink(
     app: AppHandle,
     ai_service: &AiService,
@@ -237,6 +256,7 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
     request: SubtitleTranslationRequest,
     settings: AppSettings,
     progress_sink: Option<SubtitleTranslationProgressSink>,
+    checkpoint: Option<(&SettingsStore, WorkbenchCheckpointContext)>,
 ) -> Result<SubtitleTranslationResult, String> {
     let progress_context = ProgressContext::from_request(&request);
     let log_session = app_logger.start_session("subtitle_translation")?;
@@ -332,6 +352,9 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
             &warnings,
         );
 
+        let translation_checkpoint = checkpoint
+            .as_ref()
+            .map(|(store, context)| (*store, context.child("subtitle-translation")));
         let translation_result = translate_subtitles(
             &settings,
             ai_service,
@@ -349,6 +372,9 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
                 );
                 emitter.emit(message, &source_segments, snapshot, &combined_warnings);
             },
+            translation_checkpoint
+                .as_ref()
+                .map(|(store, context)| (*store, context)),
         )
         .await?;
         translated_segments = translation_result.segments;
@@ -380,6 +406,9 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
                 &warnings,
             );
 
+            let review_checkpoint = checkpoint
+                .as_ref()
+                .map(|(store, context)| (*store, context.child("ai-subtitle-review")));
             let review_result = review_translated_subtitles(
                 &settings,
                 ai_service,
@@ -402,6 +431,9 @@ pub(crate) async fn run_subtitle_translation_workflow_with_sink(
                         &combined_warnings,
                     );
                 },
+                review_checkpoint
+                    .as_ref()
+                    .map(|(store, context)| (*store, context)),
             )
             .await;
             source_segments = review_result.source_segments;
@@ -690,6 +722,7 @@ async fn translate_subtitles<F>(
     source_segments: &[TranscriptionSegment],
     mut translated_segments: Vec<TranscriptionSegment>,
     mut report: F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
 ) -> Result<SubtitleProcessingResult, String>
 where
     F: FnMut(u8, &str, &str, &[TranscriptionSegment], &[String]),
@@ -725,15 +758,55 @@ where
     let mut next_chunk_index = 0usize;
     let mut failed_chunks = 0usize;
     let mut warnings = Vec::new();
+    let mut completed = 0usize;
+    let mut checkpoint_done_chunks = HashSet::new();
+
+    if let Some((store, context)) = checkpoint {
+        for chunk in &chunks {
+            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
+            match load_checkpoint::<TranslationRangeCheckpoint>(store, context, &checkpoint_key) {
+                Ok(Some(payload)) if !payload.segments.is_empty() => {
+                    apply_checkpoint_segments(
+                        &mut translated_segments,
+                        chunk.start_index,
+                        payload.segments,
+                    );
+                    checkpoint_done_chunks.insert(chunk.start_index);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "subtitle_translation_checkpoint_load_failed",
+                    "读取字幕翻译检查点失败，将重新执行批次",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
+    }
 
     while next_chunk_index < chunks.len() && futures.len() < max_active {
         let chunk = chunks[next_chunk_index].clone();
+        if checkpoint_done_chunks.contains(&chunk.start_index) {
+            next_chunk_index += 1;
+            continue;
+        }
         mark_range_status(
             &mut translated_segments,
             chunk.start_index,
             chunk.end_index,
             "translating",
         );
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(
+                store,
+                context,
+                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+            );
+        }
         futures.push(run_translation_chunk(
             settings,
             ai_service,
@@ -743,14 +816,13 @@ where
         next_chunk_index += 1;
     }
     report(
-        0,
+        stage_progress(0, 100, completed, total),
         "AI 字幕翻译中",
         "active",
         &translated_segments,
         &warnings,
     );
 
-    let mut completed = 0usize;
     while let Some(result) = futures.next().await {
         completed += 1;
 
@@ -767,6 +839,18 @@ where
                     result.chunk.end_index,
                     "translated",
                 );
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &translation_range_checkpoint(
+                            &translated_segments,
+                            result.chunk.start_index,
+                            result.chunk.end_index,
+                        ),
+                    );
+                }
             }
             Err((chunk, error)) => {
                 // 区分错误类型记录日志
@@ -790,6 +874,14 @@ where
                     "kept",
                 );
                 failed_chunks += 1;
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                        &error_message,
+                    );
+                }
                 log_session.warn(
                     "subtitle_translation_chunk_failed",
                     "字幕翻译批次最终失败，已保留原文",
@@ -805,12 +897,23 @@ where
 
         while next_chunk_index < chunks.len() && futures.len() < max_active {
             let chunk = chunks[next_chunk_index].clone();
+            if checkpoint_done_chunks.contains(&chunk.start_index) {
+                next_chunk_index += 1;
+                continue;
+            }
             mark_range_status(
                 &mut translated_segments,
                 chunk.start_index,
                 chunk.end_index,
                 "translating",
             );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                );
+            }
             futures.push(run_translation_chunk(
                 settings,
                 ai_service,
@@ -873,6 +976,7 @@ async fn review_translated_subtitles<F>(
     mut source_segments: Vec<TranscriptionSegment>,
     mut translated_segments: Vec<TranscriptionSegment>,
     mut report: F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
 ) -> SubtitleReviewResult
 where
     F: FnMut(u8, &str, &str, &SubtitleReviewSnapshot, &[String]),
@@ -913,9 +1017,54 @@ where
     let mut next_chunk_index = 0usize;
     let mut failed_chunks = 0usize;
     let mut warnings = Vec::new();
+    let mut completed = 0usize;
+    let mut checkpoint_done_chunks = HashSet::new();
+
+    if let Some((store, context)) = checkpoint {
+        for chunk in &chunks {
+            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
+            match load_checkpoint::<TranslationReviewRangeCheckpoint>(
+                store,
+                context,
+                &checkpoint_key,
+            ) {
+                Ok(Some(payload))
+                    if !payload.source_segments.is_empty()
+                        && !payload.translated_segments.is_empty() =>
+                {
+                    apply_checkpoint_segments(
+                        &mut source_segments,
+                        chunk.start_index,
+                        payload.source_segments,
+                    );
+                    apply_checkpoint_segments(
+                        &mut translated_segments,
+                        chunk.start_index,
+                        payload.translated_segments,
+                    );
+                    checkpoint_done_chunks.insert(chunk.start_index);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "translation_review_checkpoint_load_failed",
+                    "读取译文审核检查点失败，将重新执行批次",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
+    }
 
     while next_chunk_index < chunks.len() && futures.len() < max_active {
         let chunk = chunks[next_chunk_index].clone();
+        if checkpoint_done_chunks.contains(&chunk.start_index) {
+            next_chunk_index += 1;
+            continue;
+        }
         let source_entries = source_chunks
             .get(next_chunk_index)
             .map(|chunk| chunk.entries.clone())
@@ -932,6 +1081,13 @@ where
             chunk.end_index,
             "reviewing",
         );
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(
+                store,
+                context,
+                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+            );
+        }
         futures.push(run_translation_review_chunk(
             settings,
             ai_service,
@@ -945,9 +1101,14 @@ where
         source_segments: source_segments.clone(),
         translated_segments: translated_segments.clone(),
     };
-    report(0, "AI 字幕审核中", "active", &snapshot, &warnings);
+    report(
+        stage_progress(0, 100, completed, total),
+        "AI 字幕审核中",
+        "active",
+        &snapshot,
+        &warnings,
+    );
 
-    let mut completed = 0usize;
     while let Some(result) = futures.next().await {
         completed += 1;
 
@@ -985,6 +1146,19 @@ where
                     result.chunk.end_index,
                     "reviewed",
                 );
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &translation_review_range_checkpoint(
+                            &source_segments,
+                            &translated_segments,
+                            result.chunk.start_index,
+                            result.chunk.end_index,
+                        ),
+                    );
+                }
             }
             Err((chunk, error)) => {
                 mark_range_status(
@@ -1000,6 +1174,14 @@ where
                     "translated",
                 );
                 failed_chunks += 1;
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                        &error,
+                    );
+                }
                 log_session.warn(
                     "ai_subtitle_review_chunk_failed",
                     "AI 字幕审核批次失败，已保留当前字幕",
@@ -1015,6 +1197,10 @@ where
 
         while next_chunk_index < chunks.len() && futures.len() < max_active {
             let chunk = chunks[next_chunk_index].clone();
+            if checkpoint_done_chunks.contains(&chunk.start_index) {
+                next_chunk_index += 1;
+                continue;
+            }
             let source_entries = source_chunks
                 .get(next_chunk_index)
                 .map(|chunk| chunk.entries.clone())
@@ -1031,6 +1217,13 @@ where
                 chunk.end_index,
                 "reviewing",
             );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                );
+            }
             futures.push(run_translation_review_chunk(
                 settings,
                 ai_service,
@@ -2216,6 +2409,56 @@ fn copy_source_range_to_target(
             translated_segments.get_mut(index),
         ) {
             target.text = source.text.clone();
+        }
+    }
+}
+
+fn chunk_checkpoint_key(start_index: usize, end_index: usize) -> String {
+    format!("chunk-{start_index}-{end_index}")
+}
+
+fn translation_range_checkpoint(
+    segments: &[TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+) -> TranslationRangeCheckpoint {
+    TranslationRangeCheckpoint {
+        segments: checkpoint_segment_range(segments, start_index, end_index),
+    }
+}
+
+fn translation_review_range_checkpoint(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &[TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+) -> TranslationReviewRangeCheckpoint {
+    TranslationReviewRangeCheckpoint {
+        source_segments: checkpoint_segment_range(source_segments, start_index, end_index),
+        translated_segments: checkpoint_segment_range(translated_segments, start_index, end_index),
+    }
+}
+
+fn checkpoint_segment_range(
+    segments: &[TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+) -> Vec<TranscriptionSegment> {
+    if start_index >= segments.len() {
+        return Vec::new();
+    }
+    let end_index = end_index.min(segments.len().saturating_sub(1));
+    segments[start_index..=end_index].to_vec()
+}
+
+fn apply_checkpoint_segments(
+    segments: &mut [TranscriptionSegment],
+    start_index: usize,
+    checkpoint_segments: Vec<TranscriptionSegment>,
+) {
+    for (offset, checkpoint_segment) in checkpoint_segments.into_iter().enumerate() {
+        if let Some(segment) = segments.get_mut(start_index + offset) {
+            *segment = checkpoint_segment;
         }
     }
 }

@@ -17,6 +17,7 @@ mod subtitle_export;
 mod subtitle_style;
 mod subtitle_translation;
 mod transcription;
+mod workbench_checkpoint;
 mod youtube_monitor;
 mod ytdlp;
 
@@ -39,7 +40,7 @@ use home_tasks::{
 use home_workbench::{
     add_home_workbench_subtitle_input, add_home_workbench_video_input, get_home_workbench,
     remove_home_workbench_subtitle_input, remove_home_workbench_video_input,
-    save_home_workbench_options, start_home_workbench,
+    save_home_workbench_options, start_home_workbench, HomeWorkbenchRuntime,
 };
 use settings::{
     export_settings_backup, import_settings_backup, load_settings, save_settings, SettingsStore,
@@ -103,11 +104,13 @@ pub fn run() {
                 })?;
             let dubbing_tts_scheduler = DubbingTtsScheduler::new();
             let youtube_monitor_service = YoutubeMonitorService::new();
+            let home_workbench_runtime = HomeWorkbenchRuntime::new();
             app.manage(store);
             app.manage(ai_service);
             app.manage(app_logger);
             app.manage(dubbing_tts_scheduler);
             app.manage(youtube_monitor_service);
+            app.manage(home_workbench_runtime);
 
             let window_config = app
                 .config()

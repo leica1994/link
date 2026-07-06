@@ -2684,12 +2684,22 @@ html[data-theme='dark'] .home-info-strip {
   background: rgba(184, 59, 59, 0.1);
 }
 
+.home-info-strip.warning {
+  border-color: rgba(185, 121, 36, 0.28);
+  color: #9b650f;
+  background: rgba(185, 121, 36, 0.1);
+}
+
 html[data-theme='dark'] .home-info-strip.ready {
   color: #8ed0a8;
 }
 
 html[data-theme='dark'] .home-info-strip.error {
   color: #f0a2a2;
+}
+
+html[data-theme='dark'] .home-info-strip.warning {
+  color: #e0b46a;
 }
 
 .home-detail-stats {
@@ -2939,7 +2949,8 @@ html[data-theme='dark'] .home-workbench-stage {
   background: rgba(47, 138, 85, 0.1);
 }
 
-.home-workbench-stage.failed .home-workbench-stage-mark {
+.home-workbench-stage.failed .home-workbench-stage-mark,
+.home-workbench-stage.interrupted .home-workbench-stage-mark {
   border-color: rgba(184, 59, 59, 0.28);
   color: #9f3030;
   background: rgba(184, 59, 59, 0.1);
@@ -2950,7 +2961,8 @@ html[data-theme='dark'] .home-workbench-stage.skipped .home-workbench-stage-mark
   color: #8ed0a8;
 }
 
-html[data-theme='dark'] .home-workbench-stage.failed .home-workbench-stage-mark {
+html[data-theme='dark'] .home-workbench-stage.failed .home-workbench-stage-mark,
+html[data-theme='dark'] .home-workbench-stage.interrupted .home-workbench-stage-mark {
   color: #f0a2a2;
 }
 

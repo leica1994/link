@@ -1,7 +1,9 @@
 use crate::ai::AiService;
 use crate::app_log::{AppLogger, LogSession};
 use crate::app_paths;
-use crate::content_copy::{generate_content_copy_record, GenerateContentCopyRequest};
+use crate::content_copy::{
+    generate_content_copy_record_with_checkpoint, GenerateContentCopyRequest,
+};
 use crate::dubbing::{
     prepare_dubbing_material_internal, start_dubbing_task_internal, DubbingTaskArtifact,
     DubbingTaskOptions, DubbingTaskSnapshot, PrepareDubbingMaterialRequest,
@@ -22,13 +24,16 @@ use crate::subtitle_translation::{
     SubtitleTranslationResult,
 };
 use crate::transcription::{
-    normalize_subtitle_format, run_transcription_workflow_with_sink, serialize_segments_for_export,
-    write_text_file, TranscriptionProgress, TranscriptionProgressSink, TranscriptionRequest,
+    normalize_subtitle_format, run_transcription_workflow_with_checkpoint,
+    serialize_segments_for_export, write_text_file, TranscriptionProgress,
+    TranscriptionProgressSink, TranscriptionRequest,
 };
+use crate::workbench_checkpoint::{checkpoint_hash, WorkbenchCheckpointContext};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -41,6 +46,7 @@ const WORKBENCH_STATUS_IDLE: &str = "idle";
 const WORKBENCH_STATUS_RUNNING: &str = "running";
 const WORKBENCH_STATUS_DONE: &str = "done";
 const WORKBENCH_STATUS_FAILED: &str = "failed";
+const WORKBENCH_STATUS_INTERRUPTED: &str = "interrupted";
 
 const STAGE_DOWNLOAD_VIDEO: &str = "download-video";
 const STAGE_PREPARE_SUBTITLE: &str = "prepare-subtitle";
@@ -54,6 +60,7 @@ const STAGE_STATUS_ACTIVE: &str = "active";
 const STAGE_STATUS_DONE: &str = "done";
 const STAGE_STATUS_SKIPPED: &str = "skipped";
 const STAGE_STATUS_FAILED: &str = "failed";
+const STAGE_STATUS_INTERRUPTED: &str = "interrupted";
 
 const SUBTITLE_SOURCE_TRANSCRIBE: &str = "transcribe";
 const SUBTITLE_SOURCE_DOWNLOADED: &str = "downloaded";
@@ -176,14 +183,68 @@ struct ExportedFinalPaths {
     subtitle_path: PathBuf,
 }
 
+pub struct HomeWorkbenchRuntime {
+    active_task_ids: Mutex<HashSet<String>>,
+}
+
+impl HomeWorkbenchRuntime {
+    pub fn new() -> Self {
+        Self {
+            active_task_ids: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn start(&self, task_id: &str) -> Result<HomeWorkbenchRunGuard<'_>, String> {
+        let mut active = self
+            .active_task_ids
+            .lock()
+            .map_err(|error| format!("工作台运行状态锁定失败: {error}"))?;
+        if active.contains(task_id) {
+            return Err("工作台任务正在执行中".to_string());
+        }
+        active.insert(task_id.to_string());
+        Ok(HomeWorkbenchRunGuard {
+            runtime: self,
+            task_id: task_id.to_string(),
+        })
+    }
+
+    fn is_active(&self, task_id: &str) -> Result<bool, String> {
+        self.active_task_ids
+            .lock()
+            .map(|active| active.contains(task_id))
+            .map_err(|error| format!("工作台运行状态锁定失败: {error}"))
+    }
+}
+
+struct HomeWorkbenchRunGuard<'a> {
+    runtime: &'a HomeWorkbenchRuntime,
+    task_id: String,
+}
+
+impl Drop for HomeWorkbenchRunGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.runtime.active_task_ids.lock() {
+            active.remove(&self.task_id);
+        }
+    }
+}
+
 #[tauri::command]
 pub fn get_home_workbench(
     store: tauri::State<'_, SettingsStore>,
+    runtime: tauri::State<'_, HomeWorkbenchRuntime>,
     request: HomeWorkbenchTaskRequest,
 ) -> Result<HomeWorkbenchSnapshot, String> {
     let settings = store.load()?;
+    let should_interrupt_stale_running = !runtime.is_active(&request.task_id)?;
     store.with_connection(|connection| {
-        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+        read_or_create_workbench_snapshot(
+            connection,
+            &request.task_id,
+            &settings,
+            should_interrupt_stale_running,
+        )
     })
 }
 
@@ -220,7 +281,7 @@ pub fn save_home_workbench_options(
             existing.created_at.as_str(),
             &now,
         )?;
-        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings, false)
     })
 }
 
@@ -267,7 +328,7 @@ pub fn add_home_workbench_video_input(
     )?;
 
     store.with_connection(|connection| {
-        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings, false)
     })
 }
 
@@ -317,7 +378,7 @@ pub fn remove_home_workbench_video_input(
             &record.created_at,
             &now,
         )?;
-        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings, false)
     })?;
     emit_workbench_progress(&app, &snapshot);
     Ok(snapshot)
@@ -413,7 +474,7 @@ pub fn add_home_workbench_subtitle_input(
     })?;
 
     let snapshot = store.with_connection(|connection| {
-        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings, false)
     })?;
     emit_workbench_progress(&app, &snapshot);
     Ok(snapshot)
@@ -488,7 +549,7 @@ pub fn remove_home_workbench_subtitle_input(
             )?;
         }
 
-        read_or_create_workbench_snapshot(connection, &request.task_id, &settings)
+        read_or_create_workbench_snapshot(connection, &request.task_id, &settings, false)
     })?;
     emit_workbench_progress(&app, &snapshot);
     Ok(snapshot)
@@ -509,6 +570,7 @@ async fn run_home_workbench(
     let store = app.state::<SettingsStore>();
     let ai_service = app.state::<AiService>();
     let app_logger = app.state::<AppLogger>();
+    let runtime = app.state::<HomeWorkbenchRuntime>();
     let log_session = app_logger.start_session("home_workbench")?;
     let mut settings = store.load()?;
     let mut options = normalize_options(request.options, &settings);
@@ -516,6 +578,7 @@ async fn run_home_workbench(
     store.save(&settings)?;
     ai_service.update_thread_count(settings.translation_thread_count)?;
     let task_id = request.task_id;
+    let _run_guard = runtime.start(&task_id)?;
     log_session.info(
         "workbench_start",
         "开始执行首页工作台任务",
@@ -707,6 +770,7 @@ async fn run_home_workbench_inner(
         store,
         ai_service,
         app_logger,
+        settings,
         task_id,
         &final_video_path.1,
     )
@@ -966,7 +1030,16 @@ async fn prepare_subtitle(
     let mut run_settings = settings.clone();
     apply_transcription_options(&mut run_settings, options);
     let progress_sink = workbench_transcription_progress_sink(app.clone(), task_id.to_string());
-    let result = run_transcription_workflow_with_sink(
+    let checkpoint_context = WorkbenchCheckpointContext::new(
+        task_id,
+        "prepare-subtitle:transcribe",
+        checkpoint_hash(&build_transcription_checkpoint_input(
+            video,
+            options,
+            &run_settings,
+        )),
+    );
+    let result = run_transcription_workflow_with_checkpoint(
         app,
         ai_service,
         app_logger,
@@ -981,6 +1054,8 @@ async fn prepare_subtitle(
         },
         run_settings,
         Some(progress_sink),
+        store,
+        checkpoint_context,
     )
     .await?;
     save_workbench_subtitle(
@@ -1039,7 +1114,17 @@ async fn prepare_reference_corrected_downloaded_subtitle(
         "downloaded-reference",
         reference_correction_state.clone(),
     );
-    let mut result = run_transcription_workflow_with_sink(
+    let checkpoint_context = WorkbenchCheckpointContext::new(
+        task_id,
+        "prepare-subtitle:downloaded-reference",
+        checkpoint_hash(&build_downloaded_reference_transcription_checkpoint_input(
+            &subtitle,
+            video,
+            options,
+            &run_settings,
+        )),
+    );
+    let mut result = run_transcription_workflow_with_checkpoint(
         app.clone(),
         ai_service,
         app_logger,
@@ -1054,6 +1139,8 @@ async fn prepare_reference_corrected_downloaded_subtitle(
         },
         run_settings,
         Some(progress_sink),
+        store,
+        checkpoint_context.clone(),
     )
     .await?;
 
@@ -1129,37 +1216,42 @@ async fn prepare_reference_corrected_downloaded_subtitle(
             })
             .collect::<Vec<_>>();
         let previous_warnings = warnings.clone();
-        let reference_log_session = app_logger.start_session("home_workbench_reference_correction")?;
-        let mut report_reference_correction = |progress: u8,
-                                                message: &str,
-                                                snapshot_segments: &[crate::transcription::TranscriptionSegment],
-                                                snapshot_warnings: &[String]| {
-            let mut combined_warnings = previous_warnings.clone();
-            combined_warnings.extend(snapshot_warnings.iter().cloned());
-            let mut state = reference_correction.clone();
-            if let Some(object) = state.as_object_mut() {
-                object.insert("status".to_string(), json!(if progress >= 100 { "done" } else { "active" }));
-                object.insert("progress".to_string(), json!(progress));
-                object.insert("message".to_string(), json!(message));
-            }
-            update_reference_correction_state(&reference_correction_state, state.clone());
-            let stage_progress = 96u8.saturating_add(progress.min(100) / 34).min(99);
-            let _ = update_stage_snapshot_from_app(
-                &app,
-                task_id,
-                STAGE_PREPARE_SUBTITLE,
-                stage_progress,
-                message,
-                json!({
-                    "mode": "downloaded-reference",
-                    "message": message,
-                    "stageProgress": serde_json::Value::Null,
-                    "segments": snapshot_segments,
-                    "warnings": combined_warnings,
-                    "referenceCorrection": state,
-                }),
-            );
-        };
+        let reference_log_session =
+            app_logger.start_session("home_workbench_reference_correction")?;
+        let mut report_reference_correction =
+            |progress: u8,
+             message: &str,
+             snapshot_segments: &[crate::transcription::TranscriptionSegment],
+             snapshot_warnings: &[String]| {
+                let mut combined_warnings = previous_warnings.clone();
+                combined_warnings.extend(snapshot_warnings.iter().cloned());
+                let mut state = reference_correction.clone();
+                if let Some(object) = state.as_object_mut() {
+                    object.insert(
+                        "status".to_string(),
+                        json!(if progress >= 100 { "done" } else { "active" }),
+                    );
+                    object.insert("progress".to_string(), json!(progress));
+                    object.insert("message".to_string(), json!(message));
+                }
+                update_reference_correction_state(&reference_correction_state, state.clone());
+                let stage_progress = 96u8.saturating_add(progress.min(100) / 34).min(99);
+                let _ = update_stage_snapshot_from_app(
+                    &app,
+                    task_id,
+                    STAGE_PREPARE_SUBTITLE,
+                    stage_progress,
+                    message,
+                    json!({
+                        "mode": "downloaded-reference",
+                        "message": message,
+                        "stageProgress": serde_json::Value::Null,
+                        "segments": snapshot_segments,
+                        "warnings": combined_warnings,
+                        "referenceCorrection": state,
+                    }),
+                );
+            };
         let correction_result = correct_subtitles_with_downloaded_reference(
             settings,
             ai_service,
@@ -1167,6 +1259,7 @@ async fn prepare_reference_corrected_downloaded_subtitle(
             result.segments,
             &references,
             &mut report_reference_correction,
+            Some((store, &checkpoint_context.child("reference-correction"))),
         )
         .await;
         result.segments = correction_result.segments;
@@ -1182,12 +1275,8 @@ async fn prepare_reference_corrected_downloaded_subtitle(
 
     result.warnings = warnings;
     let output_format = normalize_subtitle_format(&result.output_format);
-    result.subtitle_text = serialize_segments_for_export(
-        &result.segments,
-        output_format,
-        Some(store),
-        settings,
-    )?;
+    result.subtitle_text =
+        serialize_segments_for_export(&result.segments, output_format, Some(store), settings)?;
 
     let mut metadata = json!({
         "mode": "downloaded-reference",
@@ -1282,6 +1371,15 @@ async fn translate_subtitle(
     let mut run_settings = settings.clone();
     apply_translation_options(&mut run_settings, options);
     let progress_sink = workbench_translation_progress_sink(app.clone(), task_id.to_string());
+    let checkpoint_context = WorkbenchCheckpointContext::new(
+        task_id,
+        "translation",
+        checkpoint_hash(&build_translation_checkpoint_input(
+            subtitle_path,
+            options,
+            &run_settings,
+        )),
+    );
     let result = run_subtitle_translation_workflow_with_sink(
         app,
         ai_service,
@@ -1294,6 +1392,7 @@ async fn translate_subtitle(
         },
         run_settings,
         Some(progress_sink),
+        Some((store, checkpoint_context)),
     )
     .await?;
     save_translation_result(store, task_id, &result)
@@ -1400,6 +1499,7 @@ async fn generate_workbench_content_copy(
     store: &SettingsStore,
     ai_service: &AiService,
     app_logger: &AppLogger,
+    settings: &AppSettings,
     task_id: &str,
     subtitle_path: &Path,
 ) -> Result<(), String> {
@@ -1436,16 +1536,27 @@ async fn generate_workbench_content_copy(
 
     let task =
         store.with_connection(|connection| read_home_video_task_by_id(connection, task_id))?;
-    let record = generate_content_copy_record(
+    let extra_context = build_workbench_content_copy_context(&task);
+    let checkpoint_context = WorkbenchCheckpointContext::new(
+        task_id,
+        "content-copy",
+        checkpoint_hash(&build_content_copy_checkpoint_input(
+            subtitle_path,
+            &extra_context,
+            settings,
+        )),
+    );
+    let record = generate_content_copy_record_with_checkpoint(
         store,
         ai_service,
         app_logger,
         GenerateContentCopyRequest {
             subtitle_path: subtitle_path_text.clone(),
-            extra_context: build_workbench_content_copy_context(&task),
+            extra_context,
             platform: None,
             source: Some("workbench".to_string()),
         },
+        checkpoint_context,
     )
     .await?;
 
@@ -1808,6 +1919,122 @@ fn build_downloaded_subtitle_cache_key(
     })
 }
 
+fn build_transcription_checkpoint_input(
+    video: &HomeVideoDownload,
+    options: &HomeWorkbenchOptions,
+    settings: &AppSettings,
+) -> Value {
+    json!({
+        "videoPath": &video.file_path,
+        "videoFileSize": video.file_size,
+        "videoUpdatedAt": &video.updated_at,
+        "transcriptionModel": &options.transcription_model,
+        "sourceLanguage": &options.source_language,
+        "transcriptionFormat": &options.transcription_format,
+        "smartSegmentationEnabled": options.is_smart_segmentation_enabled,
+        "subtitleCorrectionEnabled": options.is_subtitle_correction_enabled,
+        "aiSubtitleReviewEnabled": options.is_ai_subtitle_review_enabled,
+        "aiSubtitleReviewMode": &options.ai_subtitle_review_mode,
+        "videoContentType": &options.video_content_type,
+        "translationBatchSize": options.translation_batch_size,
+        "translationThreadCount": options.translation_thread_count,
+        "selectedLlmService": &settings.selected_llm_service,
+        "llmConfig": settings.llm_configs.get(&settings.selected_llm_service).map(|config| {
+            json!({
+                "baseUrl": &config.base_url,
+                "model": &config.model,
+                "reasoningEffort": &config.reasoning_effort,
+                "streaming": config.is_streaming,
+            })
+        }),
+    })
+}
+
+fn build_downloaded_reference_transcription_checkpoint_input(
+    subtitle: &HomeVideoSubtitle,
+    video: &HomeVideoDownload,
+    options: &HomeWorkbenchOptions,
+    settings: &AppSettings,
+) -> Value {
+    let mut value = build_transcription_checkpoint_input(video, options, settings);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("subtitleId".to_string(), json!(&subtitle.id));
+        object.insert("subtitlePath".to_string(), json!(&subtitle.file_path));
+        object.insert("subtitleFileSize".to_string(), json!(subtitle.file_size));
+        object.insert("subtitleUpdatedAt".to_string(), json!(&subtitle.updated_at));
+        object.insert(
+            "referenceMatchVersion".to_string(),
+            json!(reference_match_version()),
+        );
+    }
+    value
+}
+
+fn build_translation_checkpoint_input(
+    subtitle_path: &Path,
+    options: &HomeWorkbenchOptions,
+    settings: &AppSettings,
+) -> Value {
+    json!({
+        "subtitle": subtitle_file_checkpoint_metadata(subtitle_path),
+        "translationFormat": &options.translation_format,
+        "translationService": &options.translation_service,
+        "needsReflectionTranslation": options.needs_reflection_translation,
+        "translationBatchSize": options.translation_batch_size,
+        "translationThreadCount": options.translation_thread_count,
+        "videoContentType": &options.video_content_type,
+        "outputMode": &options.output_mode,
+        "subtitleTranslationEnabled": options.is_subtitle_translation_enabled,
+        "aiSubtitleReviewEnabled": options.is_ai_subtitle_review_enabled,
+        "aiSubtitleReviewMode": &options.ai_subtitle_review_mode,
+        "targetLanguage": &options.target_language,
+        "selectedLlmService": &settings.selected_llm_service,
+        "llmConfig": settings.llm_configs.get(&settings.selected_llm_service).map(|config| {
+            json!({
+                "baseUrl": &config.base_url,
+                "model": &config.model,
+                "reasoningEffort": &config.reasoning_effort,
+                "streaming": config.is_streaming,
+            })
+        }),
+    })
+}
+
+fn build_content_copy_checkpoint_input(
+    subtitle_path: &Path,
+    extra_context: &str,
+    settings: &AppSettings,
+) -> Value {
+    json!({
+        "subtitle": subtitle_file_checkpoint_metadata(subtitle_path),
+        "extraContext": extra_context,
+        "platform": "bilibili",
+        "titleCount": 6,
+        "coverTextCount": 4,
+        "selectedLlmService": &settings.selected_llm_service,
+        "llmConfig": settings.llm_configs.get(&settings.selected_llm_service).map(|config| {
+            json!({
+                "baseUrl": &config.base_url,
+                "model": &config.model,
+                "reasoningEffort": &config.reasoning_effort,
+                "streaming": config.is_streaming,
+            })
+        }),
+    })
+}
+
+fn subtitle_file_checkpoint_metadata(path: &Path) -> Value {
+    let metadata = fs::metadata(path).ok();
+    json!({
+        "path": path.to_string_lossy(),
+        "fileSize": metadata.as_ref().map(|metadata| metadata.len()),
+        "modified": metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+    })
+}
+
 fn initialize_run(
     store: &SettingsStore,
     task_id: &str,
@@ -1822,7 +2049,7 @@ fn initialize_run(
         for stage in &mut existing.stages {
             if matches!(
                 stage.status.as_str(),
-                STAGE_STATUS_ACTIVE | STAGE_STATUS_FAILED
+                STAGE_STATUS_ACTIVE | STAGE_STATUS_FAILED | STAGE_STATUS_INTERRUPTED
             ) {
                 stage.status = STAGE_STATUS_PENDING.to_string();
                 stage.progress = stage.progress.min(99);
@@ -1876,7 +2103,7 @@ fn mark_workbench_done(
             &record.created_at,
             &now,
         )?;
-        read_or_create_workbench_snapshot(connection, task_id, &settings)
+        read_or_create_workbench_snapshot(connection, task_id, &settings, false)
     })?;
     emit_workbench_progress(app, &snapshot);
     Ok(snapshot)
@@ -1924,7 +2151,7 @@ fn mark_workbench_failed(
             &record.created_at,
             &now,
         )?;
-        read_or_create_workbench_snapshot(connection, task_id, &settings)
+        read_or_create_workbench_snapshot(connection, task_id, &settings, false)
     })
 }
 
@@ -2057,7 +2284,7 @@ fn update_stage(
             &record.created_at,
             &now,
         )?;
-        read_or_create_workbench_snapshot(connection, task_id, &settings)
+        read_or_create_workbench_snapshot(connection, task_id, &settings, false)
     })?;
     emit_workbench_progress(app, &snapshot);
     Ok(snapshot)
@@ -2089,6 +2316,7 @@ fn read_or_create_workbench_snapshot(
     connection: &rusqlite::Connection,
     task_id: &str,
     settings: &AppSettings,
+    should_interrupt_stale_running: bool,
 ) -> Result<HomeWorkbenchSnapshot, String> {
     ensure_home_task_exists(connection, task_id)?;
     let now = Utc::now().to_rfc3339();
@@ -2117,6 +2345,10 @@ fn read_or_create_workbench_snapshot(
     let before_stage_count = record.stages.len();
     merge_workbench_stages(&mut record.stages, &record.options);
     if record.stages.len() != before_stage_count {
+        record_changed = true;
+    }
+    if should_interrupt_stale_running && record.status == WORKBENCH_STATUS_RUNNING {
+        mark_record_interrupted(&mut record);
         record_changed = true;
     }
     if record.status != WORKBENCH_STATUS_RUNNING {
@@ -2172,6 +2404,59 @@ fn read_or_create_workbench_snapshot(
         created_at: record.created_at,
         updated_at: record.updated_at,
     })
+}
+
+fn mark_record_interrupted(record: &mut HomeWorkbenchRecord) {
+    record.status = WORKBENCH_STATUS_INTERRUPTED.to_string();
+    record.progress = overall_progress(&record.stages);
+    record.message = "上次执行已中断，点击继续执行".to_string();
+    record.error_message.clear();
+    for stage in &mut record.stages {
+        if stage.status == STAGE_STATUS_ACTIVE {
+            stage.status = STAGE_STATUS_INTERRUPTED.to_string();
+            stage.progress = stage.progress.min(99);
+            stage.message = "已中断，点击继续执行".to_string();
+            mark_snapshot_interrupted(&mut stage.snapshot);
+        }
+    }
+}
+
+fn mark_snapshot_interrupted(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let status_is_processing = object
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(is_processing_snapshot_status);
+            if status_is_processing {
+                object.insert("status".to_string(), json!(STAGE_STATUS_INTERRUPTED));
+                object.insert("message".to_string(), json!("已中断，点击继续执行"));
+            }
+            for child in object.values_mut() {
+                mark_snapshot_interrupted(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                mark_snapshot_interrupted(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_processing_snapshot_status(status: &str) -> bool {
+    matches!(
+        status,
+        STAGE_STATUS_ACTIVE
+            | "segmenting"
+            | "correcting"
+            | "translating"
+            | "reviewing"
+            | "optimizing"
+            | "synthesizing"
+            | "processing"
+    )
 }
 
 fn sync_idle_workbench_stages(

@@ -783,6 +783,20 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS home_workbench_checkpoints (
+                task_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                checkpoint_key TEXT NOT NULL,
+                input_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                payload TEXT NOT NULL DEFAULT 'null',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(task_id, scope, checkpoint_key),
+                FOREIGN KEY(task_id) REFERENCES home_video_tasks(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS content_copy_records (
                 id TEXT PRIMARY KEY NOT NULL,
                 source TEXT NOT NULL DEFAULT 'copywriting',
@@ -859,6 +873,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON home_workbench_tasks(updated_at);
             CREATE INDEX IF NOT EXISTS idx_home_workbench_artifacts_task
                 ON home_workbench_artifacts(task_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_home_workbench_checkpoints_task
+                ON home_workbench_checkpoints(task_id, scope, updated_at);
             CREATE INDEX IF NOT EXISTS idx_content_copy_records_updated_at
                 ON content_copy_records(updated_at);
             CREATE INDEX IF NOT EXISTS idx_subtitle_styles_name

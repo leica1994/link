@@ -6,6 +6,9 @@ use crate::settings::{AppSettings, SettingsStore};
 use crate::subtitle_ai::{correct_subtitles, review_source_subtitles, smart_segment_subtitles};
 use crate::subtitle_export::serialize_styled_ass;
 use crate::subtitle_style::get_selected_subtitle_style;
+use crate::workbench_checkpoint::{
+    load_checkpoint, mark_checkpoint_active, mark_checkpoint_done, WorkbenchCheckpointContext,
+};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -239,6 +242,14 @@ struct RawTranscriptionResult {
     segments: Vec<TranscriptionSegment>,
     output_path: PathBuf,
     output_format: SubtitleFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTranscriptionCheckpoint {
+    segments: Vec<TranscriptionSegment>,
+    output_path: String,
+    output_format: String,
 }
 
 struct SnapshotEmitter {
@@ -746,6 +757,31 @@ pub(crate) async fn run_transcription_workflow_with_sink(
     .await
 }
 
+pub(crate) async fn run_transcription_workflow_with_checkpoint(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings_store: Option<&SettingsStore>,
+    request: TranscriptionRequest,
+    settings: AppSettings,
+    progress_sink: Option<TranscriptionProgressSink>,
+    checkpoint_store: &SettingsStore,
+    checkpoint_context: WorkbenchCheckpointContext,
+) -> Result<TranscriptionResult, String> {
+    run_transcription_workflow_with_transform_and_checkpoint(
+        app,
+        ai_service,
+        app_logger,
+        settings_store,
+        request,
+        settings,
+        progress_sink,
+        None,
+        Some((checkpoint_store, checkpoint_context)),
+    )
+    .await
+}
+
 pub(crate) async fn run_transcription_workflow_with_transform(
     app: AppHandle,
     ai_service: &AiService,
@@ -755,6 +791,32 @@ pub(crate) async fn run_transcription_workflow_with_transform(
     settings: AppSettings,
     progress_sink: Option<TranscriptionProgressSink>,
     transform_raw_segments: Option<RawTranscriptionTransform>,
+) -> Result<TranscriptionResult, String> {
+    run_transcription_workflow_with_transform_and_checkpoint(
+        app,
+        ai_service,
+        app_logger,
+        settings_store,
+        request,
+        settings,
+        progress_sink,
+        transform_raw_segments,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_transcription_workflow_with_transform_and_checkpoint(
+    app: AppHandle,
+    ai_service: &AiService,
+    app_logger: &AppLogger,
+    settings_store: Option<&SettingsStore>,
+    request: TranscriptionRequest,
+    settings: AppSettings,
+    progress_sink: Option<TranscriptionProgressSink>,
+    transform_raw_segments: Option<RawTranscriptionTransform>,
+    checkpoint: Option<(&SettingsStore, WorkbenchCheckpointContext)>,
 ) -> Result<TranscriptionResult, String> {
     let progress_context = ProgressContext::from_request(&request);
     let log_session = app_logger.start_session("transcription")?;
@@ -804,37 +866,91 @@ pub(crate) async fn run_transcription_workflow_with_transform(
         &progress_context,
     );
 
-    let transcription_app = app.clone();
-    let raw_log_session = log_session.clone();
-    let raw_workflow_progress = workflow_progress.clone();
-    let raw_progress_sink = progress_sink.clone();
-    let raw_progress_context = progress_context.clone();
-    let raw_result = match tauri::async_runtime::spawn_blocking(move || {
-        run_transcription(
-            transcription_app,
-            request,
-            raw_log_session,
-            raw_workflow_progress,
-            raw_progress_sink,
-            raw_progress_context,
-        )
-    })
-    .await
+    let raw_checkpoint_context = checkpoint
+        .as_ref()
+        .map(|(_, context)| context.child("raw-transcription"));
+    let raw_result = if let (Some((checkpoint_store, _)), Some(raw_context)) =
+        (checkpoint.as_ref(), raw_checkpoint_context.as_ref())
     {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            log_session.error("asr_failed", "语音转录阶段失败", json!({ "error": &error }));
-            return Err(error);
+        match load_checkpoint::<RawTranscriptionCheckpoint>(
+            checkpoint_store,
+            raw_context,
+            "raw-transcription",
+        ) {
+            Ok(Some(payload)) if !payload.segments.is_empty() => {
+                workflow_progress.set_stage(
+                    ProgressStage::Transcription,
+                    100,
+                    "复用已转录字幕",
+                    "done",
+                );
+                emit_progress_event(
+                    &app,
+                    overall_progress(&workflow_progress.snapshot()),
+                    "复用已转录字幕",
+                    Some(workflow_progress.snapshot()),
+                    None,
+                    Some(payload.segments.clone()),
+                    &[],
+                    progress_sink.as_ref(),
+                    &progress_context,
+                );
+                RawTranscriptionResult {
+                    segments: payload.segments,
+                    output_path: PathBuf::from(payload.output_path),
+                    output_format: normalize_subtitle_format(&payload.output_format),
+                }
+            }
+            Ok(_) => {
+                mark_checkpoint_active(checkpoint_store, raw_context, "raw-transcription")?;
+                let raw_result = run_raw_transcription_with_progress(
+                    app.clone(),
+                    request,
+                    log_session.clone(),
+                    workflow_progress.clone(),
+                    progress_sink.clone(),
+                    progress_context.clone(),
+                )
+                .await?;
+                mark_checkpoint_done(
+                    checkpoint_store,
+                    raw_context,
+                    "raw-transcription",
+                    &RawTranscriptionCheckpoint {
+                        segments: raw_result.segments.clone(),
+                        output_path: raw_result.output_path.to_string_lossy().to_string(),
+                        output_format: raw_result.output_format.to_string(),
+                    },
+                )?;
+                raw_result
+            }
+            Err(error) => {
+                log_session.warn(
+                    "raw_transcription_checkpoint_load_failed",
+                    "读取转录检查点失败，将重新转录",
+                    json!({ "error": &error }),
+                );
+                run_raw_transcription_with_progress(
+                    app.clone(),
+                    request,
+                    log_session.clone(),
+                    workflow_progress.clone(),
+                    progress_sink.clone(),
+                    progress_context.clone(),
+                )
+                .await?
+            }
         }
-        Err(error) => {
-            let message = format!("转录任务执行失败: {error}");
-            log_session.error(
-                "asr_task_join_failed",
-                "转录任务线程执行失败",
-                json!({ "error": error.to_string() }),
-            );
-            return Err(message);
-        }
+    } else {
+        run_raw_transcription_with_progress(
+            app.clone(),
+            request,
+            log_session.clone(),
+            workflow_progress.clone(),
+            progress_sink.clone(),
+            progress_context.clone(),
+        )
+        .await?
     };
 
     let mut segments = raw_result.segments;
@@ -870,6 +986,9 @@ pub(crate) async fn run_transcription_workflow_with_transform(
     );
 
     if settings.is_smart_segmentation_enabled {
+        let smart_checkpoint = checkpoint
+            .as_ref()
+            .map(|(store, context)| (*store, context.child("smart-segmentation")));
         workflow_progress.set_stage(
             ProgressStage::SmartSegmentation,
             0,
@@ -911,6 +1030,9 @@ pub(crate) async fn run_transcription_workflow_with_transform(
             &log_session,
             segments,
             &mut report_snapshot,
+            smart_checkpoint
+                .as_ref()
+                .map(|(store, context)| (*store, context)),
         )
         .await;
         segments = segmentation_result.segments;
@@ -932,6 +1054,9 @@ pub(crate) async fn run_transcription_workflow_with_transform(
     }
 
     if settings.is_subtitle_correction_enabled {
+        let correction_checkpoint = checkpoint
+            .as_ref()
+            .map(|(store, context)| (*store, context.child("subtitle-correction")));
         let previous_warnings = warnings.clone();
         workflow_progress.set_stage(
             ProgressStage::SubtitleCorrection,
@@ -979,6 +1104,9 @@ pub(crate) async fn run_transcription_workflow_with_transform(
             &log_session,
             segments,
             &mut report_snapshot,
+            correction_checkpoint
+                .as_ref()
+                .map(|(store, context)| (*store, context)),
         )
         .await;
         segments = correction_result.segments;
@@ -1000,6 +1128,9 @@ pub(crate) async fn run_transcription_workflow_with_transform(
     }
 
     if settings.is_ai_subtitle_review_enabled {
+        let review_checkpoint = checkpoint
+            .as_ref()
+            .map(|(store, context)| (*store, context.child("source-review")));
         let previous_warnings = warnings.clone();
         workflow_progress.set_stage(ProgressStage::AiReview, 0, "AI 审核源文中", "active");
         emit_progress_event(
@@ -1037,6 +1168,9 @@ pub(crate) async fn run_transcription_workflow_with_transform(
             &log_session,
             segments,
             &mut report_snapshot,
+            review_checkpoint
+                .as_ref()
+                .map(|(store, context)| (*store, context)),
         )
         .await;
         segments = review_result.segments;
@@ -1090,6 +1224,33 @@ pub(crate) async fn run_transcription_workflow_with_transform(
         warnings,
         metadata,
     })
+}
+
+async fn run_raw_transcription_with_progress(
+    app: AppHandle,
+    request: TranscriptionRequest,
+    log_session: LogSession,
+    workflow_progress: WorkflowProgress,
+    progress_sink: Option<TranscriptionProgressSink>,
+    progress_context: ProgressContext,
+) -> Result<RawTranscriptionResult, String> {
+    let raw_result = match tauri::async_runtime::spawn_blocking(move || {
+        run_transcription(
+            app,
+            request,
+            log_session.clone(),
+            workflow_progress,
+            progress_sink,
+            progress_context,
+        )
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(format!("转录任务执行失败: {error}")),
+    };
+    Ok(raw_result)
 }
 
 #[tauri::command]
