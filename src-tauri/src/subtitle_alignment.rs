@@ -1,39 +1,49 @@
-use crate::transcription::{TranscriptionSegment, TranscriptionWord};
+use crate::transcription::TranscriptionSegment;
 use serde::Serialize;
 
-const ALIGNMENT_VERSION: &str = "downloaded-subtitle-align-v2";
+const REFERENCE_MATCH_VERSION: &str = "downloaded-reference-correction-v1";
 const MIN_TOKEN_COVERAGE: f64 = 0.55;
 const MIN_SEGMENT_COVERAGE: f64 = 0.60;
-const MIN_SEGMENT_DURATION_MS: u64 = 300;
-const DEFAULT_GAP_MS: u64 = 120;
 const MAX_ALIGNMENT_MATRIX_CELLS: usize = 25_000_000;
 const CHUNK_SUBTITLE_TOKENS: usize = 1_600;
 const CHUNK_ASR_PADDING_TOKENS: usize = 800;
+const REFERENCE_TIME_PADDING_MS: u64 = 400;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SubtitleAlignmentReport {
-    pub alignment_version: String,
+pub struct SubtitleReferenceMatchReport {
+    pub match_version: String,
     pub token_coverage: f64,
     pub segment_coverage: f64,
     pub matched_token_count: usize,
-    pub subtitle_token_count: usize,
-    pub aligned_segment_count: usize,
-    pub subtitle_segment_count: usize,
+    pub asr_token_count: usize,
+    pub referenced_segment_count: usize,
+    pub asr_segment_count: usize,
+    pub downloaded_segment_count: usize,
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleReferenceMatch {
+    pub asr_index: usize,
+    pub reference_text: String,
+    pub reference_segment_indices: Vec<usize>,
+    pub matched_token_count: usize,
+    pub asr_token_count: usize,
+    pub confidence: f64,
+}
+
 #[derive(Debug, Clone)]
-pub struct SubtitleAlignmentResult {
-    pub segments: Vec<TranscriptionSegment>,
-    pub report: SubtitleAlignmentReport,
+pub struct SubtitleReferenceMatchResult {
+    pub matches: Vec<SubtitleReferenceMatch>,
+    pub report: SubtitleReferenceMatchReport,
 }
 
 #[derive(Debug, Clone)]
 struct TimedToken {
     normalized: String,
-    start_time: u64,
-    end_time: u64,
+    segment_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -42,110 +52,111 @@ struct SubtitleToken {
     segment_index: usize,
 }
 
-pub fn alignment_version() -> &'static str {
-    ALIGNMENT_VERSION
+pub fn reference_match_version() -> &'static str {
+    REFERENCE_MATCH_VERSION
 }
 
-pub fn align_downloaded_subtitles(
-    downloaded_segments: &[TranscriptionSegment],
+pub fn match_downloaded_subtitle_references(
     asr_segments: &[TranscriptionSegment],
-) -> Result<SubtitleAlignmentResult, String> {
+    downloaded_segments: &[TranscriptionSegment],
+) -> Result<SubtitleReferenceMatchResult, String> {
+    if asr_segments.is_empty() {
+        return Err("ASR 没有返回可参考字幕".to_string());
+    }
     if downloaded_segments.is_empty() {
         return Err("下载字幕没有可用文本".to_string());
     }
 
-    let subtitle_tokens = subtitle_tokens(downloaded_segments);
-    let asr_tokens = asr_tokens(asr_segments);
-    if subtitle_tokens.is_empty() {
-        return Err("下载字幕没有可对齐文本".to_string());
+    let asr_subtitle_tokens = subtitle_tokens(asr_segments);
+    let downloaded_timed_tokens = timed_tokens_for_segments(downloaded_segments);
+    if asr_subtitle_tokens.is_empty() {
+        return Err("ASR 字幕没有可匹配文本".to_string());
     }
-    if asr_tokens.is_empty() {
-        return Err("ASR 没有返回词级时间戳，无法对齐下载字幕".to_string());
+    if downloaded_timed_tokens.is_empty() {
+        return Err("下载字幕没有可匹配文本".to_string());
     }
 
-    let matches = monotonic_match(&subtitle_tokens, &asr_tokens);
+    let matches = monotonic_match(&asr_subtitle_tokens, &downloaded_timed_tokens);
     let matched_count = matches
         .iter()
         .filter(|match_index| match_index.is_some())
         .count();
-    let token_coverage = ratio(matched_count, subtitle_tokens.len());
 
-    let mut segment_matched_tokens: Vec<Vec<usize>> = vec![Vec::new(); downloaded_segments.len()];
-    for (token_index, token) in subtitle_tokens.iter().enumerate() {
-        if let Some(asr_index) = matches[token_index] {
-            segment_matched_tokens[token.segment_index].push(asr_index);
+    let mut referenced_by_asr: Vec<Vec<usize>> = vec![Vec::new(); asr_segments.len()];
+    let mut matched_count_by_asr: Vec<usize> = vec![0; asr_segments.len()];
+    let mut token_count_by_asr: Vec<usize> = vec![0; asr_segments.len()];
+    for (token_index, token) in asr_subtitle_tokens.iter().enumerate() {
+        token_count_by_asr[token.segment_index] =
+            token_count_by_asr[token.segment_index].saturating_add(1);
+        if let Some(downloaded_index) = matches[token_index] {
+            matched_count_by_asr[token.segment_index] =
+                matched_count_by_asr[token.segment_index].saturating_add(1);
+            if let Some(downloaded_token) = downloaded_timed_tokens.get(downloaded_index) {
+                referenced_by_asr[token.segment_index].push(downloaded_token.segment_index);
+            }
         }
     }
 
-    let mut aligned_segments = Vec::with_capacity(downloaded_segments.len());
-    let mut aligned_count = 0usize;
-    for (index, segment) in downloaded_segments.iter().enumerate() {
-        let matched = &segment_matched_tokens[index];
-        if matched.is_empty() {
-            aligned_segments.push(segment.clone());
-            continue;
+    let mut reference_matches = Vec::with_capacity(asr_segments.len());
+    for (asr_index, asr_segment) in asr_segments.iter().enumerate() {
+        let mut reference_indices = unique_sorted_indices(&referenced_by_asr[asr_index]);
+        if reference_indices.is_empty() {
+            reference_indices = subtitle_indices_overlapping_time(downloaded_segments, asr_segment);
         }
 
-        let start_asr_index = *matched.first().unwrap_or(&0);
-        let end_asr_index = *matched.last().unwrap_or(&start_asr_index);
-        let mut aligned = segment.clone();
-        aligned.start_time = asr_tokens
-            .get(start_asr_index)
-            .map(|token| token.start_time)
-            .unwrap_or(segment.start_time);
-        aligned.end_time = asr_tokens
-            .get(end_asr_index)
-            .map(|token| token.end_time)
-            .unwrap_or(segment.end_time);
-        aligned.words =
-            aligned_words_for_segment(&aligned.text, aligned.start_time, aligned.end_time);
-        aligned.uid.clear();
-        aligned.status.clear();
-        aligned_segments.push(aligned);
-        aligned_count += 1;
+        let reference_text = reference_indices
+            .iter()
+            .filter_map(|index| downloaded_segments.get(*index))
+            .map(|segment| segment.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let asr_token_count = token_count_by_asr[asr_index];
+        let matched_token_count = matched_count_by_asr[asr_index];
+        reference_matches.push(SubtitleReferenceMatch {
+            asr_index,
+            reference_text,
+            reference_segment_indices: reference_indices,
+            matched_token_count,
+            asr_token_count,
+            confidence: ratio(matched_token_count, asr_token_count),
+        });
     }
 
-    interpolate_unmatched_segments(&mut aligned_segments, &segment_matched_tokens);
-    normalize_segment_timeline(&mut aligned_segments);
-
-    let segment_coverage = ratio(aligned_count, downloaded_segments.len());
+    let referenced_segment_count = reference_matches
+        .iter()
+        .filter(|item| !item.reference_text.trim().is_empty())
+        .count();
+    let token_coverage = ratio(matched_count, asr_subtitle_tokens.len());
+    let segment_coverage = ratio(referenced_segment_count, asr_segments.len());
     let mut warnings = Vec::new();
     if token_coverage < MIN_TOKEN_COVERAGE {
         warnings.push(format!(
-            "下载字幕 token 对齐覆盖率过低（{:.0}%）",
+            "下载字幕参考 token 覆盖率较低（{:.0}%）",
             token_coverage * 100.0
         ));
     }
     if segment_coverage < MIN_SEGMENT_COVERAGE {
         warnings.push(format!(
-            "下载字幕行对齐覆盖率过低（{:.0}%）",
+            "下载字幕参考行覆盖率较低（{:.0}%）",
             segment_coverage * 100.0
         ));
     }
 
-    let report = SubtitleAlignmentReport {
-        alignment_version: ALIGNMENT_VERSION.to_string(),
-        token_coverage,
-        segment_coverage,
-        matched_token_count: matched_count,
-        subtitle_token_count: subtitle_tokens.len(),
-        aligned_segment_count: aligned_count,
-        subtitle_segment_count: downloaded_segments.len(),
-        warnings,
-    };
-
-    if report.token_coverage < MIN_TOKEN_COVERAGE || report.segment_coverage < MIN_SEGMENT_COVERAGE
-    {
-        return Err(format!(
-            "下载字幕对齐置信度不足，token 覆盖率 {:.0}%，行覆盖率 {:.0}%",
-            report.token_coverage * 100.0,
-            report.segment_coverage * 100.0
-        ));
-    }
-
-    Ok(SubtitleAlignmentResult {
-        segments: aligned_segments,
-        report,
+    Ok(SubtitleReferenceMatchResult {
+        matches: reference_matches,
+        report: SubtitleReferenceMatchReport {
+            match_version: REFERENCE_MATCH_VERSION.to_string(),
+            token_coverage,
+            segment_coverage,
+            matched_token_count: matched_count,
+            asr_token_count: asr_subtitle_tokens.len(),
+            referenced_segment_count,
+            asr_segment_count: asr_segments.len(),
+            downloaded_segment_count: downloaded_segments.len(),
+            warnings,
+        },
     })
 }
 
@@ -162,25 +173,54 @@ fn subtitle_tokens(segments: &[TranscriptionSegment]) -> Vec<SubtitleToken> {
     tokens
 }
 
-fn asr_tokens(segments: &[TranscriptionSegment]) -> Vec<TimedToken> {
+fn timed_tokens_for_segments(segments: &[TranscriptionSegment]) -> Vec<TimedToken> {
     let mut tokens = Vec::new();
-    for segment in segments {
-        let words = if segment.words.is_empty() {
-            aligned_words_for_segment(&segment.text, segment.start_time, segment.end_time)
-        } else {
-            segment.words.clone()
-        };
-        for word in words {
-            for normalized in normalized_tokens(&word.text) {
+    for (segment_index, segment) in segments.iter().enumerate() {
+        if segment.words.is_empty() {
+            for normalized in normalized_tokens(&segment.text) {
                 tokens.push(TimedToken {
                     normalized,
-                    start_time: word.start_time,
-                    end_time: word.end_time.max(word.start_time.saturating_add(1)),
+                    segment_index,
                 });
+            }
+        } else {
+            for word in &segment.words {
+                for normalized in normalized_tokens(&word.text) {
+                    tokens.push(TimedToken {
+                        normalized,
+                        segment_index,
+                    });
+                }
             }
         }
     }
     tokens
+}
+
+fn unique_sorted_indices(indices: &[usize]) -> Vec<usize> {
+    let mut result = indices.to_vec();
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
+fn subtitle_indices_overlapping_time(
+    downloaded_segments: &[TranscriptionSegment],
+    asr_segment: &TranscriptionSegment,
+) -> Vec<usize> {
+    let start = asr_segment.start_time.saturating_sub(REFERENCE_TIME_PADDING_MS);
+    let end = asr_segment.end_time.saturating_add(REFERENCE_TIME_PADDING_MS);
+    downloaded_segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            if segment.end_time >= start && segment.start_time <= end {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn monotonic_match(
@@ -316,119 +356,6 @@ fn lcs_match_range(
     matches
 }
 
-fn interpolate_unmatched_segments(
-    segments: &mut [TranscriptionSegment],
-    matched_by_segment: &[Vec<usize>],
-) {
-    for index in 0..segments.len() {
-        if matched_by_segment
-            .get(index)
-            .map(|matches| !matches.is_empty())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let previous = (0..index).rev().find(|candidate| {
-            matched_by_segment
-                .get(*candidate)
-                .map(|matches| !matches.is_empty())
-                .unwrap_or(false)
-        });
-        let next = (index + 1..segments.len()).find(|candidate| {
-            matched_by_segment
-                .get(*candidate)
-                .map(|matches| !matches.is_empty())
-                .unwrap_or(false)
-        });
-
-        match (previous, next) {
-            (Some(previous), Some(next))
-                if segments[next].start_time > segments[previous].end_time =>
-            {
-                let gap_start = segments[previous].end_time.saturating_add(DEFAULT_GAP_MS);
-                let gap_end = segments[next].start_time.saturating_sub(DEFAULT_GAP_MS);
-                let slots = (next - previous) as u64;
-                let offset = (index - previous) as u64;
-                let span = gap_end.saturating_sub(gap_start);
-                let start =
-                    gap_start.saturating_add(span.saturating_mul(offset.saturating_sub(1)) / slots);
-                let end = gap_start.saturating_add(span.saturating_mul(offset) / slots);
-                segments[index].start_time = start;
-                segments[index].end_time = end.max(start.saturating_add(MIN_SEGMENT_DURATION_MS));
-            }
-            (Some(previous), None) => {
-                let start = segments[previous].end_time.saturating_add(DEFAULT_GAP_MS);
-                segments[index].start_time = start;
-                segments[index].end_time = start.saturating_add(
-                    estimated_duration_for_text(&segments[index].text).max(MIN_SEGMENT_DURATION_MS),
-                );
-            }
-            (None, Some(next)) => {
-                let duration =
-                    estimated_duration_for_text(&segments[index].text).max(MIN_SEGMENT_DURATION_MS);
-                let end = segments[next].start_time.saturating_sub(DEFAULT_GAP_MS);
-                segments[index].end_time = end;
-                segments[index].start_time = end.saturating_sub(duration);
-            }
-            _ => {}
-        }
-        segments[index].words = aligned_words_for_segment(
-            &segments[index].text,
-            segments[index].start_time,
-            segments[index].end_time,
-        );
-    }
-}
-
-fn normalize_segment_timeline(segments: &mut [TranscriptionSegment]) {
-    let mut last_end = 0u64;
-    for segment in segments {
-        if segment.start_time < last_end {
-            segment.start_time = last_end;
-        }
-        if segment.end_time <= segment.start_time {
-            segment.end_time = segment.start_time.saturating_add(MIN_SEGMENT_DURATION_MS);
-        }
-        last_end = segment.end_time.saturating_add(DEFAULT_GAP_MS.min(40));
-        segment.words =
-            aligned_words_for_segment(&segment.text, segment.start_time, segment.end_time);
-    }
-}
-
-fn aligned_words_for_segment(text: &str, start_time: u64, end_time: u64) -> Vec<TranscriptionWord> {
-    let display_tokens = display_tokens(text);
-    if display_tokens.is_empty() {
-        return Vec::new();
-    }
-    let duration = end_time
-        .saturating_sub(start_time)
-        .max(display_tokens.len() as u64);
-    let total_weight = display_tokens
-        .iter()
-        .map(|token| token.chars().count().max(1) as u64)
-        .sum::<u64>()
-        .max(1);
-    let mut words = Vec::with_capacity(display_tokens.len());
-    let mut current = start_time;
-    for (index, token) in display_tokens.iter().enumerate() {
-        let end = if index + 1 == display_tokens.len() {
-            end_time
-        } else {
-            current.saturating_add(
-                duration.saturating_mul(token.chars().count().max(1) as u64) / total_weight,
-            )
-        };
-        words.push(TranscriptionWord {
-            text: token.clone(),
-            start_time: current,
-            end_time: end.max(current.saturating_add(1)),
-        });
-        current = end;
-    }
-    words
-}
-
 fn normalized_tokens(text: &str) -> Vec<String> {
     if is_mainly_no_space_language(text) {
         return text
@@ -451,22 +378,6 @@ fn normalized_tokens(text: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
-}
-
-fn display_tokens(text: &str) -> Vec<String> {
-    if is_mainly_no_space_language(text) {
-        return text
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .map(|character| character.to_string())
-            .collect();
-    }
-
-    text.split_whitespace()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn normalize_char(character: char) -> Option<char> {
@@ -526,15 +437,6 @@ fn is_cjk(character: char) -> bool {
     )
 }
 
-fn estimated_duration_for_text(text: &str) -> u64 {
-    let units = display_tokens(text)
-        .len()
-        .max(text.chars().filter(|ch| !ch.is_whitespace()).count());
-    (units as u64)
-        .saturating_mul(180)
-        .clamp(MIN_SEGMENT_DURATION_MS, 5000)
-}
-
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
         0.0
@@ -546,6 +448,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::TranscriptionWord;
 
     fn segment(
         text: &str,
@@ -572,35 +475,30 @@ mod tests {
     }
 
     #[test]
-    fn aligns_english_subtitles_to_asr_words() {
-        let downloaded = vec![
-            segment("Hello world", 10000, 11000, Vec::new()),
-            segment("this is a test", 12000, 13000, Vec::new()),
-        ];
+    fn matches_downloaded_references_to_asr_segments_without_changing_asr_shape() {
         let asr = vec![segment(
-            "hello world this is a test",
+            "hello world",
             0,
-            3000,
-            vec![
-                word("hello", 100, 300),
-                word("world", 350, 600),
-                word("this", 900, 1100),
-                word("is", 1120, 1240),
-                word("a", 1260, 1320),
-                word("test", 1400, 1700),
-            ],
+            1000,
+            vec![word("hello", 100, 300), word("world", 350, 600)],
         )];
+        let downloaded = vec![
+            segment("Hello world", 5000, 6000, Vec::new()),
+            segment("unused text", 6000, 7000, Vec::new()),
+        ];
 
-        let result = align_downloaded_subtitles(&downloaded, &asr).unwrap();
-        assert_eq!(result.segments[0].start_time, 100);
-        assert_eq!(result.segments[0].end_time, 600);
-        assert_eq!(result.segments[1].start_time, 900);
-        assert_eq!(result.segments[1].end_time, 1700);
+        let result = match_downloaded_subtitle_references(&asr, &downloaded).unwrap();
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].asr_index, 0);
+        assert_eq!(result.matches[0].reference_text, "Hello world");
+        assert_eq!(result.matches[0].reference_segment_indices, vec![0]);
+        assert_eq!(result.report.asr_segment_count, 1);
+        assert_eq!(result.report.downloaded_segment_count, 2);
     }
 
     #[test]
-    fn aligns_cjk_subtitles_character_by_character() {
-        let downloaded = vec![segment("你好世界", 0, 1000, Vec::new())];
+    fn matches_cjk_references_character_by_character() {
         let asr = vec![segment(
             "你好世界",
             0,
@@ -612,27 +510,52 @@ mod tests {
                 word("界", 640, 800),
             ],
         )];
+        let downloaded = vec![segment("你好世界", 0, 1000, Vec::new())];
 
-        let result = align_downloaded_subtitles(&downloaded, &asr).unwrap();
-        assert_eq!(result.segments[0].start_time, 100);
-        assert_eq!(result.segments[0].end_time, 800);
+        let result = match_downloaded_subtitle_references(&asr, &downloaded).unwrap();
+
+        assert_eq!(result.matches[0].reference_text, "你好世界");
+        assert_eq!(result.report.token_coverage, 1.0);
     }
 
     #[test]
-    fn rejects_low_coverage_alignment() {
-        let downloaded = vec![segment("completely different text", 0, 1000, Vec::new())];
+    fn keeps_running_with_low_token_coverage_warning() {
         let asr = vec![segment(
             "hello world",
             0,
             1000,
             vec![word("hello", 0, 100), word("world", 200, 300)],
         )];
+        let downloaded = vec![segment("completely different text", 0, 1000, Vec::new())];
 
-        assert!(align_downloaded_subtitles(&downloaded, &asr).is_err());
+        let result = match_downloaded_subtitle_references(&asr, &downloaded).unwrap();
+
+        assert!(result.report.token_coverage < MIN_TOKEN_COVERAGE);
+        assert!(!result.report.warnings.is_empty());
+        assert_eq!(result.matches[0].reference_text, "completely different text");
     }
 
     #[test]
-    fn aligns_overlapping_youtube_subtitles_to_resegmented_asr() {
+    fn uses_time_overlap_when_token_match_is_missing() {
+        let asr = vec![segment(
+            "unmatched asr words",
+            1000,
+            2000,
+            vec![word("unmatched", 1100, 1300)],
+        )];
+        let downloaded = vec![
+            segment("nearby reference", 900, 1800, Vec::new()),
+            segment("far away reference", 3000, 4000, Vec::new()),
+        ];
+
+        let result = match_downloaded_subtitle_references(&asr, &downloaded).unwrap();
+
+        assert_eq!(result.matches[0].reference_text, "nearby reference");
+        assert_eq!(result.matches[0].reference_segment_indices, vec![0]);
+    }
+
+    #[test]
+    fn matches_overlapping_youtube_subtitles_to_resegmented_asr() {
         let downloaded = vec![
             segment(
                 "We are currently in Kosovo and we are so",
@@ -749,11 +672,19 @@ mod tests {
             ),
         ];
 
-        let result = align_downloaded_subtitles(&downloaded, &asr).unwrap();
+        let result = match_downloaded_subtitle_references(&asr, &downloaded).unwrap();
+
         assert!(result.report.token_coverage > 0.75);
         assert!(result.report.segment_coverage > 0.75);
-        assert_eq!(result.segments[0].start_time, 160);
-        assert!(result.segments[2].start_time >= 5900);
-        assert!(result.segments[5].end_time >= 15110);
+        assert_eq!(
+            result.matches[0].reference_text,
+            "We are currently in Kosovo and we are so"
+        );
+        assert!(result.matches[1]
+            .reference_text
+            .contains("excited to try a fast food chain"));
+        assert!(result.matches[3]
+            .reference_text
+            .contains("we try and eat as much local food"));
     }
 }

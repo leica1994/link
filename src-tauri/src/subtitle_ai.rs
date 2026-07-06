@@ -3,6 +3,7 @@ use crate::app_log::LogSession;
 use crate::settings::AppSettings;
 use crate::transcription::{TranscriptionSegment, TranscriptionWord};
 use futures::stream::{FuturesUnordered, StreamExt};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
@@ -12,6 +13,7 @@ const MAX_SPLIT_CHUNK_WORDS: usize = 500;
 const MAX_SPLIT_ATTEMPTS: usize = 2;
 const MAX_CORRECTION_ATTEMPTS: usize = 3;
 const MAX_SOURCE_REVIEW_ATTEMPTS: usize = 3;
+const MAX_REFERENCE_CORRECTION_ATTEMPTS: usize = 3;
 const RULE_SPLIT_GAP_MS: u64 = 500;
 const RULE_MAX_GAP_MS: u64 = 1500;
 const TIME_GAP_WINDOW_SIZE: usize = 5;
@@ -51,6 +53,34 @@ struct CorrectionChunkResult {
 #[derive(Debug, Clone)]
 struct SourceReviewChunkResult {
     chunk: CorrectionChunk,
+    entries: Vec<(usize, ReviewedSourceEntry)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleReferenceCorrectionReference {
+    pub asr_index: usize,
+    pub reference_text: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceCorrectionChunk {
+    start_index: usize,
+    end_index: usize,
+    entries: BTreeMap<String, ReferenceCorrectionPromptEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferenceCorrectionPromptEntry {
+    source_text: String,
+    reference_text: String,
+    confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceCorrectionChunkResult {
     entries: Vec<(usize, ReviewedSourceEntry)>,
 }
 
@@ -696,6 +726,158 @@ where
     }
 }
 
+pub async fn correct_subtitles_with_downloaded_reference<F>(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    log_session: &LogSession,
+    segments: Vec<TranscriptionSegment>,
+    references: &[SubtitleReferenceCorrectionReference],
+    report: &mut F,
+) -> SubtitleProcessingResult
+where
+    F: FnMut(u8, &str, &[TranscriptionSegment], &[String]),
+{
+    if segments.is_empty() {
+        return SubtitleProcessingResult {
+            segments,
+            warnings: Vec::new(),
+        };
+    }
+
+    let chunks = build_reference_correction_chunks(
+        &segments,
+        references,
+        settings.translation_batch_size.max(1) as usize,
+    );
+    let mut corrected_segments = segments;
+    let mut failed_chunks = 0usize;
+    let mut warnings = Vec::new();
+
+    if chunks.is_empty() {
+        return SubtitleProcessingResult {
+            segments: corrected_segments,
+            warnings,
+        };
+    }
+
+    log_session.info(
+        "subtitle_reference_correction_stage_prepared",
+        "AI 参考校正批次已准备",
+        json!({
+            "inputSegmentCount": corrected_segments.len(),
+            "chunkCount": chunks.len(),
+            "batchSize": settings.translation_batch_size.max(1),
+            "videoContentType": &settings.video_content_type,
+            "llmMode": "configured_llm_settings_json_response",
+        }),
+    );
+
+    let total = chunks.len().max(1);
+    let max_active = active_ai_work_count(settings);
+    let mut futures = FuturesUnordered::new();
+    let mut next_chunk_index = 0usize;
+
+    while next_chunk_index < chunks.len() && futures.len() < max_active {
+        let chunk = chunks[next_chunk_index].clone();
+        mark_range_status(
+            &mut corrected_segments,
+            chunk.start_index,
+            chunk.end_index,
+            "correcting",
+        );
+        futures.push(run_reference_correction_chunk(
+            settings,
+            ai_service,
+            chunk,
+            log_session.clone(),
+        ));
+        next_chunk_index += 1;
+    }
+    report(0, "AI 参考校正中", &corrected_segments, &warnings);
+
+    let mut completed = 0usize;
+    while let Some(result) = futures.next().await {
+        completed += 1;
+
+        match result {
+            Ok(result) => {
+                for (index, entry) in result.entries {
+                    if let Some(segment) = corrected_segments.get_mut(index) {
+                        segment.text = entry.text;
+                        segment.status = match entry.action.as_str() {
+                            "remove" => "removed",
+                            "keep" => "kept",
+                            _ => "corrected",
+                        }
+                        .to_string();
+                    }
+                }
+            }
+            Err((chunk, error)) => {
+                mark_range_status(
+                    &mut corrected_segments,
+                    chunk.start_index,
+                    chunk.end_index,
+                    "kept",
+                );
+                failed_chunks += 1;
+                log_session.warn(
+                    "subtitle_reference_correction_chunk_failed",
+                    "参考校正批次失败，已保留转录字幕",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "entryCount": chunk.entries.len(),
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+
+        while next_chunk_index < chunks.len() && futures.len() < max_active {
+            let chunk = chunks[next_chunk_index].clone();
+            mark_range_status(
+                &mut corrected_segments,
+                chunk.start_index,
+                chunk.end_index,
+                "correcting",
+            );
+            futures.push(run_reference_correction_chunk(
+                settings,
+                ai_service,
+                chunk,
+                log_session.clone(),
+            ));
+            next_chunk_index += 1;
+        }
+
+        warnings = build_processing_warnings("参考校正", failed_chunks, "校正批次");
+        let progress = stage_progress(0, 100, completed, total);
+        let message = if completed == total {
+            "AI 参考校正完成"
+        } else {
+            "AI 参考校正中"
+        };
+        report(progress, message, &corrected_segments, &warnings);
+    }
+
+    if failed_chunks > 0 {
+        log_session.warn(
+            "subtitle_reference_correction_stage_partial",
+            "AI 参考校正部分批次失败，已保留转录字幕",
+            json!({
+                "failedChunkCount": failed_chunks,
+                "chunkCount": total,
+            }),
+        );
+    }
+
+    SubtitleProcessingResult {
+        segments: corrected_segments,
+        warnings,
+    }
+}
+
 fn build_segmentation_blocks(segments: &[TranscriptionSegment]) -> Vec<SegmentationBlock> {
     let mut blocks = Vec::new();
     let mut current_segments = Vec::new();
@@ -893,6 +1075,15 @@ async fn run_source_review_chunk(
     log_session: LogSession,
 ) -> Result<SourceReviewChunkResult, (CorrectionChunk, String)> {
     review_source_chunk_by_llm(settings, ai_service, chunk, log_session).await
+}
+
+async fn run_reference_correction_chunk(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: ReferenceCorrectionChunk,
+    log_session: LogSession,
+) -> Result<ReferenceCorrectionChunkResult, (ReferenceCorrectionChunk, String)> {
+    correct_reference_chunk_by_llm(settings, ai_service, chunk, log_session).await
 }
 
 async fn split_chunk_by_llm(
@@ -1161,6 +1352,105 @@ async fn review_source_chunk_by_llm(
     Err((chunk, "LLM 源文审核结果多次校验失败".to_string()))
 }
 
+async fn correct_reference_chunk_by_llm(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: ReferenceCorrectionChunk,
+    log_session: LogSession,
+) -> Result<ReferenceCorrectionChunkResult, (ReferenceCorrectionChunk, String)> {
+    let system_prompt = build_reference_correction_system_prompt(settings);
+    let max_output_tokens = estimate_max_output_tokens(
+        &chunk
+            .entries
+            .values()
+            .map(|entry| {
+                format!(
+                    "{}\n{}",
+                    entry.source_text.trim(),
+                    entry.reference_text.trim()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let mut feedback = String::new();
+
+    for attempt in 1..=MAX_REFERENCE_CORRECTION_ATTEMPTS {
+        let user_prompt = build_reference_correction_user_prompt(&chunk.entries, &feedback);
+        let response = match ai_service
+            .chat_for_json_output(
+                settings,
+                system_prompt.clone(),
+                user_prompt,
+                max_output_tokens,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log_session.warn(
+                    "subtitle_reference_correction_llm_request_failed",
+                    "参考校正 LLM 请求失败",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": &error,
+                    }),
+                );
+                return Err((chunk, error));
+            }
+        };
+
+        let parsed = match parse_source_review_response(&response) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                feedback = build_reference_correction_json_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "subtitle_reference_correction_validation_failed",
+                    "参考校正 LLM 结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "json_parse",
+                        "error": &error,
+                    }),
+                );
+                continue;
+            }
+        };
+
+        match validate_reference_correction_keys(&chunk.entries, &parsed) {
+            Ok(()) => {
+                let entries = parsed
+                    .into_iter()
+                    .filter_map(|(key, entry)| {
+                        key.parse::<usize>().ok().map(|index| (index - 1, entry))
+                    })
+                    .collect();
+                return Ok(ReferenceCorrectionChunkResult { entries });
+            }
+            Err(error) => {
+                feedback = build_reference_correction_key_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "subtitle_reference_correction_validation_failed",
+                    "参考校正 LLM 结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "key_mismatch",
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+    }
+
+    Err((chunk, "LLM 参考校正结果多次校验失败".to_string()))
+}
+
 fn build_source_review_system_prompt(settings: &AppSettings) -> String {
     let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
         "保守模式：严格保持每条字幕的独立含义，不删除内容；只有明显 ASR 错字、术语误识别、口癖、标点和非语言声音可修正。"
@@ -1197,6 +1487,42 @@ fn build_source_review_system_prompt(settings: &AppSettings) -> String {
     )
 }
 
+fn build_reference_correction_system_prompt(settings: &AppSettings) -> String {
+    let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
+        "保守模式：下载字幕只作为弱参考。只有转录明显错听、漏词、术语误识别、标点或噪音时才修改；不确定时 keep。"
+    } else {
+        "专家模式：以转录字幕的时间轴和口播内容为主，结合下载字幕参考修正明显 ASR 错误、漏识别、术语、人名和标点；可删除明显噪音行。"
+    };
+    let reference = match settings.video_content_type.as_str() {
+        "trading" => "交易视频：重点保护数字、价格、百分比、ticker、交易方向、周期、指标和 Al Brooks 价格行为术语。参考字幕可用于修正交易术语，但不得改变交易判断。",
+        _ => "通用视频：优先保证语义准确、上下文通顺、字幕可读。下载字幕只用于辅助判断，不是最终答案来源。",
+    };
+
+    format!(
+        r#"你是一位专业字幕参考校正专家。你正在处理 ASR 转录字幕，每条转录字幕已经有正确时间轴；下载字幕只是参考资料。
+
+<review_mode>{mode_rule}</review_mode>
+<domain_reference>{reference}</domain_reference>
+
+<rules>
+1. 转录字幕是主依据，下载字幕只是参考；冲突、不确定、语言不一致或参考缺失时必须保留转录。
+2. 保持输入 JSON 的所有真实 key，不新增、不删除、不重命名 key，不合并、不拆分条目。
+3. 只能修改每个 key 的 text 和 action，不能输出时间戳、解释、Markdown 或额外字段。
+4. action 只能是 keep、revise、remove。
+5. keep 表示转录可接受，text 原样保留；revise 表示参考字幕能证明转录有明确错误，text 写校正后的源文；remove 表示该转录行是噪音或无意义内容。
+6. 不翻译源文，不扩写下载字幕中有但音频/转录上下文不支持的内容。
+7. 不改变数字、专有名词、方向性判断、风险提示和事实；只有参考和上下文都明确时才修正。
+8. 输出只能是单个 JSON object，第一字符必须是 {{，最后字符必须是 }}。
+</rules>
+
+<output_format>
+{{
+  "1": {{ "text": "校正后的源文", "action": "keep" }}
+}}
+</output_format>"#
+    )
+}
+
 fn build_source_review_user_prompt(entries: &BTreeMap<String, String>, feedback: &str) -> String {
     let input_json = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
     let output_template = entries
@@ -1215,6 +1541,42 @@ fn build_source_review_user_prompt(entries: &BTreeMap<String, String>, feedback:
     let mut prompt = format!(
         "请审核以下源文字幕 JSON。最终必须输出 JSON object，key 必须与输入完全一致。\n\
          <source_subtitle>{input_json}</source_subtitle>\n\
+         <output_template>{output_template}</output_template>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改每个 key 下的 text 和 action。</template_rule>\n\
+         <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
+    );
+
+    if !feedback.is_empty() {
+        prompt.push_str("\n<feedback>");
+        prompt.push_str(feedback);
+        prompt.push_str("</feedback>");
+    }
+
+    prompt
+}
+
+fn build_reference_correction_user_prompt(
+    entries: &BTreeMap<String, ReferenceCorrectionPromptEntry>,
+    feedback: &str,
+) -> String {
+    let input_json = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+    let output_template = entries
+        .iter()
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                json!({
+                    "text": entry.source_text,
+                    "action": "keep",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let output_template = Value::Object(output_template).to_string();
+    let mut prompt = format!(
+        "请根据下载字幕参考校正以下 ASR 转录字幕 JSON。最终必须输出 JSON object，key 必须与输入完全一致。\n\
+         每个输入项包含 sourceText（转录主文本）、referenceText（下载字幕参考）和 confidence（参考匹配置信度）。\n\
+         <subtitle_items>{input_json}</subtitle_items>\n\
          <output_template>{output_template}</output_template>\n\
          <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改每个 key 下的 text 和 action。</template_rule>\n\
          <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
@@ -1313,6 +1675,28 @@ fn build_source_review_key_feedback(entries: &BTreeMap<String, String>, error: &
     )
 }
 
+fn build_reference_correction_json_feedback(
+    entries: &BTreeMap<String, ReferenceCorrectionPromptEntry>,
+    error: &str,
+) -> String {
+    let output_template = reference_correction_output_template(entries);
+
+    format!(
+        "上一次结果不是有效参考校正 JSON: {error}\n请只输出完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。每个 key 的 value 必须是包含 text 和 action 的对象，action 只能是 keep、revise、remove。请复制这个结构: {output_template}"
+    )
+}
+
+fn build_reference_correction_key_feedback(
+    entries: &BTreeMap<String, ReferenceCorrectionPromptEntry>,
+    error: &str,
+) -> String {
+    let output_template = reference_correction_output_template(entries);
+
+    format!(
+        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key，不能新增、遗漏或重命名。请复制这个结构: {output_template}"
+    )
+}
+
 fn source_review_output_template(entries: &BTreeMap<String, String>) -> String {
     let template = entries
         .iter()
@@ -1321,6 +1705,25 @@ fn source_review_output_template(entries: &BTreeMap<String, String>) -> String {
                 key.clone(),
                 json!({
                     "text": text,
+                    "action": "keep",
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    Value::Object(template).to_string()
+}
+
+fn reference_correction_output_template(
+    entries: &BTreeMap<String, ReferenceCorrectionPromptEntry>,
+) -> String {
+    let template = entries
+        .iter()
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                json!({
+                    "text": entry.source_text,
                     "action": "keep",
                 }),
             )
@@ -1448,6 +1851,47 @@ fn build_correction_chunks(
             }
 
             CorrectionChunk {
+                start_index,
+                end_index: start_index + chunk.len().saturating_sub(1),
+                entries,
+            }
+        })
+        .collect()
+}
+
+fn build_reference_correction_chunks(
+    segments: &[TranscriptionSegment],
+    references: &[SubtitleReferenceCorrectionReference],
+    batch_size: usize,
+) -> Vec<ReferenceCorrectionChunk> {
+    let mut reference_by_index = BTreeMap::new();
+    for reference in references {
+        reference_by_index.insert(reference.asr_index, reference);
+    }
+
+    segments
+        .chunks(batch_size.max(1))
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let start_index = chunk_index * batch_size.max(1);
+            let mut entries = BTreeMap::new();
+
+            for (offset, segment) in chunk.iter().enumerate() {
+                let index = start_index + offset;
+                let reference = reference_by_index.get(&index);
+                entries.insert(
+                    (index + 1).to_string(),
+                    ReferenceCorrectionPromptEntry {
+                        source_text: segment.text.clone(),
+                        reference_text: reference
+                            .map(|item| item.reference_text.clone())
+                            .unwrap_or_default(),
+                        confidence: reference.map(|item| item.confidence).unwrap_or_default(),
+                    },
+                );
+            }
+
+            ReferenceCorrectionChunk {
                 start_index,
                 end_index: start_index + chunk.len().saturating_sub(1),
                 entries,
@@ -2187,6 +2631,29 @@ fn validate_correction_keys(
 
 fn validate_source_review_keys(
     expected: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, ReviewedSourceEntry>,
+) -> Result<(), String> {
+    let expected_keys = expected.keys().cloned().collect::<HashSet<_>>();
+    let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
+
+    if expected_keys == actual_keys {
+        return Ok(());
+    }
+
+    let missing = expected_keys
+        .difference(&actual_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = actual_keys
+        .difference(&expected_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
+}
+
+fn validate_reference_correction_keys(
+    expected: &BTreeMap<String, ReferenceCorrectionPromptEntry>,
     actual: &BTreeMap<String, ReviewedSourceEntry>,
 ) -> Result<(), String> {
     let expected_keys = expected.keys().cloned().collect::<HashSet<_>>();

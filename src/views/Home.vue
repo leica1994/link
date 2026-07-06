@@ -2189,7 +2189,7 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     return []
   }
   const stageProgress = readRecordValue(snapshot.stageProgress)
-  const alignment = readRecordValue(snapshot.alignment)
+  const referenceCorrection = readRecordValue(snapshot.referenceCorrection)
   const steps = [
     { key: 'transcription', label: '转录', source: stageProgress.transcription },
     { key: 'smartSegmentation', label: '智能断句', source: stageProgress.smartSegmentation },
@@ -2198,14 +2198,17 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
   ]
     .filter((item) => readRecordValue(item.source))
     .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
-  if (mode === 'downloaded-align') {
-    const hasCoverage = readNumberValue(alignment.tokenCoverage) !== undefined || readNumberValue(alignment.segmentCoverage) !== undefined
+  if (mode === 'downloaded-reference') {
+    const match = readRecordValue(referenceCorrection.match)
+    const status = readStringValue(referenceCorrection.status)
+    const progress = readNumberValue(referenceCorrection.progress)
+    const hasCoverage = readNumberValue(match.tokenCoverage) !== undefined || readNumberValue(match.segmentCoverage) !== undefined
     steps.splice(1, 0, {
-      key: 'subtitleAlignment',
-      label: '字幕对齐',
-      progress: hasCoverage || readStringValue(alignment.status) === 'failed' ? 100 : 0,
-      status: readStringValue(alignment.status) === 'failed' ? 'failed' : hasCoverage ? 'done' : 'pending',
-      message: subtitleAlignmentMessage(alignment),
+      key: 'subtitleReferenceCorrection',
+      label: '参考校正',
+      progress: progress !== undefined ? clampProgress(progress) : status === 'failed' || status === 'done' || hasCoverage ? 100 : 0,
+      status: status === 'failed' ? 'failed' : status === 'done' ? 'done' : status === 'active' ? 'active' : hasCoverage ? 'done' : 'pending',
+      message: subtitleReferenceCorrectionMessage(referenceCorrection),
     })
   }
   return steps
@@ -3388,19 +3391,20 @@ const detailStepFromRecord = (key: string, label: string, value: Record<string, 
   message: readStringValue(value.message) || '等待处理',
 })
 
-const subtitleAlignmentMessage = (alignment: Record<string, unknown>) => {
-  const status = readStringValue(alignment.status)
+const subtitleReferenceCorrectionMessage = (referenceCorrection: Record<string, unknown>) => {
+  const status = readStringValue(referenceCorrection.status)
   if (status === 'failed') {
-    return '对齐失败，已改用自动转录字幕'
+    return readStringValue(referenceCorrection.message) || '参考校正失败，已保留转录字幕'
   }
-  const tokenCoverage = readNumberValue(alignment.tokenCoverage)
-  const segmentCoverage = readNumberValue(alignment.segmentCoverage)
+  const match = readRecordValue(referenceCorrection.match)
+  const tokenCoverage = readNumberValue(match.tokenCoverage)
+  const segmentCoverage = readNumberValue(match.segmentCoverage)
   if (tokenCoverage !== undefined || segmentCoverage !== undefined) {
     const tokenText = tokenCoverage !== undefined ? `词覆盖 ${Math.round(tokenCoverage * 100)}%` : ''
     const segmentText = segmentCoverage !== undefined ? `行覆盖 ${Math.round(segmentCoverage * 100)}%` : ''
-    return [tokenText, segmentText].filter(Boolean).join(' · ') || '字幕已对齐'
+    return [readStringValue(referenceCorrection.message), tokenText, segmentText].filter(Boolean).join(' · ') || '参考校正完成'
   }
-  return readStringValue(alignment.message) || '等待字幕对齐'
+  return readStringValue(referenceCorrection.message) || '等待参考校正'
 }
 
 const readSubtitleSegments = (value: unknown): WorkbenchSubtitleSegment[] => {
@@ -3801,6 +3805,10 @@ const normalizeSegmentStatus = (status?: string) => {
     'active',
     'done',
     'failed',
+    'segmenting',
+    'segmented',
+    'correcting',
+    'corrected',
     'translating',
     'translated',
     'optimizing',
@@ -3822,6 +3830,14 @@ const segmentStatusLabel = (status?: string) => {
       return '完成'
     case 'failed':
       return '失败'
+    case 'segmenting':
+      return '断句中'
+    case 'segmented':
+      return '已断句'
+    case 'correcting':
+      return '校正中'
+    case 'corrected':
+      return '已校正'
     case 'translating':
       return '翻译中'
     case 'translated':
