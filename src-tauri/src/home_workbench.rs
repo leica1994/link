@@ -21,7 +21,7 @@ use crate::subtitle_alignment::{match_downloaded_subtitle_references, reference_
 use crate::subtitle_translation::{
     load_subtitle_segments, run_subtitle_translation_workflow_with_sink,
     SubtitleTranslationProgress, SubtitleTranslationProgressSink, SubtitleTranslationRequest,
-    SubtitleTranslationResult,
+    SubtitleTranslationResult, AI_SUBTITLE_REVIEW_PIPELINE_VERSION,
 };
 use crate::transcription::{
     normalize_subtitle_format, run_transcription_workflow_with_checkpoint,
@@ -1349,36 +1349,42 @@ async fn translate_subtitle(
     options: &HomeWorkbenchOptions,
     subtitle_path: &Path,
 ) -> Result<PathBuf, String> {
+    let mut run_settings = settings.clone();
+    apply_translation_options(&mut run_settings, options);
+    let translation_input =
+        build_translation_checkpoint_input(subtitle_path, options, &run_settings);
+
     if let Some(artifact) = workbench_artifact_file(store, task_id, ARTIFACT_TRANSLATED_SUBTITLE)? {
-        update_stage_snapshot_from_app(
-            &app,
-            task_id,
-            STAGE_TRANSLATION,
-            99,
-            "复用已翻译字幕",
-            json!({
-                "mode": "translation",
-                "path": artifact.path,
-                "fileSize": artifact.file_size,
-                "metadata": artifact.metadata,
-                "message": "复用已翻译字幕",
-            }),
-        )?;
-        return Ok(artifact_path_value(&artifact));
+        let artifact_input = artifact
+            .metadata
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if artifact_input == translation_input {
+            update_stage_snapshot_from_app(
+                &app,
+                task_id,
+                STAGE_TRANSLATION,
+                99,
+                "复用已翻译字幕",
+                json!({
+                    "mode": "translation",
+                    "path": artifact.path,
+                    "fileSize": artifact.file_size,
+                    "metadata": artifact.metadata,
+                    "message": "复用已翻译字幕",
+                }),
+            )?;
+            return Ok(artifact_path_value(&artifact));
+        }
     }
 
     set_stage_active(store, &app, task_id, STAGE_TRANSLATION, "翻译字幕", 2)?;
-    let mut run_settings = settings.clone();
-    apply_translation_options(&mut run_settings, options);
     let progress_sink = workbench_translation_progress_sink(app.clone(), task_id.to_string());
     let checkpoint_context = WorkbenchCheckpointContext::new(
         task_id,
         "translation",
-        checkpoint_hash(&build_translation_checkpoint_input(
-            subtitle_path,
-            options,
-            &run_settings,
-        )),
+        checkpoint_hash(&translation_input),
     );
     let result = run_subtitle_translation_workflow_with_sink(
         app,
@@ -1395,7 +1401,7 @@ async fn translate_subtitle(
         Some((store, checkpoint_context)),
     )
     .await?;
-    save_translation_result(store, task_id, &result)
+    save_translation_result(store, task_id, &result, translation_input)
 }
 
 async fn run_dubbing(
@@ -1746,6 +1752,7 @@ fn save_translation_result(
     store: &SettingsStore,
     task_id: &str,
     result: &SubtitleTranslationResult,
+    input: Value,
 ) -> Result<PathBuf, String> {
     let path = workbench_file_path(task_id, "translated", &result.output_format)?;
     let path_string = path.to_string_lossy().to_string();
@@ -1762,6 +1769,7 @@ fn save_translation_result(
             "translatedSegmentCount": result.translated_segments.len(),
             "logPath": result.log_path,
             "warnings": result.warnings,
+            "input": input,
         }),
     )?;
     Ok(path)
@@ -1987,6 +1995,7 @@ fn build_translation_checkpoint_input(
         "subtitleTranslationEnabled": options.is_subtitle_translation_enabled,
         "aiSubtitleReviewEnabled": options.is_ai_subtitle_review_enabled,
         "aiSubtitleReviewMode": &options.ai_subtitle_review_mode,
+        "aiSubtitleReviewPipelineVersion": AI_SUBTITLE_REVIEW_PIPELINE_VERSION,
         "targetLanguage": &options.target_language,
         "selectedLlmService": &settings.selected_llm_service,
         "llmConfig": settings.llm_configs.get(&settings.selected_llm_service).map(|config| {

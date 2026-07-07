@@ -20,6 +20,7 @@ const MAX_SOURCE_REVIEW_ATTEMPTS: usize = 3;
 const MAX_REFERENCE_CORRECTION_ATTEMPTS: usize = 3;
 const RULE_SPLIT_GAP_MS: u64 = 500;
 const RULE_MAX_GAP_MS: u64 = 1500;
+const ORPHAN_FRAGMENT_GAP_MS: u64 = 650;
 const TIME_GAP_WINDOW_SIZE: usize = 5;
 const TIME_GAP_MULTIPLIER: u64 = 3;
 const MIN_TIME_GAP_GROUP_SIZE: usize = 5;
@@ -2322,7 +2323,241 @@ fn normalize_split_sentences_by_rules(
         normalized.extend(rule_split_word_units(&words[word_index..]));
     }
 
-    Ok(normalized)
+    repair_split_sentences_by_word_rules(&normalized, words)
+}
+
+fn repair_split_sentences_by_word_rules(
+    sentences: &[String],
+    words: &[WordUnit],
+) -> Result<Vec<String>, String> {
+    let mut groups = word_groups_by_sentences(words, sentences)?;
+    let mut index = 0usize;
+    while index + 1 < groups.len() {
+        move_prefix_words_to_complete_previous(&mut groups, index);
+        index += 1;
+    }
+
+    let mut repaired: Vec<Vec<WordUnit>> = Vec::new();
+    for group in groups.into_iter().filter(|group| !group.is_empty()) {
+        let should_merge = repaired
+            .last()
+            .map(|previous| should_merge_short_fragment(previous, &group))
+            .unwrap_or(false);
+        if should_merge {
+            if let Some(previous) = repaired.last_mut() {
+                previous.extend(group);
+            }
+        } else {
+            repaired.push(group);
+        }
+    }
+
+    Ok(repaired
+        .iter()
+        .map(|group| join_word_units(group))
+        .filter(|text| !text.trim().is_empty())
+        .collect())
+}
+
+fn word_groups_by_sentences(
+    words: &[WordUnit],
+    sentences: &[String],
+) -> Result<Vec<Vec<WordUnit>>, String> {
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut groups = Vec::new();
+    let mut word_index = 0usize;
+    for sentence in sentences {
+        let target_len = normalized_len(sentence);
+        if target_len == 0 {
+            continue;
+        }
+
+        let start_index = word_index;
+        let mut current_len = 0usize;
+        while word_index < words.len() && (current_len < target_len || word_index == start_index) {
+            current_len += normalized_len(&words[word_index].text).max(1);
+            word_index += 1;
+        }
+
+        if start_index < word_index {
+            groups.push(words[start_index..word_index].to_vec());
+        }
+    }
+
+    if word_index < words.len() {
+        groups.push(words[word_index..].to_vec());
+    }
+
+    if groups.is_empty() {
+        Err("断句结果无法映射到词级时间轴".to_string())
+    } else {
+        Ok(groups)
+    }
+}
+
+fn move_prefix_words_to_complete_previous(groups: &mut [Vec<WordUnit>], index: usize) {
+    if index + 1 >= groups.len() || groups[index].is_empty() || groups[index + 1].is_empty() {
+        return;
+    }
+
+    let mut moved = 0usize;
+    while moved < 4 && !groups[index + 1].is_empty() {
+        let previous_text = join_word_units(&groups[index]);
+        if !needs_previous_completion(&previous_text) {
+            break;
+        }
+
+        let next_word = groups[index + 1][0].clone();
+        if !can_move_prefix_word(&groups[index], &groups[index + 1], &next_word) {
+            break;
+        }
+
+        let moved_word = groups[index + 1].remove(0);
+        groups[index].push(moved_word);
+        moved += 1;
+
+        if is_terminal_text(&next_word.text) {
+            break;
+        }
+    }
+}
+
+fn should_merge_short_fragment(previous: &[WordUnit], current: &[WordUnit]) -> bool {
+    if previous.is_empty() || current.is_empty() {
+        return false;
+    }
+
+    let previous_text = join_word_units(previous);
+    let current_text = join_word_units(current);
+    if !is_short_orphan_fragment(&current_text) && !needs_previous_completion(&previous_text) {
+        return false;
+    }
+
+    let gap = current
+        .first()
+        .map(|first| first.start_time)
+        .unwrap_or_default()
+        .saturating_sub(
+            previous
+                .last()
+                .map(|last| last.end_time)
+                .unwrap_or_default(),
+        );
+    if gap > ORPHAN_FRAGMENT_GAP_MS && is_terminal_text(&previous_text) {
+        return false;
+    }
+
+    let merged_words = previous
+        .iter()
+        .chain(current.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let merged_text = join_word_units(&merged_words);
+    count_words(&merged_text) <= max_segment_words_for_text(&merged_text)
+}
+
+fn can_move_prefix_word(
+    previous: &[WordUnit],
+    next_group: &[WordUnit],
+    next_word: &WordUnit,
+) -> bool {
+    let gap = next_word.start_time.saturating_sub(
+        previous
+            .last()
+            .map(|word| word.end_time)
+            .unwrap_or_default(),
+    );
+    if gap > ORPHAN_FRAGMENT_GAP_MS {
+        return false;
+    }
+
+    let next_text = next_word.text.trim();
+    let previous_text = join_word_units(previous);
+    let candidate_words = previous
+        .iter()
+        .cloned()
+        .chain(std::iter::once(next_word.clone()))
+        .collect::<Vec<_>>();
+    let candidate_text = join_word_units(&candidate_words);
+
+    if count_words(&candidate_text) > max_segment_words_for_text(&candidate_text) {
+        return false;
+    }
+
+    starts_lowercase(next_text)
+        || is_terminal_text(next_text)
+        || previous_text.trim_end().ends_with(',')
+        || previous_text.trim_end().ends_with('，')
+        || next_group.len() <= 2
+}
+
+fn needs_previous_completion(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_terminal_text(trimmed) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let last_word = lower
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_alphanumeric());
+
+    trimmed.ends_with(',')
+        || trimmed.ends_with('，')
+        || matches!(
+            last_word,
+            "a" | "an"
+                | "the"
+                | "and"
+                | "or"
+                | "but"
+                | "of"
+                | "in"
+                | "at"
+                | "to"
+                | "for"
+                | "with"
+                | "from"
+                | "new"
+                | "another"
+                | "this"
+                | "that"
+        )
+}
+
+fn is_short_orphan_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_terminal_text(trimmed) {
+        return false;
+    }
+
+    if is_mainly_no_space_language(trimmed) {
+        normalized_len(trimmed) <= 4
+    } else {
+        count_words(trimmed) <= 2
+    }
+}
+
+fn is_terminal_text(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    trimmed.ends_with('.')
+        || trimmed.ends_with('!')
+        || trimmed.ends_with('?')
+        || trimmed.ends_with('。')
+        || trimmed.ends_with('！')
+        || trimmed.ends_with('？')
+}
+
+fn starts_lowercase(text: &str) -> bool {
+    text.chars()
+        .find(|character| character.is_alphabetic())
+        .map(|character| character.is_lowercase())
+        .unwrap_or(false)
 }
 
 fn validate_split_result(source_text: &str, sentences: &[String]) -> Result<(), String> {
@@ -3192,5 +3427,29 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_time, 1000);
         assert_eq!(merged[0].end_time, 3000);
+    }
+
+    #[test]
+    fn normalize_split_sentences_merges_short_orphan_fragment() {
+        let segments = vec![
+            test_segment(
+                "Another day living in Guangzhou,",
+                11_630,
+                14_680,
+                Vec::new(),
+            ),
+            test_segment("China", 14_680, 15_140, Vec::new()),
+        ];
+        let words = build_word_units(&segments);
+        let source_text = join_word_units(&words);
+        let sentences = vec![
+            "Another day living in Guangzhou,".to_string(),
+            "China".to_string(),
+        ];
+
+        let normalized = normalize_split_sentences_by_rules(&source_text, &words, &sentences)
+            .expect("short orphan fragment should be repaired");
+
+        assert_eq!(normalized, vec!["Another day living in Guangzhou, China"]);
     }
 }

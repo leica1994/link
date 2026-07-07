@@ -25,6 +25,13 @@ const PROGRESS_EVENT: &str = "subtitle-translation-progress";
 const MAX_VALIDATION_ATTEMPTS: usize = 3;
 const MAX_TRANSLATION_ATTEMPTS: usize = 3;
 const MAX_AI_SUBTITLE_REVIEW_ATTEMPTS: usize = 3;
+pub(crate) const AI_SUBTITLE_REVIEW_PIPELINE_VERSION: u32 = 2;
+const REVIEW_CONTENT_PROGRESS_END: u8 = 35;
+const REVIEW_SOURCE_REFLOW_PROGRESS_END: u8 = 65;
+const REVIEW_SOURCE_REFLOW_MAX_WORDS: usize = 500;
+const REVIEW_MAX_SEGMENT_WORDS_CJK: usize = 25;
+const REVIEW_MAX_SEGMENT_WORDS_ENGLISH: usize = 18;
+const REVIEW_SHORT_FRAGMENT_GAP_MS: u64 = 650;
 
 pub(crate) type SubtitleTranslationProgressSink =
     Arc<dyn Fn(SubtitleTranslationProgress) + Send + Sync>;
@@ -157,6 +164,70 @@ struct TranslationReviewChunkResult {
 struct ReviewedTranslationEntry {
     text: String,
     action: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewWordUnit {
+    text: String,
+    start_time: u64,
+    end_time: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SourceReflowBlock {
+    block_id: usize,
+    original_source_segments: Vec<TranscriptionSegment>,
+    original_translated_segments: Vec<TranscriptionSegment>,
+    words: Vec<ReviewWordUnit>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceReflowBlockResult {
+    block: SourceReflowBlock,
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceReflowPromptEntry {
+    source_text: String,
+    draft_translation: String,
+    start_ms: u64,
+    end_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SourceReflowResult {
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TargetOptimizationChunk {
+    start_index: usize,
+    end_index: usize,
+    entries: BTreeMap<String, TargetOptimizationPromptEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetOptimizationPromptEntry {
+    source_text: String,
+    draft_translation: String,
+}
+
+#[derive(Debug, Clone)]
+struct TargetOptimizationChunkResult {
+    chunk: TargetOptimizationChunk,
+    entries: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct TargetOptimizationResult {
+    translated_segments: Vec<TranscriptionSegment>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -973,6 +1044,133 @@ async fn review_translated_subtitles<F>(
     settings: &AppSettings,
     ai_service: &AiService,
     log_session: &LogSession,
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+    mut report: F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
+) -> SubtitleReviewResult
+where
+    F: FnMut(u8, &str, &str, &SubtitleReviewSnapshot, &[String]),
+{
+    let content_checkpoint_context = checkpoint.map(|(_, context)| context.child("content-review"));
+    let content_checkpoint = match (checkpoint, content_checkpoint_context.as_ref()) {
+        (Some((store, _)), Some(context)) => Some((store, context)),
+        _ => None,
+    };
+    let content_result = review_translation_content_subtitles(
+        settings,
+        ai_service,
+        log_session,
+        source_segments,
+        translated_segments,
+        |progress, message, status, snapshot, snapshot_warnings| {
+            let mapped_progress = scale_substage_progress(0, REVIEW_CONTENT_PROGRESS_END, progress);
+            let mapped_message = review_substage_message("内容审核", message);
+            report(
+                mapped_progress,
+                &mapped_message,
+                status,
+                snapshot,
+                snapshot_warnings,
+            );
+        },
+        content_checkpoint,
+    )
+    .await;
+
+    let mut warnings = content_result.warnings;
+    let (reviewed_source_segments, reviewed_translated_segments) = filter_removed_translation_pairs(
+        &content_result.source_segments,
+        &content_result.translated_segments,
+    );
+
+    if reviewed_source_segments.is_empty() || reviewed_translated_segments.is_empty() {
+        return SubtitleReviewResult {
+            source_segments: content_result.source_segments,
+            translated_segments: content_result.translated_segments,
+            warnings,
+        };
+    }
+
+    let source_reflow_checkpoint_context =
+        checkpoint.map(|(_, context)| context.child("source-reflow"));
+    let source_reflow_checkpoint = match (checkpoint, source_reflow_checkpoint_context.as_ref()) {
+        (Some((store, _)), Some(context)) => Some((store, context)),
+        _ => None,
+    };
+    let previous_warnings = warnings.clone();
+    let source_reflow_result = optimize_review_source_segments(
+        settings,
+        ai_service,
+        log_session,
+        reviewed_source_segments,
+        reviewed_translated_segments,
+        |progress, message, status, snapshot, snapshot_warnings| {
+            let mut combined_warnings = previous_warnings.clone();
+            combined_warnings.extend(snapshot_warnings.iter().cloned());
+            let mapped_progress = scale_substage_progress(
+                REVIEW_CONTENT_PROGRESS_END,
+                REVIEW_SOURCE_REFLOW_PROGRESS_END,
+                progress,
+            );
+            let mapped_message = review_substage_message("源文断句优化", message);
+            report(
+                mapped_progress,
+                &mapped_message,
+                status,
+                snapshot,
+                &combined_warnings,
+            );
+        },
+        source_reflow_checkpoint,
+    )
+    .await;
+    warnings.extend(source_reflow_result.warnings);
+
+    let target_optimization_checkpoint_context =
+        checkpoint.map(|(_, context)| context.child("target-optimization"));
+    let target_optimization_checkpoint =
+        match (checkpoint, target_optimization_checkpoint_context.as_ref()) {
+            (Some((store, _)), Some(context)) => Some((store, context)),
+            _ => None,
+        };
+    let previous_warnings = warnings.clone();
+    let target_optimization_result = optimize_review_target_segments(
+        settings,
+        ai_service,
+        log_session,
+        &source_reflow_result.source_segments,
+        source_reflow_result.translated_segments,
+        |progress, message, status, snapshot, snapshot_warnings| {
+            let mut combined_warnings = previous_warnings.clone();
+            combined_warnings.extend(snapshot_warnings.iter().cloned());
+            let mapped_progress =
+                scale_substage_progress(REVIEW_SOURCE_REFLOW_PROGRESS_END, 100, progress);
+            let mapped_message = review_substage_message("译文优化", message);
+            report(
+                mapped_progress,
+                &mapped_message,
+                status,
+                snapshot,
+                &combined_warnings,
+            );
+        },
+        target_optimization_checkpoint,
+    )
+    .await;
+    warnings.extend(target_optimization_result.warnings);
+
+    SubtitleReviewResult {
+        source_segments: source_reflow_result.source_segments,
+        translated_segments: target_optimization_result.translated_segments,
+        warnings,
+    }
+}
+
+async fn review_translation_content_subtitles<F>(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    log_session: &LogSession,
     mut source_segments: Vec<TranscriptionSegment>,
     mut translated_segments: Vec<TranscriptionSegment>,
     mut report: F,
@@ -1267,6 +1465,433 @@ where
     }
 }
 
+async fn optimize_review_source_segments<F>(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    log_session: &LogSession,
+    source_segments: Vec<TranscriptionSegment>,
+    translated_segments: Vec<TranscriptionSegment>,
+    mut report: F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
+) -> SourceReflowResult
+where
+    F: FnMut(u8, &str, &str, &SubtitleReviewSnapshot, &[String]),
+{
+    let blocks = build_source_reflow_blocks(&source_segments, &translated_segments);
+    if blocks.is_empty() {
+        return SourceReflowResult {
+            source_segments,
+            translated_segments,
+            warnings: Vec::new(),
+        };
+    }
+
+    log_session.info(
+        "ai_subtitle_review_source_reflow_prepared",
+        "AI 审核源文断句优化批次已准备",
+        json!({
+            "inputSegmentCount": source_segments.len(),
+            "blockCount": blocks.len(),
+            "maxBlockWords": REVIEW_SOURCE_REFLOW_MAX_WORDS,
+            "pipelineVersion": AI_SUBTITLE_REVIEW_PIPELINE_VERSION,
+        }),
+    );
+
+    let total = blocks.len().max(1);
+    let max_active = active_ai_work_count(settings);
+    let mut outputs: Vec<Option<SourceReflowBlockResult>> = vec![None; blocks.len()];
+    let mut checkpoint_done_blocks = HashSet::new();
+    let mut completed = 0usize;
+    let mut failed_blocks = 0usize;
+    let mut warnings = Vec::new();
+
+    if let Some((store, context)) = checkpoint {
+        for block in &blocks {
+            let checkpoint_key = source_reflow_block_key(block.block_id);
+            match load_checkpoint::<TranslationReviewRangeCheckpoint>(
+                store,
+                context,
+                &checkpoint_key,
+            ) {
+                Ok(Some(payload))
+                    if !payload.source_segments.is_empty()
+                        && !payload.translated_segments.is_empty() =>
+                {
+                    outputs[block.block_id] = Some(SourceReflowBlockResult {
+                        block: block.clone(),
+                        source_segments: payload.source_segments,
+                        translated_segments: payload.translated_segments,
+                    });
+                    checkpoint_done_blocks.insert(block.block_id);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "source_reflow_checkpoint_load_failed",
+                    "读取源文断句优化检查点失败，将重新执行批次",
+                    json!({ "blockIndex": block.block_id + 1, "error": error }),
+                ),
+            }
+        }
+    }
+
+    let mut futures = FuturesUnordered::new();
+    let mut next_block_index = 0usize;
+    while next_block_index < blocks.len() && futures.len() < max_active {
+        let block = blocks[next_block_index].clone();
+        if checkpoint_done_blocks.contains(&block.block_id) {
+            next_block_index += 1;
+            continue;
+        }
+        if let Some((store, context)) = checkpoint {
+            let _ =
+                mark_checkpoint_active(store, context, &source_reflow_block_key(block.block_id));
+        }
+        futures.push(run_source_reflow_block(
+            settings,
+            ai_service,
+            block,
+            log_session.clone(),
+        ));
+        next_block_index += 1;
+    }
+
+    let snapshot = source_reflow_snapshot(&blocks, &outputs);
+    report(
+        stage_progress(0, 100, completed, total),
+        "源文断句优化中",
+        "active",
+        &snapshot,
+        &warnings,
+    );
+
+    while let Some(result) = futures.next().await {
+        completed += 1;
+
+        match result {
+            Ok(result) => {
+                let block_id = result.block.block_id;
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &source_reflow_block_key(block_id),
+                        &TranslationReviewRangeCheckpoint {
+                            source_segments: result.source_segments.clone(),
+                            translated_segments: result.translated_segments.clone(),
+                        },
+                    );
+                }
+                outputs[block_id] = Some(result);
+            }
+            Err((block, error)) => {
+                failed_blocks += 1;
+                let fallback = fallback_source_reflow_block(&block);
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &source_reflow_block_key(block.block_id),
+                        &error,
+                    );
+                }
+                log_session.warn(
+                    "source_reflow_block_failed",
+                    "源文断句优化批次失败，已使用规则兜底",
+                    json!({
+                        "blockIndex": block.block_id + 1,
+                        "sourceSegmentCount": block.original_source_segments.len(),
+                        "error": &error,
+                    }),
+                );
+                outputs[block.block_id] = Some(fallback);
+            }
+        }
+
+        while next_block_index < blocks.len() && futures.len() < max_active {
+            let block = blocks[next_block_index].clone();
+            if checkpoint_done_blocks.contains(&block.block_id) {
+                next_block_index += 1;
+                continue;
+            }
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &source_reflow_block_key(block.block_id),
+                );
+            }
+            futures.push(run_source_reflow_block(
+                settings,
+                ai_service,
+                block,
+                log_session.clone(),
+            ));
+            next_block_index += 1;
+        }
+
+        warnings = build_processing_warnings("源文断句优化", failed_blocks, "优化批次");
+        let snapshot = source_reflow_snapshot(&blocks, &outputs);
+        let progress = stage_progress(0, 100, completed, total);
+        let message = if completed == total {
+            "源文断句优化完成"
+        } else {
+            "源文断句优化中"
+        };
+        let status = if completed == total { "done" } else { "active" };
+        report(progress, message, status, &snapshot, &warnings);
+    }
+
+    if failed_blocks > 0 {
+        log_session.warn(
+            "source_reflow_stage_partial",
+            "源文断句优化部分批次失败，已使用规则兜底",
+            json!({
+                "failedBlockCount": failed_blocks,
+                "blockCount": total,
+            }),
+        );
+    }
+
+    let snapshot = source_reflow_snapshot(&blocks, &outputs);
+    SourceReflowResult {
+        source_segments: snapshot.source_segments,
+        translated_segments: snapshot.translated_segments,
+        warnings,
+    }
+}
+
+async fn optimize_review_target_segments<F>(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    log_session: &LogSession,
+    source_segments: &[TranscriptionSegment],
+    mut translated_segments: Vec<TranscriptionSegment>,
+    mut report: F,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
+) -> TargetOptimizationResult
+where
+    F: FnMut(u8, &str, &str, &SubtitleReviewSnapshot, &[String]),
+{
+    let chunks = build_target_optimization_chunks(
+        source_segments,
+        &translated_segments,
+        settings.translation_batch_size.max(1) as usize,
+    );
+    if chunks.is_empty() {
+        return TargetOptimizationResult {
+            translated_segments,
+            warnings: Vec::new(),
+        };
+    }
+
+    log_session.info(
+        "ai_subtitle_review_target_optimization_prepared",
+        "AI 审核译文优化批次已准备",
+        json!({
+            "inputSegmentCount": translated_segments.len(),
+            "chunkCount": chunks.len(),
+            "batchSize": settings.translation_batch_size.max(1),
+            "targetLanguage": &settings.target_language,
+            "pipelineVersion": AI_SUBTITLE_REVIEW_PIPELINE_VERSION,
+        }),
+    );
+
+    let total = chunks.len().max(1);
+    let max_active = active_ai_work_count(settings);
+    let mut futures = FuturesUnordered::new();
+    let mut next_chunk_index = 0usize;
+    let mut completed = 0usize;
+    let mut failed_chunks = 0usize;
+    let mut warnings = Vec::new();
+    let mut checkpoint_done_chunks = HashSet::new();
+
+    if let Some((store, context)) = checkpoint {
+        for chunk in &chunks {
+            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
+            match load_checkpoint::<TranslationRangeCheckpoint>(store, context, &checkpoint_key) {
+                Ok(Some(payload)) if !payload.segments.is_empty() => {
+                    apply_checkpoint_segments(
+                        &mut translated_segments,
+                        chunk.start_index,
+                        payload.segments,
+                    );
+                    checkpoint_done_chunks.insert(chunk.start_index);
+                    completed += 1;
+                }
+                Ok(_) => {}
+                Err(error) => log_session.warn(
+                    "target_optimization_checkpoint_load_failed",
+                    "读取译文优化检查点失败，将重新执行批次",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": error,
+                    }),
+                ),
+            }
+        }
+    }
+
+    while next_chunk_index < chunks.len() && futures.len() < max_active {
+        let chunk = chunks[next_chunk_index].clone();
+        if checkpoint_done_chunks.contains(&chunk.start_index) {
+            next_chunk_index += 1;
+            continue;
+        }
+        mark_range_status(
+            &mut translated_segments,
+            chunk.start_index,
+            chunk.end_index,
+            "optimizing",
+        );
+        if let Some((store, context)) = checkpoint {
+            let _ = mark_checkpoint_active(
+                store,
+                context,
+                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+            );
+        }
+        futures.push(run_target_optimization_chunk(
+            settings,
+            ai_service,
+            chunk,
+            log_session.clone(),
+        ));
+        next_chunk_index += 1;
+    }
+
+    let snapshot = SubtitleReviewSnapshot {
+        source_segments: source_segments.to_vec(),
+        translated_segments: translated_segments.clone(),
+    };
+    report(
+        stage_progress(0, 100, completed, total),
+        "译文优化中",
+        "active",
+        &snapshot,
+        &warnings,
+    );
+
+    while let Some(result) = futures.next().await {
+        completed += 1;
+
+        match result {
+            Ok(result) => {
+                for (index, text) in result.entries {
+                    if let Some(segment) = translated_segments.get_mut(index) {
+                        segment.text = text;
+                        segment.status = "optimized".to_string();
+                    }
+                }
+                mark_range_status(
+                    &mut translated_segments,
+                    result.chunk.start_index,
+                    result.chunk.end_index,
+                    "optimized",
+                );
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_done(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &translation_range_checkpoint(
+                            &translated_segments,
+                            result.chunk.start_index,
+                            result.chunk.end_index,
+                        ),
+                    );
+                }
+            }
+            Err((chunk, error)) => {
+                failed_chunks += 1;
+                mark_range_status(
+                    &mut translated_segments,
+                    chunk.start_index,
+                    chunk.end_index,
+                    "reviewed",
+                );
+                if let Some((store, context)) = checkpoint {
+                    let _ = mark_checkpoint_failed(
+                        store,
+                        context,
+                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                        &error,
+                    );
+                }
+                log_session.warn(
+                    "target_optimization_chunk_failed",
+                    "译文优化批次失败，已保留当前译文",
+                    json!({
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "entryCount": chunk.entries.len(),
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+
+        while next_chunk_index < chunks.len() && futures.len() < max_active {
+            let chunk = chunks[next_chunk_index].clone();
+            if checkpoint_done_chunks.contains(&chunk.start_index) {
+                next_chunk_index += 1;
+                continue;
+            }
+            mark_range_status(
+                &mut translated_segments,
+                chunk.start_index,
+                chunk.end_index,
+                "optimizing",
+            );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
+                );
+            }
+            futures.push(run_target_optimization_chunk(
+                settings,
+                ai_service,
+                chunk,
+                log_session.clone(),
+            ));
+            next_chunk_index += 1;
+        }
+
+        warnings = build_processing_warnings("译文优化", failed_chunks, "优化批次");
+        let snapshot = SubtitleReviewSnapshot {
+            source_segments: source_segments.to_vec(),
+            translated_segments: translated_segments.clone(),
+        };
+        let progress = stage_progress(0, 100, completed, total);
+        let message = if completed == total {
+            "译文优化完成"
+        } else {
+            "译文优化中"
+        };
+        let status = if completed == total { "done" } else { "active" };
+        report(progress, message, status, &snapshot, &warnings);
+    }
+
+    if failed_chunks > 0 {
+        log_session.warn(
+            "target_optimization_stage_partial",
+            "译文优化部分批次失败，已保留当前译文",
+            json!({
+                "failedChunkCount": failed_chunks,
+                "chunkCount": total,
+            }),
+        );
+    }
+
+    TargetOptimizationResult {
+        translated_segments,
+        warnings,
+    }
+}
+
 async fn run_translation_chunk(
     settings: &AppSettings,
     ai_service: &AiService,
@@ -1284,6 +1909,24 @@ async fn run_translation_review_chunk(
     log_session: LogSession,
 ) -> Result<TranslationReviewChunkResult, (TextChunk, String)> {
     review_translation_chunk_by_llm(settings, ai_service, source_entries, chunk, log_session).await
+}
+
+async fn run_source_reflow_block(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    block: SourceReflowBlock,
+    log_session: LogSession,
+) -> Result<SourceReflowBlockResult, (SourceReflowBlock, String)> {
+    source_reflow_block_by_llm(settings, ai_service, block, log_session).await
+}
+
+async fn run_target_optimization_chunk(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: TargetOptimizationChunk,
+    log_session: LogSession,
+) -> Result<TargetOptimizationChunkResult, (TargetOptimizationChunk, String)> {
+    target_optimization_chunk_by_llm(settings, ai_service, chunk, log_session).await
 }
 
 async fn translate_chunk_by_llm(
@@ -1603,6 +2246,209 @@ async fn review_translation_chunk_by_llm(
     Err((chunk, "LLM AI 字幕审核结果多次校验失败".to_string()))
 }
 
+async fn source_reflow_block_by_llm(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    block: SourceReflowBlock,
+    log_session: LogSession,
+) -> Result<SourceReflowBlockResult, (SourceReflowBlock, String)> {
+    if block.words.is_empty() {
+        return Ok(fallback_source_reflow_block(&block));
+    }
+
+    let system_prompt = build_source_reflow_system_prompt(settings);
+    let source_text = join_review_word_units(&block.words);
+    let max_output_tokens = estimate_max_output_tokens(&source_text);
+    let mut feedback = String::new();
+
+    for attempt in 1..=MAX_AI_SUBTITLE_REVIEW_ATTEMPTS {
+        let user_prompt = build_source_reflow_user_prompt(&block, &source_text, &feedback);
+        let response = match ai_service
+            .chat_for_json_output(
+                settings,
+                system_prompt.clone(),
+                user_prompt,
+                max_output_tokens,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log_session.warn(
+                    "source_reflow_llm_request_failed",
+                    "源文断句优化 LLM 请求失败",
+                    json!({
+                        "attempt": attempt,
+                        "blockIndex": block.block_id + 1,
+                        "error": &error,
+                    }),
+                );
+                return Err((block, error));
+            }
+        };
+
+        let sentences = match parse_source_reflow_response(&response) {
+            Ok(sentences) => sentences,
+            Err(error) => {
+                feedback = build_source_reflow_feedback(&source_text, &error);
+                log_session.warn(
+                    "source_reflow_validation_failed",
+                    "源文断句优化结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "blockIndex": block.block_id + 1,
+                        "validationType": "json_parse",
+                        "error": &error,
+                    }),
+                );
+                continue;
+            }
+        };
+
+        match build_reflowed_source_segments(&source_text, &block.words, &sentences) {
+            Ok(mut source_segments) => {
+                assign_segment_metadata(
+                    &mut source_segments,
+                    &format!("review-src-{}", block.block_id),
+                    "reviewed",
+                );
+                let mut translated_segments = build_draft_translated_segments_for_sources(
+                    &source_segments,
+                    &block.original_translated_segments,
+                );
+                assign_segment_metadata(
+                    &mut translated_segments,
+                    &format!("review-target-draft-{}", block.block_id),
+                    "reviewing",
+                );
+                return Ok(SourceReflowBlockResult {
+                    block,
+                    source_segments,
+                    translated_segments,
+                });
+            }
+            Err(error) => {
+                feedback = build_source_reflow_feedback(&source_text, &error);
+                log_session.warn(
+                    "source_reflow_validation_failed",
+                    "源文断句优化结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "blockIndex": block.block_id + 1,
+                        "validationType": "content_or_timing",
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+    }
+
+    Err((block, "LLM 源文断句优化结果多次校验失败".to_string()))
+}
+
+async fn target_optimization_chunk_by_llm(
+    settings: &AppSettings,
+    ai_service: &AiService,
+    chunk: TargetOptimizationChunk,
+    log_session: LogSession,
+) -> Result<TargetOptimizationChunkResult, (TargetOptimizationChunk, String)> {
+    let system_prompt = build_target_optimization_system_prompt(settings);
+    let current_text = chunk
+        .entries
+        .values()
+        .map(|entry| {
+            if entry.draft_translation.trim().is_empty() {
+                entry.source_text.as_str()
+            } else {
+                entry.draft_translation.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let max_output_tokens = estimate_max_output_tokens(&current_text);
+    let mut feedback = String::new();
+
+    for attempt in 1..=MAX_AI_SUBTITLE_REVIEW_ATTEMPTS {
+        let user_prompt = build_target_optimization_user_prompt(&chunk.entries, &feedback);
+        let response = match ai_service
+            .chat_for_json_output(
+                settings,
+                system_prompt.clone(),
+                user_prompt,
+                max_output_tokens,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log_session.warn(
+                    "target_optimization_llm_request_failed",
+                    "译文优化 LLM 请求失败",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "error": &error,
+                    }),
+                );
+                return Err((chunk, error));
+            }
+        };
+
+        let parsed = match parse_json_text_map(&response) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                feedback = build_target_optimization_json_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "target_optimization_validation_failed",
+                    "译文优化结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "json_parse",
+                        "error": &error,
+                    }),
+                );
+                continue;
+            }
+        };
+
+        let expected = target_optimization_expected_text_map(&chunk.entries);
+        match validate_or_remap_relative_keys(&expected, parsed)
+            .and_then(|parsed| validate_target_optimization_texts(&parsed).map(|()| parsed))
+        {
+            Ok(parsed) => {
+                let entries = parsed
+                    .into_iter()
+                    .filter_map(|(key, text)| {
+                        key.parse::<usize>()
+                            .ok()
+                            .map(|index| (index - 1, normalize_target_optimized_text(&text)))
+                    })
+                    .collect();
+                return Ok(TargetOptimizationChunkResult { chunk, entries });
+            }
+            Err(error) => {
+                feedback = build_target_optimization_key_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "target_optimization_validation_failed",
+                    "译文优化结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "key_or_text",
+                        "error": &error,
+                    }),
+                );
+            }
+        }
+    }
+
+    Err((chunk, "LLM 译文优化结果多次校验失败".to_string()))
+}
+
 #[derive(Debug, Clone)]
 struct TranslationReviewEntry {
     source: ReviewedTranslationEntry,
@@ -1880,6 +2726,163 @@ fn translation_review_output_template(
         .collect::<serde_json::Map<_, _>>();
 
     Value::Object(template).to_string()
+}
+
+fn build_source_reflow_system_prompt(settings: &AppSettings) -> String {
+    let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
+        "保守模式：只修复明确的坏断句、孤立词、句尾词跑到下一行、明显不完整短片段；不要改写源文。"
+    } else {
+        "专家模式：以最终字幕阅读质量为目标，积极修复坏断句、孤立短片段、跨行句子和不自然边界；仍然不能改写源文。"
+    };
+    let domain_rule = match settings.video_content_type.as_str() {
+        "trading" => "交易内容：保护价格、百分比、ticker、周期、交易方向、条件关系和术语，不要把一个交易判断拆散。",
+        _ => "通用内容：优先保持完整自然句，一句话尽量一行；过长时只在逗号、分号、转折或自然语义停顿处拆分。",
+    };
+
+    format!(
+        r#"你是一位专业字幕断句终审专家。你只负责重新安排源文字幕断句，不翻译、不改写、不增删任何源文字符。
+
+<review_mode>{mode_rule}</review_mode>
+<domain_rule>{domain_rule}</domain_rule>
+
+<rules>
+1. 输出的所有 source 片段按顺序拼接后，必须与 inputSourceText 完全一致；只能改变断句位置。
+2. 一句话最好保持在一条字幕中，不要把主语、宾语、地点、句尾词或短语尾巴单独拆成一行。
+3. 如果句子太长，可以在逗号、分号、连接词、转折、停顿或语义边界拆成多条。
+4. 不要输出单词级碎片，除非它本身是完整回答、标题或独立短句。
+5. 不输出时间戳；时间轴会由程序根据词序重建。
+6. 输出只能是 JSON object，格式为 {{ "segments": ["源文片段1", "源文片段2"] }}。
+</rules>"#
+    )
+}
+
+fn build_source_reflow_user_prompt(
+    block: &SourceReflowBlock,
+    source_text: &str,
+    feedback: &str,
+) -> String {
+    let entries = block
+        .original_source_segments
+        .iter()
+        .zip(block.original_translated_segments.iter())
+        .enumerate()
+        .map(|(index, (source, translated))| {
+            (
+                (index + 1).to_string(),
+                SourceReflowPromptEntry {
+                    source_text: source.text.clone(),
+                    draft_translation: translated.text.clone(),
+                    start_ms: source.start_time,
+                    end_ms: source.end_time,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let entries_json = serde_json::to_string(&entries).unwrap_or_else(|_| "{}".to_string());
+    let mut prompt = format!(
+        "请重排以下字幕源文断句。currentItems 是当前字幕和草稿译文，draftTranslation 仅用于理解上下文。\n\
+         <inputSourceText>{source_text}</inputSourceText>\n\
+         <currentItems>{entries_json}</currentItems>\n\
+         <outputTemplate>{{\"segments\":[\"源文片段1\",\"源文片段2\"]}}</outputTemplate>\n\
+         <validationRule>segments 按顺序拼接后必须与 inputSourceText 完全一致，不能改字、加标点、删词或翻译。</validationRule>"
+    );
+
+    if !feedback.is_empty() {
+        prompt.push_str("\n<feedback>");
+        prompt.push_str(feedback);
+        prompt.push_str("</feedback>");
+    }
+
+    prompt
+}
+
+fn build_source_reflow_feedback(source_text: &str, error: &str) -> String {
+    format!(
+        "上一次源文断句结果无效: {error}\n请只输出 JSON: {{\"segments\":[...]}}。segments 拼接后必须严格等于以下文本，不要修改任何字符: {source_text}"
+    )
+}
+
+fn build_target_optimization_system_prompt(settings: &AppSettings) -> String {
+    let target_language = language_label(&settings.target_language);
+    let custom_prompt = translation_review_reference(&settings.video_content_type);
+    let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
+        "保守模式：优先修正错译、漏译、明显不通顺、标点和跨行衔接；不要过度改写风格。"
+    } else {
+        "专家模式：以最终发布字幕质量为目标，在准确保留原意前提下重写为自然、流畅、适合字幕阅读的表达。"
+    };
+
+    format!(
+        r#"你是一位专业字幕译文终审专家，目标语言是{target_language}。你会根据已经优化后的源文分段，重新优化每条译文。
+
+<review_mode>{mode_rule}</review_mode>
+<terminology_and_requirements>
+{custom_prompt}
+</terminology_and_requirements>
+
+<rules>
+1. key 必须与输入完全一致，不新增、不删除、不重命名。
+2. 每个 key 输出一条最终译文；译文必须准确对应同 key 的 sourceText。
+3. draftTranslation 只是草稿参考，可以重写、合并上下文表达、修正机器翻译腔和前后不顺。
+4. 一句话最好保持在一条字幕中；如果源文本身已经按逗号、转折或长度拆分，译文跟随源文分段。
+5. 不要在单个译文内输出换行符；不要输出解释、评分、Markdown 或额外字段。
+6. 严格保护数字、金额、比例、专有名词、方向性判断、事实和风险提示。
+7. 输出只能是单个 JSON object，第一字符必须是 {{，最后字符必须是 }}。
+</rules>"#
+    )
+}
+
+fn build_target_optimization_user_prompt(
+    entries: &BTreeMap<String, TargetOptimizationPromptEntry>,
+    feedback: &str,
+) -> String {
+    let input_json = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
+    let output_template = target_optimization_output_template(entries);
+    let mut prompt = format!(
+        "请优化以下已重排字幕的最终译文。最终必须输出 JSON object，key 必须与 inputItems 完全一致。\n\
+         <inputItems>{input_json}</inputItems>\n\
+         <outputTemplate>{output_template}</outputTemplate>\n\
+         <templateRule>复制 outputTemplate 的外层结构和全部 key，只把 value 改成最终译文字符串。</templateRule>\n\
+         <finalAnswerRule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</finalAnswerRule>"
+    );
+
+    if !feedback.is_empty() {
+        prompt.push_str("\n<feedback>");
+        prompt.push_str(feedback);
+        prompt.push_str("</feedback>");
+    }
+
+    prompt
+}
+
+fn build_target_optimization_json_feedback(
+    entries: &BTreeMap<String, TargetOptimizationPromptEntry>,
+    error: &str,
+) -> String {
+    let output_template = target_optimization_output_template(entries);
+    format!(
+        "上一次译文优化结果不是有效 JSON: {error}\n请只输出完整 JSON 对象，第一字符必须是 {{，最后字符必须是 }}。请复制这个结构: {output_template}"
+    )
+}
+
+fn build_target_optimization_key_feedback(
+    entries: &BTreeMap<String, TargetOptimizationPromptEntry>,
+    error: &str,
+) -> String {
+    let output_template = target_optimization_output_template(entries);
+    format!(
+        "上一次译文优化结果 key 或文本不合法: {error}\n必须包含全部原始 key，不能新增、遗漏或重命名，value 必须是非空单行译文。请复制这个结构: {output_template}"
+    )
+}
+
+fn target_optimization_output_template(
+    entries: &BTreeMap<String, TargetOptimizationPromptEntry>,
+) -> String {
+    let template = entries
+        .keys()
+        .map(|key| (key.clone(), "最终优化译文".to_string()))
+        .collect::<BTreeMap<_, _>>();
+
+    serde_json::to_string(&template).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn translation_reference(video_content_type: &str) -> &'static str {
@@ -2350,6 +3353,519 @@ fn parse_seconds_millis(text: &str) -> Result<(u64, u64), String> {
     Ok((seconds, millis))
 }
 
+fn build_source_reflow_blocks(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &[TranscriptionSegment],
+) -> Vec<SourceReflowBlock> {
+    let mut blocks = Vec::new();
+    let mut current_source = Vec::new();
+    let mut current_translated = Vec::new();
+    let mut current_words = Vec::new();
+    let mut current_word_count = 0usize;
+
+    for (index, source) in source_segments.iter().enumerate() {
+        let translated = translated_segments
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| draft_segment_from_source(source, ""));
+        let words = build_review_word_units(std::slice::from_ref(source));
+        let word_count = count_review_word_units(&words).max(1);
+
+        if !current_source.is_empty()
+            && current_word_count + word_count > REVIEW_SOURCE_REFLOW_MAX_WORDS
+        {
+            push_source_reflow_block(
+                &mut blocks,
+                &mut current_source,
+                &mut current_translated,
+                &mut current_words,
+            );
+            current_word_count = 0;
+        }
+
+        current_source.push(source.clone());
+        current_translated.push(translated);
+        current_words.extend(words);
+        current_word_count += word_count;
+    }
+
+    push_source_reflow_block(
+        &mut blocks,
+        &mut current_source,
+        &mut current_translated,
+        &mut current_words,
+    );
+
+    blocks
+}
+
+fn push_source_reflow_block(
+    blocks: &mut Vec<SourceReflowBlock>,
+    current_source: &mut Vec<TranscriptionSegment>,
+    current_translated: &mut Vec<TranscriptionSegment>,
+    current_words: &mut Vec<ReviewWordUnit>,
+) {
+    if current_source.is_empty() {
+        return;
+    }
+
+    let block_id = blocks.len();
+    blocks.push(SourceReflowBlock {
+        block_id,
+        original_source_segments: std::mem::take(current_source),
+        original_translated_segments: std::mem::take(current_translated),
+        words: std::mem::take(current_words),
+    });
+}
+
+fn source_reflow_snapshot(
+    blocks: &[SourceReflowBlock],
+    outputs: &[Option<SourceReflowBlockResult>],
+) -> SubtitleReviewSnapshot {
+    let mut source_segments = Vec::new();
+    let mut translated_segments = Vec::new();
+
+    for block in blocks {
+        if let Some(Some(output)) = outputs.get(block.block_id) {
+            source_segments.extend(output.source_segments.iter().cloned());
+            translated_segments.extend(output.translated_segments.iter().cloned());
+        } else {
+            let mut pending_source = block.original_source_segments.clone();
+            let mut pending_translated = block.original_translated_segments.clone();
+            mark_finished_segments_status(&mut pending_source, "reviewing");
+            mark_finished_segments_status(&mut pending_translated, "reviewing");
+            source_segments.extend(pending_source);
+            translated_segments.extend(pending_translated);
+        }
+    }
+
+    SubtitleReviewSnapshot {
+        source_segments,
+        translated_segments,
+    }
+}
+
+fn fallback_source_reflow_block(block: &SourceReflowBlock) -> SourceReflowBlockResult {
+    let mut source_segments = if block.words.is_empty() {
+        block.original_source_segments.clone()
+    } else {
+        let original_groups = block
+            .original_source_segments
+            .iter()
+            .map(|segment| build_review_word_units(std::slice::from_ref(segment)))
+            .filter(|group| !group.is_empty())
+            .collect::<Vec<_>>();
+        let groups = repair_review_word_groups(original_groups);
+        review_word_groups_to_segments(groups)
+    };
+
+    if source_segments.is_empty() {
+        source_segments = block.original_source_segments.clone();
+    }
+
+    assign_segment_metadata(
+        &mut source_segments,
+        &format!("review-src-fallback-{}", block.block_id),
+        "reviewed",
+    );
+    let mut translated_segments = build_draft_translated_segments_for_sources(
+        &source_segments,
+        &block.original_translated_segments,
+    );
+    assign_segment_metadata(
+        &mut translated_segments,
+        &format!("review-target-draft-{}", block.block_id),
+        "reviewing",
+    );
+
+    SourceReflowBlockResult {
+        block: block.clone(),
+        source_segments,
+        translated_segments,
+    }
+}
+
+fn build_review_word_units(segments: &[TranscriptionSegment]) -> Vec<ReviewWordUnit> {
+    segments
+        .iter()
+        .flat_map(|segment| {
+            if segment.words.is_empty() {
+                estimate_review_word_units(segment)
+            } else {
+                let mut words = segment
+                    .words
+                    .iter()
+                    .filter_map(|word| {
+                        let text = word.text.trim().to_string();
+                        if text.is_empty() {
+                            None
+                        } else {
+                            Some(ReviewWordUnit {
+                                text,
+                                start_time: word.start_time,
+                                end_time: word.end_time,
+                            })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if words.is_empty() {
+                    estimate_review_word_units(segment)
+                } else {
+                    apply_review_segment_timing_bounds(&mut words, segment);
+                    words
+                }
+            }
+        })
+        .collect()
+}
+
+fn estimate_review_word_units(segment: &TranscriptionSegment) -> Vec<ReviewWordUnit> {
+    let tokens = split_review_text_tokens(&segment.text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let duration = segment.end_time.saturating_sub(segment.start_time);
+    let total_weight = tokens
+        .iter()
+        .map(|token| review_normalized_len(token).max(1) as u64)
+        .sum::<u64>()
+        .max(1);
+    let mut current_time = segment.start_time;
+    let mut words = Vec::with_capacity(tokens.len());
+
+    for (index, token) in tokens.iter().enumerate() {
+        let weight = review_normalized_len(token).max(1) as u64;
+        let end_time = if index == tokens.len() - 1 {
+            segment.end_time
+        } else {
+            current_time.saturating_add(duration.saturating_mul(weight) / total_weight)
+        };
+        words.push(ReviewWordUnit {
+            text: token.clone(),
+            start_time: current_time,
+            end_time,
+        });
+        current_time = end_time;
+    }
+
+    words
+}
+
+fn apply_review_segment_timing_bounds(
+    words: &mut [ReviewWordUnit],
+    segment: &TranscriptionSegment,
+) {
+    if words.is_empty() {
+        return;
+    }
+
+    if let Some(first) = words.first_mut() {
+        first.start_time = first.start_time.max(segment.start_time);
+        if first.end_time < first.start_time {
+            first.end_time = first.start_time;
+        }
+    }
+
+    if let Some(last) = words.last_mut() {
+        last.end_time = last.end_time.max(segment.end_time);
+        if last.start_time > last.end_time {
+            last.start_time = last.end_time;
+        }
+    }
+}
+
+fn split_review_text_tokens(text: &str) -> Vec<String> {
+    if is_review_mainly_no_space_language(text) {
+        return text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .map(|character| character.to_string())
+            .collect();
+    }
+
+    text.split_whitespace().map(ToOwned::to_owned).collect()
+}
+
+fn build_reflowed_source_segments(
+    source_text: &str,
+    words: &[ReviewWordUnit],
+    sentences: &[String],
+) -> Result<Vec<TranscriptionSegment>, String> {
+    if sentences.is_empty() {
+        return Err("没有找到源文断句结果".to_string());
+    }
+    validate_source_reflow_content(source_text, sentences)?;
+    let groups = review_word_groups_by_sentences(words, sentences)?;
+    let groups = repair_review_word_groups(groups);
+    let source_segments = review_word_groups_to_segments(groups);
+    let repaired_sentences = source_segments
+        .iter()
+        .map(|segment| segment.text.clone())
+        .collect::<Vec<_>>();
+    validate_source_reflow_content(source_text, &repaired_sentences)?;
+    validate_review_segment_lengths(&repaired_sentences)?;
+    Ok(source_segments)
+}
+
+fn review_word_groups_by_sentences(
+    words: &[ReviewWordUnit],
+    sentences: &[String],
+) -> Result<Vec<Vec<ReviewWordUnit>>, String> {
+    if words.is_empty() {
+        return Err("源文没有可用于重建时间轴的 token".to_string());
+    }
+
+    let mut groups = Vec::new();
+    let mut word_index = 0usize;
+
+    for sentence in sentences {
+        let target_len = review_normalized_len(sentence);
+        if target_len == 0 {
+            continue;
+        }
+
+        let start_index = word_index;
+        let mut current_len = 0usize;
+        while word_index < words.len() && (current_len < target_len || word_index == start_index) {
+            current_len += review_normalized_len(&words[word_index].text).max(1);
+            word_index += 1;
+        }
+
+        if start_index < word_index {
+            groups.push(words[start_index..word_index].to_vec());
+        }
+    }
+
+    if word_index < words.len() {
+        groups.push(words[word_index..].to_vec());
+    }
+
+    if groups.is_empty() {
+        Err("源文断句结果无法映射到时间轴".to_string())
+    } else {
+        Ok(groups)
+    }
+}
+
+fn repair_review_word_groups(mut groups: Vec<Vec<ReviewWordUnit>>) -> Vec<Vec<ReviewWordUnit>> {
+    let mut index = 0usize;
+    while index + 1 < groups.len() {
+        move_prefix_words_to_complete_previous(&mut groups, index);
+        index += 1;
+    }
+
+    let mut repaired: Vec<Vec<ReviewWordUnit>> = Vec::new();
+    for group in groups.into_iter().filter(|group| !group.is_empty()) {
+        let should_merge = repaired
+            .last()
+            .map(|previous| should_merge_short_fragment(previous, &group))
+            .unwrap_or(false);
+        if should_merge {
+            if let Some(previous) = repaired.last_mut() {
+                previous.extend(group);
+            }
+        } else {
+            repaired.push(group);
+        }
+    }
+
+    repaired
+}
+
+fn move_prefix_words_to_complete_previous(groups: &mut [Vec<ReviewWordUnit>], index: usize) {
+    if index + 1 >= groups.len() || groups[index].is_empty() || groups[index + 1].is_empty() {
+        return;
+    }
+
+    let mut moved = 0usize;
+    while moved < 4 && !groups[index + 1].is_empty() {
+        let previous_text = join_review_word_units(&groups[index]);
+        if !needs_previous_completion(&previous_text) {
+            break;
+        }
+
+        let next_word = groups[index + 1][0].clone();
+        if !can_move_prefix_word(&groups[index], &groups[index + 1], &next_word) {
+            break;
+        }
+
+        let moved_word = groups[index + 1].remove(0);
+        groups[index].push(moved_word);
+        moved += 1;
+
+        if is_terminal_text(&next_word.text) {
+            break;
+        }
+    }
+}
+
+fn should_merge_short_fragment(previous: &[ReviewWordUnit], current: &[ReviewWordUnit]) -> bool {
+    if previous.is_empty() || current.is_empty() {
+        return false;
+    }
+
+    let previous_text = join_review_word_units(previous);
+    let current_text = join_review_word_units(current);
+    if !is_short_orphan_fragment(&current_text) && !needs_previous_completion(&previous_text) {
+        return false;
+    }
+
+    let gap = current
+        .first()
+        .map(|first| first.start_time)
+        .unwrap_or_default()
+        .saturating_sub(
+            previous
+                .last()
+                .map(|last| last.end_time)
+                .unwrap_or_default(),
+        );
+    if gap > REVIEW_SHORT_FRAGMENT_GAP_MS && is_terminal_text(&previous_text) {
+        return false;
+    }
+
+    let merged_words = previous
+        .iter()
+        .chain(current.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let merged_text = join_review_word_units(&merged_words);
+    count_review_words(&merged_text) <= max_review_segment_words_for_text(&merged_text)
+}
+
+fn can_move_prefix_word(
+    previous: &[ReviewWordUnit],
+    next_group: &[ReviewWordUnit],
+    next_word: &ReviewWordUnit,
+) -> bool {
+    let gap = next_word.start_time.saturating_sub(
+        previous
+            .last()
+            .map(|word| word.end_time)
+            .unwrap_or_default(),
+    );
+    if gap > REVIEW_SHORT_FRAGMENT_GAP_MS {
+        return false;
+    }
+
+    let next_text = next_word.text.trim();
+    let previous_text = join_review_word_units(previous);
+    let candidate_words = previous
+        .iter()
+        .cloned()
+        .chain(std::iter::once(next_word.clone()))
+        .collect::<Vec<_>>();
+    let candidate_text = join_review_word_units(&candidate_words);
+
+    if count_review_words(&candidate_text) > max_review_segment_words_for_text(&candidate_text) {
+        return false;
+    }
+
+    starts_lowercase(next_text)
+        || is_terminal_text(next_text)
+        || previous_text.trim_end().ends_with(',')
+        || previous_text.trim_end().ends_with('，')
+        || next_group.len() <= 2
+}
+
+fn review_word_groups_to_segments(groups: Vec<Vec<ReviewWordUnit>>) -> Vec<TranscriptionSegment> {
+    groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .map(|group| TranscriptionSegment {
+            text: join_review_word_units(&group),
+            start_time: group
+                .first()
+                .map(|word| word.start_time)
+                .unwrap_or_default(),
+            end_time: group.last().map(|word| word.end_time).unwrap_or_default(),
+            uid: String::new(),
+            status: "reviewed".to_string(),
+            words: Vec::new(),
+        })
+        .collect()
+}
+
+fn build_draft_translated_segments_for_sources(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &[TranscriptionSegment],
+) -> Vec<TranscriptionSegment> {
+    source_segments
+        .iter()
+        .map(|source| {
+            let draft = translated_segments
+                .iter()
+                .filter(|translated| segments_overlap(source, translated))
+                .map(|translated| translated.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            draft_segment_from_source(source, &draft)
+        })
+        .collect()
+}
+
+fn draft_segment_from_source(source: &TranscriptionSegment, text: &str) -> TranscriptionSegment {
+    TranscriptionSegment {
+        text: text.to_string(),
+        start_time: source.start_time,
+        end_time: source.end_time,
+        uid: String::new(),
+        status: "reviewing".to_string(),
+        words: Vec::new(),
+    }
+}
+
+fn segments_overlap(a: &TranscriptionSegment, b: &TranscriptionSegment) -> bool {
+    let start = a.start_time.max(b.start_time);
+    let end = a.end_time.min(b.end_time);
+    start < end || a.start_time == b.start_time || a.end_time == b.end_time
+}
+
+fn build_target_optimization_chunks(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &[TranscriptionSegment],
+    batch_size: usize,
+) -> Vec<TargetOptimizationChunk> {
+    source_segments
+        .chunks(batch_size.max(1))
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let start_index = chunk_index * batch_size.max(1);
+            let mut entries = BTreeMap::new();
+            for (offset, source) in chunk.iter().enumerate() {
+                let index = start_index + offset;
+                let translated = translated_segments
+                    .get(index)
+                    .map(|segment| segment.text.clone())
+                    .unwrap_or_default();
+                entries.insert(
+                    (index + 1).to_string(),
+                    TargetOptimizationPromptEntry {
+                        source_text: source.text.clone(),
+                        draft_translation: translated,
+                    },
+                );
+            }
+            TargetOptimizationChunk {
+                start_index,
+                end_index: start_index + chunk.len().saturating_sub(1),
+                entries,
+            }
+        })
+        .collect()
+}
+
+fn target_optimization_expected_text_map(
+    entries: &BTreeMap<String, TargetOptimizationPromptEntry>,
+) -> BTreeMap<String, String> {
+    entries
+        .keys()
+        .map(|key| (key.clone(), String::new()))
+        .collect()
+}
+
 fn build_text_chunks(segments: &[TranscriptionSegment], batch_size: usize) -> Vec<TextChunk> {
     segments
         .chunks(batch_size.max(1))
@@ -2461,6 +3977,166 @@ fn apply_checkpoint_segments(
             *segment = checkpoint_segment;
         }
     }
+}
+
+fn parse_source_reflow_response(text: &str) -> Result<Vec<String>, String> {
+    let candidates = extract_json_value_candidates(text);
+    if candidates.is_empty() {
+        return Err("未找到 JSON 结果".to_string());
+    }
+
+    let mut last_error = String::new();
+    for json_text in candidates.iter().rev() {
+        let value = match serde_json::from_str::<Value>(json_text) {
+            Ok(value) => value,
+            Err(error) => {
+                last_error = format!("JSON 解析失败: {error}");
+                continue;
+            }
+        };
+
+        match parse_source_reflow_value(&value) {
+            Ok(sentences) => return Ok(sentences),
+            Err(error) => last_error = error,
+        }
+    }
+
+    Err(last_error)
+}
+
+fn parse_source_reflow_value(value: &Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::Array(items) => parse_source_reflow_array(items),
+        Value::Object(object) => {
+            for field in [
+                "segments",
+                "source_segments",
+                "sourceSegments",
+                "items",
+                "results",
+                "output",
+            ] {
+                if let Some(value) = object.get(field) {
+                    match value {
+                        Value::Array(items) => return parse_source_reflow_array(items),
+                        Value::String(text) => return parse_source_reflow_text(text),
+                        _ => {}
+                    }
+                }
+            }
+
+            if looks_like_subtitle_map(object) {
+                let text_map = parse_text_map_object(object)?;
+                return Ok(sorted_subtitle_keys(&text_map)
+                    .into_iter()
+                    .filter_map(|key| text_map.get(&key).cloned())
+                    .collect());
+            }
+
+            Err("未找到 segments 数组".to_string())
+        }
+        Value::String(text) => parse_source_reflow_text(text),
+        _ => Err("源文断句结果不是数组、对象或字符串".to_string()),
+    }
+}
+
+fn parse_source_reflow_array(items: &[Value]) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    for item in items {
+        match item {
+            Value::String(text) => result.push(text.trim().to_string()),
+            Value::Object(object) => {
+                let text = [
+                    "source",
+                    "sourceText",
+                    "source_text",
+                    "text",
+                    "subtitle",
+                    "caption",
+                    "content",
+                ]
+                .iter()
+                .find_map(|field| object.get(*field).and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+                if !text.is_empty() {
+                    result.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if result.is_empty() {
+        Err("segments 数组没有可用文本".to_string())
+    } else {
+        Ok(result)
+    }
+}
+
+fn parse_source_reflow_text(text: &str) -> Result<Vec<String>, String> {
+    let segments = text
+        .replace('\n', "")
+        .split("<br>")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        Err("源文断句字符串没有可用片段".to_string())
+    } else {
+        Ok(segments)
+    }
+}
+
+fn validate_source_reflow_content(source_text: &str, sentences: &[String]) -> Result<(), String> {
+    if sentences.is_empty() {
+        return Err("没有找到源文断句结果".to_string());
+    }
+
+    let source_normalized = review_normalize_content(source_text);
+    let merged_normalized = review_normalize_content(&sentences.join(""));
+    if source_normalized != merged_normalized {
+        return Err("源文断句结果修改了原文内容".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_review_segment_lengths(sentences: &[String]) -> Result<(), String> {
+    for (index, sentence) in sentences.iter().enumerate() {
+        let max_allowed = max_review_segment_words_for_text(sentence);
+        let count = count_review_words(sentence);
+        if count > max_allowed {
+            return Err(format!(
+                "第 {} 段过长（{} > {}）",
+                index + 1,
+                count,
+                max_allowed
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_target_optimization_texts(entries: &BTreeMap<String, String>) -> Result<(), String> {
+    for (key, text) in entries {
+        if text.contains('\n') || text.contains('\r') {
+            return Err(format!("key {key} 译文包含换行"));
+        }
+        let normalized = normalize_target_optimized_text(text);
+        if normalized.trim().is_empty() {
+            return Err(format!("key {key} 译文为空"));
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_target_optimized_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_translation_response(
@@ -3230,6 +4906,10 @@ fn active_ai_work_count(settings: &AppSettings) -> usize {
     settings.translation_thread_count.max(1) as usize
 }
 
+fn source_reflow_block_key(block_id: usize) -> String {
+    format!("source-reflow-block-{}", block_id + 1)
+}
+
 fn stage_progress(start: u8, end: u8, completed: usize, total: usize) -> u8 {
     let span = end.saturating_sub(start) as usize;
     let scaled = if total == 0 {
@@ -3238,6 +4918,19 @@ fn stage_progress(start: u8, end: u8, completed: usize, total: usize) -> u8 {
         span.saturating_mul(completed) / total
     };
     start.saturating_add(scaled as u8).min(end)
+}
+
+fn scale_substage_progress(start: u8, end: u8, progress: u8) -> u8 {
+    let span = end.saturating_sub(start) as u16;
+    start.saturating_add(((span * progress.min(100) as u16) / 100) as u8)
+}
+
+fn review_substage_message(stage: &str, message: &str) -> String {
+    if message.trim().is_empty() {
+        format!("AI审核：{stage}")
+    } else {
+        format!("AI审核：{stage} · {message}")
+    }
 }
 
 fn overall_progress(stages: &SubtitleTranslationStageProgress) -> u8 {
@@ -3293,6 +4986,168 @@ fn estimate_max_output_tokens(text: &str) -> u32 {
     ((text.chars().count() as u32) * 6).clamp(1024, 12000)
 }
 
+fn join_review_word_units(words: &[ReviewWordUnit]) -> String {
+    let compact_text = words
+        .iter()
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+    if is_review_mainly_no_space_language(&compact_text) {
+        compact_text
+    } else {
+        words
+            .iter()
+            .map(|word| word.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn count_review_word_units(words: &[ReviewWordUnit]) -> usize {
+    count_review_words(&join_review_word_units(words))
+}
+
+fn needs_previous_completion(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_terminal_text(trimmed) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let last_word = lower
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_alphanumeric());
+
+    trimmed.ends_with(',')
+        || trimmed.ends_with('，')
+        || matches!(
+            last_word,
+            "a" | "an"
+                | "the"
+                | "and"
+                | "or"
+                | "but"
+                | "of"
+                | "in"
+                | "at"
+                | "to"
+                | "for"
+                | "with"
+                | "from"
+                | "new"
+                | "another"
+                | "this"
+                | "that"
+        )
+}
+
+fn is_short_orphan_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_terminal_text(trimmed) {
+        return false;
+    }
+
+    if is_review_mainly_no_space_language(trimmed) {
+        review_normalized_len(trimmed) <= 4
+    } else {
+        count_review_words(trimmed) <= 2
+    }
+}
+
+fn is_terminal_text(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    trimmed.ends_with('.')
+        || trimmed.ends_with('!')
+        || trimmed.ends_with('?')
+        || trimmed.ends_with('。')
+        || trimmed.ends_with('！')
+        || trimmed.ends_with('？')
+}
+
+fn starts_lowercase(text: &str) -> bool {
+    text.chars()
+        .find(|character| character.is_alphabetic())
+        .map(|character| character.is_lowercase())
+        .unwrap_or(false)
+}
+
+fn max_review_segment_words_for_text(text: &str) -> usize {
+    if is_review_mainly_no_space_language(text) {
+        REVIEW_MAX_SEGMENT_WORDS_CJK
+    } else {
+        REVIEW_MAX_SEGMENT_WORDS_ENGLISH
+    }
+}
+
+fn review_normalize_content(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn review_normalized_len(text: &str) -> usize {
+    review_normalize_content(text).chars().count()
+}
+
+fn count_review_words(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_word = false;
+
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if in_word {
+                count += 1;
+                in_word = false;
+            }
+            continue;
+        }
+
+        if is_review_no_space_character(character) {
+            if in_word {
+                count += 1;
+                in_word = false;
+            }
+            count += 1;
+        } else {
+            in_word = true;
+        }
+    }
+
+    if in_word {
+        count += 1;
+    }
+
+    count
+}
+
+fn is_review_mainly_no_space_language(text: &str) -> bool {
+    let total = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count();
+    if total == 0 {
+        return false;
+    }
+
+    let no_space = text
+        .chars()
+        .filter(|character| is_review_no_space_character(*character))
+        .count();
+    no_space * 2 >= total
+}
+
+fn is_review_no_space_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3040..=0x30ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xac00..=0xd7af
+    )
+}
+
 fn log_translation_settings(log_session: &LogSession, settings: &AppSettings) {
     let llm_config = settings.llm_configs.get(&settings.selected_llm_service);
     log_session.info(
@@ -3318,4 +5173,91 @@ fn log_translation_settings(log_session: &LogSession, settings: &AppSettings) {
             "llmStreaming": llm_config.map(|config| config.is_streaming).unwrap_or(false),
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_segment(text: &str, start_time: u64, end_time: u64) -> TranscriptionSegment {
+        TranscriptionSegment {
+            text: text.to_string(),
+            start_time,
+            end_time,
+            uid: String::new(),
+            status: String::new(),
+            words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn source_reflow_merges_short_location_fragment() {
+        let source_segments = vec![
+            test_segment("Another day living in Guangzhou,", 11_630, 14_680),
+            test_segment("China", 14_680, 15_140),
+        ];
+        let words = build_review_word_units(&source_segments);
+        let source_text = join_review_word_units(&words);
+        let sentences = vec![
+            "Another day living in Guangzhou,".to_string(),
+            "China".to_string(),
+        ];
+
+        let result = build_reflowed_source_segments(&source_text, &words, &sentences).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, "Another day living in Guangzhou, China");
+        assert_eq!(result[0].start_time, 11_630);
+        assert_eq!(result[0].end_time, 15_140);
+    }
+
+    #[test]
+    fn source_reflow_moves_sentence_tail_word_from_next_segment() {
+        let source_segments = vec![
+            test_segment("A new coffee shop and new", 15_200, 16_760),
+            test_segment(
+                "experiences. So let's dive right into today.",
+                16_880,
+                19_880,
+            ),
+        ];
+        let words = build_review_word_units(&source_segments);
+        let source_text = join_review_word_units(&words);
+        let sentences = vec![
+            "A new coffee shop and new".to_string(),
+            "experiences. So let's dive right into today.".to_string(),
+        ];
+
+        let result = build_reflowed_source_segments(&source_text, &words, &sentences).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "A new coffee shop and new experiences.");
+        assert_eq!(result[1].text, "So let's dive right into today.");
+        assert_eq!(result[0].start_time, 15_200);
+        assert!(result[0].end_time > 16_880);
+        assert_eq!(result[1].end_time, 19_880);
+    }
+
+    #[test]
+    fn source_reflow_rejects_content_changes() {
+        let source_segments = vec![test_segment("hello world", 0, 1_000)];
+        let words = build_review_word_units(&source_segments);
+        let source_text = join_review_word_units(&words);
+        let sentences = vec!["hello brave world".to_string()];
+
+        let result = build_reflowed_source_segments(&source_text, &words, &sentences);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn target_optimization_rejects_empty_or_multiline_text() {
+        let mut entries = BTreeMap::new();
+        entries.insert("1".to_string(), "有效译文".to_string());
+        entries.insert("2".to_string(), "第一行\n第二行".to_string());
+        assert!(validate_target_optimization_texts(&entries).is_err());
+
+        entries.insert("2".to_string(), "   ".to_string());
+        assert!(validate_target_optimization_texts(&entries).is_err());
+    }
 }
