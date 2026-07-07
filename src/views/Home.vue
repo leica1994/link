@@ -2196,13 +2196,93 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     return []
   }
 
-  // 当后端设置 stageProgress 为 null 时（参考校正阶段），不显示转录阶段的子步骤
   const hasStageProgress = snapshot.stageProgress !== null && snapshot.stageProgress !== undefined
   const stageProgress = readRecordValue(snapshot.stageProgress)
   const referenceCorrection = readRecordValue(snapshot.referenceCorrection)
 
-  const steps = hasStageProgress
-    ? [
+  // 构建步骤列表
+  let steps: WorkbenchDetailStep[] = []
+
+  if (mode === 'downloaded-reference') {
+    // 参考校正模式：构建完整流程的步骤列表
+    const match = readRecordValue(referenceCorrection.match)
+    const refStatus = readStringValue(referenceCorrection.status)
+    const refProgress = readNumberValue(referenceCorrection.progress)
+    const hasCoverage = readNumberValue(match.tokenCoverage) !== undefined || readNumberValue(match.segmentCoverage) !== undefined
+    const rawRefStatus = refStatus === 'failed' ? 'failed' : refStatus === 'done' ? 'done' : refStatus === 'active' ? 'active' : hasCoverage ? 'done' : 'pending'
+
+    // 1. 转录步骤（如果 stageProgress 有数据则使用，否则根据参考校正状态推断）
+    if (hasStageProgress && stageProgress.transcription) {
+      steps.push(detailStepFromRecord('transcription', '转录', readRecordValue(stageProgress.transcription)))
+    } else if (refStatus) {
+      // 参考校正阶段，转录必定已完成
+      steps.push({
+        key: 'transcription',
+        label: '转录',
+        progress: 100,
+        status: 'done',
+        message: '语音转录完成',
+      })
+    }
+
+    // 2. 参考校正步骤
+    const referenceCorrectionStep: WorkbenchDetailStep = {
+      key: 'subtitleReferenceCorrection',
+      label: '参考校正',
+      progress: refProgress !== undefined ? clampProgress(refProgress) : refStatus === 'failed' || refStatus === 'done' || hasCoverage ? 100 : 0,
+      status: normalizeWorkbenchDetailStatus(rawRefStatus),
+      message: subtitleReferenceCorrectionMessage(referenceCorrection),
+    }
+    steps.push(referenceCorrectionStep)
+
+    // 3. 后续步骤（智能断句、字幕校正、AI审核）
+    // 如果 stageProgress 有数据则使用，否则根据参考校正状态推断
+    if (hasStageProgress) {
+      if (stageProgress.smartSegmentation) {
+        steps.push(detailStepFromRecord('smartSegmentation', '智能断句', readRecordValue(stageProgress.smartSegmentation)))
+      }
+      if (stageProgress.subtitleCorrection) {
+        steps.push(detailStepFromRecord('subtitleCorrection', '字幕校正', readRecordValue(stageProgress.subtitleCorrection)))
+      }
+      if (stageProgress.aiReview) {
+        steps.push(detailStepFromRecord('aiReview', 'AI审核', readRecordValue(stageProgress.aiReview)))
+      }
+    } else if (refStatus === 'done') {
+      // 参考校正完成但后续步骤未开始，显示为 pending
+      // 这些步骤是否显示取决于用户的配置（从 workbenchOptions 读取）
+      const options = workbenchOptions.value
+      if (options.isSmartSegmentationEnabled) {
+        steps.push({
+          key: 'smartSegmentation',
+          label: '智能断句',
+          progress: 0,
+          status: 'pending',
+          message: '等待执行',
+        })
+      }
+      if (options.isSubtitleCorrectionEnabled) {
+        steps.push({
+          key: 'subtitleCorrection',
+          label: '字幕校正',
+          progress: 0,
+          status: 'pending',
+          message: '等待执行',
+        })
+      }
+      if (options.isAiSubtitleReviewEnabled) {
+        steps.push({
+          key: 'aiReview',
+          label: 'AI审核',
+          progress: 0,
+          status: 'pending',
+          message: '等待执行',
+        })
+      }
+    }
+  } else {
+    // 普通转录模式：只显示 stageProgress 中的步骤
+    if (hasStageProgress) {
+      steps = [
         { key: 'transcription', label: '转录', source: stageProgress.transcription },
         { key: 'smartSegmentation', label: '智能断句', source: stageProgress.smartSegmentation },
         { key: 'subtitleCorrection', label: '字幕校正', source: stageProgress.subtitleCorrection },
@@ -2210,30 +2290,9 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
       ]
         .filter((item) => readRecordValue(item.source))
         .map((item) => detailStepFromRecord(item.key, item.label, readRecordValue(item.source)))
-    : []
-
-  if (mode === 'downloaded-reference') {
-    const match = readRecordValue(referenceCorrection.match)
-    const status = readStringValue(referenceCorrection.status)
-    const progress = readNumberValue(referenceCorrection.progress)
-    const hasCoverage = readNumberValue(match.tokenCoverage) !== undefined || readNumberValue(match.segmentCoverage) !== undefined
-    const rawStatus = status === 'failed' ? 'failed' : status === 'done' ? 'done' : status === 'active' ? 'active' : hasCoverage ? 'done' : 'pending'
-    const referenceCorrectionStep: WorkbenchDetailStep = {
-      key: 'subtitleReferenceCorrection',
-      label: '参考校正',
-      progress: progress !== undefined ? clampProgress(progress) : status === 'failed' || status === 'done' || hasCoverage ? 100 : 0,
-      status: normalizeWorkbenchDetailStatus(rawStatus),
-      message: subtitleReferenceCorrectionMessage(referenceCorrection),
-    }
-
-    // 如果有转录阶段的步骤，将参考校正插入到转录之后（位置1）
-    // 如果没有转录阶段的步骤（stageProgress 为 null），参考校正作为唯一步骤
-    if (steps.length > 0) {
-      steps.splice(1, 0, referenceCorrectionStep)
-    } else {
-      steps.push(referenceCorrectionStep)
     }
   }
+
   return steps
 })
 
