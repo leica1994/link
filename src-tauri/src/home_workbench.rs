@@ -1106,8 +1106,17 @@ async fn prepare_reference_corrected_downloaded_subtitle(
         }),
     )?;
 
+    // 第一阶段：纯转录（禁用智能断句、字幕校正、AI审核）
     let mut run_settings = settings.clone();
     apply_transcription_options(&mut run_settings, options);
+    // 禁用后续处理步骤，只保留纯转录
+    let original_smart_segmentation = run_settings.is_smart_segmentation_enabled;
+    let original_subtitle_correction = run_settings.is_subtitle_correction_enabled;
+    let original_ai_review = run_settings.is_ai_subtitle_review_enabled;
+    run_settings.is_smart_segmentation_enabled = false;
+    run_settings.is_subtitle_correction_enabled = false;
+    run_settings.is_ai_subtitle_review_enabled = false;
+
     let progress_sink = workbench_transcription_progress_sink_with_mode(
         app.clone(),
         task_id.to_string(),
@@ -1137,13 +1146,14 @@ async fn prepare_reference_corrected_downloaded_subtitle(
             client_run_id: task_id.to_string(),
             progress_source: "home-workbench".to_string(),
         },
-        run_settings,
+        run_settings.clone(),
         Some(progress_sink),
         store,
         checkpoint_context.clone(),
     )
     .await?;
 
+    // 第二阶段：参考校正
     update_reference_correction_state(
         &reference_correction_state,
         json!({
@@ -1155,7 +1165,7 @@ async fn prepare_reference_corrected_downloaded_subtitle(
         &app,
         task_id,
         STAGE_PREPARE_SUBTITLE,
-        96,
+        30,
         "匹配参考字幕",
         json!({
             "mode": "downloaded-reference",
@@ -1235,7 +1245,8 @@ async fn prepare_reference_corrected_downloaded_subtitle(
                     object.insert("message".to_string(), json!(message));
                 }
                 update_reference_correction_state(&reference_correction_state, state.clone());
-                let stage_progress = 96u8.saturating_add(progress.min(100) / 34).min(99);
+                // 参考校正占 30-60% 的进度
+                let stage_progress = 30u8.saturating_add((progress.min(100) * 30) / 100).min(60);
                 let _ = update_stage_snapshot_from_app(
                     &app,
                     task_id,
@@ -1274,6 +1285,238 @@ async fn prepare_reference_corrected_downloaded_subtitle(
     }
 
     result.warnings = warnings;
+
+    // 第三阶段：后处理（智能断句 → 字幕校正 → AI审核）
+    // 恢复原始设置，在参考校正后的准确文本基础上执行优化
+    run_settings.is_smart_segmentation_enabled = original_smart_segmentation;
+    run_settings.is_subtitle_correction_enabled = original_subtitle_correction;
+    run_settings.is_ai_subtitle_review_enabled = original_ai_review;
+
+    let post_processing_log_session = app_logger.start_session("home_workbench_post_processing")?;
+    let mut current_segments = result.segments.clone();
+    let mut post_processing_warnings = Vec::<String>::new();
+    let mut base_progress = 60u8; // 参考校正完成后从 60% 开始
+
+    // 智能断句
+    if run_settings.is_smart_segmentation_enabled {
+        post_processing_log_session.info(
+            "smart_segmentation_start",
+            "开始 AI 智能断句（参考校正后）",
+            json!({ "segmentCount": current_segments.len() }),
+        );
+        update_stage_snapshot_from_app(
+            &app,
+            task_id,
+            STAGE_PREPARE_SUBTITLE,
+            base_progress,
+            "AI 智能断句中",
+            json!({
+                "mode": "downloaded-reference",
+                "message": "AI 智能断句中",
+                "stageProgress": json!({
+                    "smartSegmentation": {
+                        "progress": 0,
+                        "message": "AI 智能断句中",
+                        "status": "active"
+                    }
+                }),
+                "segments": current_segments,
+                "warnings": result.warnings,
+                "referenceCorrection": reference_correction,
+            }),
+        )?;
+
+        let mut report_smart_segmentation = |progress: u8, message: &str, snapshot_segments: &[crate::transcription::TranscriptionSegment], snapshot_warnings: &[String]| {
+            let stage_progress = base_progress.saturating_add((progress.min(100) * 15) / 100).min(75);
+            let _ = update_stage_snapshot_from_app(
+                &app,
+                task_id,
+                STAGE_PREPARE_SUBTITLE,
+                stage_progress,
+                message,
+                json!({
+                    "mode": "downloaded-reference",
+                    "message": message,
+                    "stageProgress": json!({
+                        "smartSegmentation": {
+                            "progress": progress,
+                            "message": message,
+                            "status": if progress >= 100 { "done" } else { "active" }
+                        }
+                    }),
+                    "segments": snapshot_segments,
+                    "warnings": snapshot_warnings,
+                    "referenceCorrection": &reference_correction,
+                }),
+            );
+        };
+
+        let segmentation_result = crate::subtitle_ai::smart_segment_subtitles(
+            &run_settings,
+            ai_service,
+            &post_processing_log_session,
+            current_segments,
+            &mut report_smart_segmentation,
+            Some((store, &checkpoint_context.child("post-smart-segmentation"))),
+        )
+        .await;
+        current_segments = segmentation_result.segments;
+        post_processing_warnings.extend(segmentation_result.warnings);
+        post_processing_log_session.info(
+            "smart_segmentation_completed",
+            "AI 智能断句完成",
+            json!({ "segmentCount": current_segments.len() }),
+        );
+        base_progress = 75;
+    }
+
+    // 字幕校正
+    if run_settings.is_subtitle_correction_enabled {
+        post_processing_log_session.info(
+            "subtitle_correction_start",
+            "开始字幕校正（参考校正后）",
+            json!({ "segmentCount": current_segments.len() }),
+        );
+        update_stage_snapshot_from_app(
+            &app,
+            task_id,
+            STAGE_PREPARE_SUBTITLE,
+            base_progress,
+            "字幕校正中",
+            json!({
+                "mode": "downloaded-reference",
+                "message": "字幕校正中",
+                "stageProgress": json!({
+                    "subtitleCorrection": {
+                        "progress": 0,
+                        "message": "字幕校正中",
+                        "status": "active"
+                    }
+                }),
+                "segments": current_segments,
+                "warnings": post_processing_warnings,
+                "referenceCorrection": reference_correction,
+            }),
+        )?;
+
+        let mut report_correction = |progress: u8, message: &str, snapshot_segments: &[crate::transcription::TranscriptionSegment], snapshot_warnings: &[String]| {
+            let stage_progress = base_progress.saturating_add((progress.min(100) * 12) / 100).min(87);
+            let _ = update_stage_snapshot_from_app(
+                &app,
+                task_id,
+                STAGE_PREPARE_SUBTITLE,
+                stage_progress,
+                message,
+                json!({
+                    "mode": "downloaded-reference",
+                    "message": message,
+                    "stageProgress": json!({
+                        "subtitleCorrection": {
+                            "progress": progress,
+                            "message": message,
+                            "status": if progress >= 100 { "done" } else { "active" }
+                        }
+                    }),
+                    "segments": snapshot_segments,
+                    "warnings": snapshot_warnings,
+                    "referenceCorrection": &reference_correction,
+                }),
+            );
+        };
+
+        let correction_result = crate::subtitle_ai::correct_subtitles(
+            &run_settings,
+            ai_service,
+            &post_processing_log_session,
+            current_segments,
+            &mut report_correction,
+            Some((store, &checkpoint_context.child("post-correction"))),
+        )
+        .await;
+        current_segments = correction_result.segments;
+        post_processing_warnings.extend(correction_result.warnings);
+        post_processing_log_session.info(
+            "subtitle_correction_completed",
+            "字幕校正完成",
+            json!({ "segmentCount": current_segments.len() }),
+        );
+        base_progress = 87;
+    }
+
+    // AI 审核
+    if run_settings.is_ai_subtitle_review_enabled {
+        post_processing_log_session.info(
+            "ai_review_start",
+            "开始 AI 审核（参考校正后）",
+            json!({ "segmentCount": current_segments.len() }),
+        );
+        update_stage_snapshot_from_app(
+            &app,
+            task_id,
+            STAGE_PREPARE_SUBTITLE,
+            base_progress,
+            "AI 审核中",
+            json!({
+                "mode": "downloaded-reference",
+                "message": "AI 审核中",
+                "stageProgress": json!({
+                    "aiReview": {
+                        "progress": 0,
+                        "message": "AI 审核中",
+                        "status": "active"
+                    }
+                }),
+                "segments": current_segments,
+                "warnings": post_processing_warnings,
+                "referenceCorrection": reference_correction,
+            }),
+        )?;
+
+        let mut report_review = |progress: u8, message: &str, snapshot_segments: &[crate::transcription::TranscriptionSegment], snapshot_warnings: &[String]| {
+            let stage_progress = base_progress.saturating_add((progress.min(100) * 12) / 100).min(99);
+            let _ = update_stage_snapshot_from_app(
+                &app,
+                task_id,
+                STAGE_PREPARE_SUBTITLE,
+                stage_progress,
+                message,
+                json!({
+                    "mode": "downloaded-reference",
+                    "message": message,
+                    "stageProgress": json!({
+                        "aiReview": {
+                            "progress": progress,
+                            "message": message,
+                            "status": if progress >= 100 { "done" } else { "active" }
+                        }
+                    }),
+                    "segments": snapshot_segments,
+                    "warnings": snapshot_warnings,
+                    "referenceCorrection": &reference_correction,
+                }),
+            );
+        };
+
+        let review_result = crate::subtitle_ai::review_source_subtitles(
+            &run_settings,
+            ai_service,
+            &post_processing_log_session,
+            current_segments,
+            &mut report_review,
+            Some((store, &checkpoint_context.child("post-review"))),
+        )
+        .await;
+        current_segments = review_result.segments;
+        post_processing_warnings.extend(review_result.warnings);
+        post_processing_log_session.info(
+            "ai_review_completed",
+            "AI 审核完成",
+            json!({ "segmentCount": current_segments.len() }),
+        );
+    }
+
+    result.segments = current_segments;
+    result.warnings.extend(post_processing_warnings);
     let output_format = normalize_subtitle_format(&result.output_format);
     result.subtitle_text =
         serialize_segments_for_export(&result.segments, output_format, Some(store), settings)?;
