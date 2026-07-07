@@ -3,7 +3,7 @@
     <header class="translate-header youtube-monitor-header">
       <div class="youtube-monitor-title-block">
         <button
-          v-if="isDetailView"
+          v-if="isDetailView || isUnreadView"
           class="youtube-monitor-back"
           type="button"
           aria-label="返回监控列表"
@@ -20,17 +20,7 @@
         </div>
       </div>
 
-      <div v-if="!isDetailView" class="translate-actions youtube-monitor-header-actions">
-        <button
-          class="settings-action youtube-monitor-action"
-          type="button"
-          :disabled="!canMarkAllChannelsSeen"
-          @click="markAllChannelsSeen"
-        >
-          <LoaderCircle v-if="isMarkingAllSeen" class="spinning" :stroke-width="2.1" aria-hidden="true" />
-          <CheckCheck v-else :stroke-width="2.1" aria-hidden="true" />
-          <span>{{ isMarkingAllSeen ? '标记中' : '全部已读' }}</span>
-        </button>
+      <div v-if="isListView" class="translate-actions youtube-monitor-header-actions">
         <button
           class="settings-action youtube-monitor-action"
           type="button"
@@ -53,7 +43,7 @@
     </header>
 
     <main class="youtube-monitor-workspace">
-      <section v-if="!isDetailView" class="youtube-monitor-list-view">
+      <section v-if="isListView" class="youtube-monitor-list-view">
         <div v-if="channelError" class="translate-alert" role="alert">
           <CircleAlert :stroke-width="2.1" aria-hidden="true" />
           <span>{{ channelError }}</span>
@@ -71,8 +61,19 @@
               <span class="youtube-monitor-summary-label">博主</span>
             </div>
             <div class="youtube-monitor-summary-item">
-              <span class="youtube-monitor-summary-value">{{ totalUnreadCount }}</span>
-              <span class="youtube-monitor-summary-label">未读更新</span>
+              <RouterLink
+                v-if="totalUnreadCount > 0"
+                class="youtube-monitor-summary-link"
+                :to="{ name: 'YoutubeMonitorUnread' }"
+                aria-label="查看全部未读更新"
+              >
+                <span class="youtube-monitor-summary-value">{{ totalUnreadCount }}</span>
+                <span class="youtube-monitor-summary-label">未读更新</span>
+              </RouterLink>
+              <template v-else>
+                <span class="youtube-monitor-summary-value">{{ totalUnreadCount }}</span>
+                <span class="youtube-monitor-summary-label">未读更新</span>
+              </template>
             </div>
             <div class="youtube-monitor-summary-item">
               <span class="youtube-monitor-summary-value">{{ totalVideoCount }}</span>
@@ -177,6 +178,141 @@
 
                 <ChevronRight class="chevron-icon" :stroke-width="2.4" aria-hidden="true" />
               </RouterLink>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section v-else-if="isUnreadView" class="youtube-monitor-unread-view">
+        <div v-if="channelError" class="translate-alert" role="alert">
+          <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+          <span>{{ channelError }}</span>
+        </div>
+
+        <section class="settings-section" aria-labelledby="youtube-monitor-unread-title">
+          <div id="youtube-monitor-unread-title" class="section-heading">
+            <ListVideo aria-hidden="true" />
+            <span>未读视频</span>
+          </div>
+
+          <div class="settings-panel youtube-monitor-panel">
+            <div class="youtube-monitor-toolbar">
+              <label class="youtube-monitor-search">
+                <Search :stroke-width="2.1" aria-hidden="true" />
+                <input
+                  v-model="unreadQuery"
+                  type="search"
+                  placeholder="搜索视频、博主或地址"
+                  aria-label="搜索未读更新"
+                />
+              </label>
+
+              <div class="youtube-unread-toolbar-actions">
+                <span class="youtube-unread-total">未读 {{ unreadVideoTotal }} 条</span>
+                <button
+                  v-if="totalUnreadCount > 0"
+                  class="settings-action youtube-monitor-action"
+                  type="button"
+                  :disabled="!canMarkAllUnreadSeen"
+                  @click="markAllChannelsSeen"
+                >
+                  <LoaderCircle v-if="isMarkingAllSeen" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+                  <CheckCheck v-else :stroke-width="2.1" aria-hidden="true" />
+                  <span>{{ isMarkingAllSeen ? '标记中' : '全部已读' }}</span>
+                </button>
+              </div>
+            </div>
+
+            <div v-if="unreadError" class="translate-alert" role="alert">
+              <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ unreadError }}</span>
+            </div>
+
+            <div v-if="taskAddError" class="translate-alert" role="alert">
+              <CircleAlert :stroke-width="2.1" aria-hidden="true" />
+              <span>{{ taskAddError }}</span>
+            </div>
+
+            <div v-if="isLoadingUnreadVideos && unreadVideos.length === 0" class="youtube-monitor-empty">
+              <LoaderCircle class="youtube-monitor-empty-icon spinning" :stroke-width="2.1" aria-hidden="true" />
+              <span class="translate-empty-title">正在读取未读更新</span>
+            </div>
+
+            <div v-else-if="unreadVideos.length === 0" class="youtube-monitor-empty">
+              <Video class="youtube-monitor-empty-icon" :stroke-width="2.1" aria-hidden="true" />
+              <span class="translate-empty-title">{{ emptyUnreadText }}</span>
+            </div>
+
+            <div v-else class="youtube-video-list youtube-unread-video-list" role="table" aria-label="未读更新视频列表">
+              <article v-for="item in unreadVideos" :key="item.video.id" class="youtube-unread-video-row" role="row">
+                <span class="youtube-video-status unread" role="cell">新</span>
+
+                <span class="youtube-video-main" role="cell">
+                  <span class="youtube-video-title">{{ item.video.title }}</span>
+                  <a class="youtube-video-url" :href="item.video.url" target="_blank" rel="noreferrer">{{ item.video.url }}</a>
+                </span>
+
+                <RouterLink
+                  class="youtube-unread-channel"
+                  :to="{ name: 'YoutubeMonitorDetail', params: { channelId: item.channel.id } }"
+                  role="cell"
+                >
+                  <span class="youtube-channel-avatar" aria-hidden="true">{{ channelInitial(item.channel) }}</span>
+                  <span class="youtube-unread-channel-copy">
+                    <span class="youtube-channel-title-line">
+                      <span class="youtube-channel-title">{{ item.channel.title }}</span>
+                      <span class="youtube-status-pill" :class="channelStatusClass(item.channel)">
+                        {{ channelStatusLabel(item.channel) }}
+                      </span>
+                    </span>
+                    <span class="youtube-channel-url">{{ item.channel.handle || item.channel.canonicalUrl || item.channel.url }}</span>
+                  </span>
+                </RouterLink>
+
+                <span class="youtube-video-meta" role="cell">
+                  <Clock :stroke-width="2.1" aria-hidden="true" />
+                  {{ formatDuration(item.video.duration) }}
+                </span>
+
+                <span class="youtube-video-meta" role="cell">
+                  {{ formatDateTime(item.video.firstSeenAt) }}
+                </span>
+
+                <button
+                  class="youtube-video-task-button"
+                  type="button"
+                  :disabled="isVideoQueued(item.video) || isAddingVideoTask(item.video)"
+                  :aria-label="isVideoQueued(item.video) ? '已加入主页待办' : '加入主页待办'"
+                  @click="addVideoTask(item.video)"
+                >
+                  <LoaderCircle
+                    v-if="isAddingVideoTask(item.video)"
+                    class="spinning"
+                    :stroke-width="2.1"
+                    aria-hidden="true"
+                  />
+                  <Check v-else-if="isVideoQueued(item.video)" :stroke-width="2.1" aria-hidden="true" />
+                  <ListPlus v-else :stroke-width="2.1" aria-hidden="true" />
+                  <span>{{ isVideoQueued(item.video) ? '已加入' : '加入待办' }}</span>
+                </button>
+
+                <a class="youtube-video-open" :href="item.video.url" target="_blank" rel="noreferrer" aria-label="打开视频">
+                  <ExternalLink :stroke-width="2.1" aria-hidden="true" />
+                </a>
+              </article>
+            </div>
+
+            <div v-if="unreadVideos.length > 0" class="youtube-monitor-loadbar">
+              <span>已显示 {{ unreadVideos.length }} / {{ unreadVideoTotal }}</span>
+              <button
+                class="settings-action youtube-monitor-action"
+                type="button"
+                :disabled="!hasMoreUnreadVideos || isLoadingUnreadVideos"
+                @click="loadMoreUnreadVideos"
+              >
+                <LoaderCircle v-if="isLoadingUnreadVideos" class="spinning" :stroke-width="2.1" aria-hidden="true" />
+                <span>{{ hasMoreUnreadVideos ? '加载更多' : '已全部显示' }}</span>
+              </button>
             </div>
           </div>
         </section>
@@ -527,6 +663,16 @@ type YoutubeVideo = {
   metadata: Record<string, unknown>
 }
 
+type YoutubeChannelLike = {
+  id: string
+  title: string
+  handle: string
+  url: string
+  canonicalUrl: string
+  status: string
+  unreadCount: number
+}
+
 type HomeVideoTask = {
   id: string
   url: string
@@ -537,6 +683,29 @@ type HomeVideoTask = {
 
 type YoutubeVideoPage = {
   items: YoutubeVideo[]
+  total: number
+  hasMore: boolean
+}
+
+type YoutubeUnreadVideoChannel = {
+  id: string
+  title: string
+  handle: string
+  url: string
+  canonicalUrl: string
+  status: string
+  unreadCount: number
+  videoCount: number
+  lastCheckedAt?: string | null
+}
+
+type YoutubeUnreadVideoItem = {
+  video: YoutubeVideo
+  channel: YoutubeUnreadVideoChannel
+}
+
+type YoutubeUnreadVideoPage = {
+  items: YoutubeUnreadVideoItem[]
   total: number
   hasMore: boolean
 }
@@ -561,8 +730,11 @@ const router = useRouter()
 
 const channels = ref<YoutubeChannel[]>([])
 const videos = ref<YoutubeVideo[]>([])
+const unreadVideos = ref<YoutubeUnreadVideoItem[]>([])
 const videoTotal = ref(0)
+const unreadVideoTotal = ref(0)
 const hasMoreVideos = ref(false)
+const hasMoreUnreadVideos = ref(false)
 const ytdlpStatus = ref<YtdlpStatus>({
   isAvailable: false,
   version: '',
@@ -573,9 +745,11 @@ const ytdlpStatus = ref<YtdlpStatus>({
 const channelQuery = ref('')
 const channelFilter = ref<ChannelStatusFilter>('all')
 const videoQuery = ref('')
+const unreadQuery = ref('')
 const unreadOnly = ref(false)
 const isLoadingChannels = ref(false)
 const isLoadingVideos = ref(false)
+const isLoadingUnreadVideos = ref(false)
 const isPageRefreshing = ref(false)
 const isMarkingAllSeen = ref(false)
 const isAddDialogOpen = ref(false)
@@ -585,6 +759,7 @@ const addError = ref('')
 const deleteError = ref('')
 const channelError = ref('')
 const videosError = ref('')
+const unreadError = ref('')
 const taskAddError = ref('')
 const isAddingChannel = ref(false)
 const isDeletingChannel = ref(false)
@@ -610,14 +785,19 @@ const activeChannelId = computed(() => {
   return typeof value === 'string' ? value : ''
 })
 
+const isUnreadView = computed(() => route.name === 'YoutubeMonitorUnread')
 const isDetailView = computed(() => Boolean(activeChannelId.value))
+const isListView = computed(() => !isUnreadView.value && !isDetailView.value)
 
 const activeChannel = computed(() => {
   return channels.value.find((channel) => channel.id === activeChannelId.value) ?? null
 })
 
 const pageTitle = computed(() => {
-  if (!isDetailView.value) {
+  if (isUnreadView.value) {
+    return '未读更新'
+  }
+  if (isListView.value) {
     return '监控'
   }
 
@@ -648,10 +828,11 @@ const totalVideoCount = computed(() => channels.value.reduce((total, channel) =>
 const checkingChannelCount = computed(() => {
   return channels.value.filter((channel) => channel.status === 'checking' || isChannelRefreshing(channel.id)).length
 })
-const canMarkAllChannelsSeen = computed(() => {
+const canMarkAllUnreadSeen = computed(() => {
   return isTauriRuntime() &&
     totalUnreadCount.value > 0 &&
     !isLoadingChannels.value &&
+    !isLoadingUnreadVideos.value &&
     !isPageRefreshing.value &&
     !isMarkingAllSeen.value
 })
@@ -671,10 +852,25 @@ const emptyVideoText = computed(() => {
   return activeChannel.value?.lastCheckedAt ? '暂无视频记录' : '检查更新后会显示视频'
 })
 
+const emptyUnreadText = computed(() => {
+  if (unreadQuery.value.trim()) {
+    return '没有匹配的未读更新'
+  }
+
+  return '暂无未读更新'
+})
+
 watch(activeChannelId, () => {
   resetVideos()
   if (activeChannelId.value) {
     void loadVideos(true)
+  }
+})
+
+watch(isUnreadView, () => {
+  resetUnreadVideos()
+  if (isUnreadView.value) {
+    void loadUnreadVideos(true)
   }
 })
 
@@ -685,11 +881,22 @@ watch([videoQuery, unreadOnly], () => {
   }
 })
 
+watch(unreadQuery, () => {
+  if (isUnreadView.value) {
+    resetUnreadVideos()
+    void loadUnreadVideos(true)
+  }
+})
+
 const loadAll = async () => {
   await Promise.all([loadYtdlpStatus(), loadChannels(), loadQueuedVideoUrls()])
   if (activeChannelId.value) {
     resetVideos()
     await loadVideos(true)
+  }
+  if (isUnreadView.value) {
+    resetUnreadVideos()
+    await loadUnreadVideos(true)
   }
 }
 
@@ -775,6 +982,14 @@ const resetVideos = () => {
   taskAddError.value = ''
 }
 
+const resetUnreadVideos = () => {
+  unreadVideos.value = []
+  unreadVideoTotal.value = 0
+  hasMoreUnreadVideos.value = false
+  unreadError.value = ''
+  taskAddError.value = ''
+}
+
 const loadVideos = async (replace = false) => {
   if (!activeChannelId.value || isLoadingVideos.value) {
     return
@@ -811,6 +1026,42 @@ const loadVideos = async (replace = false) => {
 
 const loadMoreVideos = async () => {
   await loadVideos(false)
+}
+
+const loadUnreadVideos = async (replace = false) => {
+  if (!isUnreadView.value || isLoadingUnreadVideos.value) {
+    return
+  }
+
+  if (!isTauriRuntime()) {
+    unreadError.value = '请在桌面应用中读取未读更新'
+    return
+  }
+
+  isLoadingUnreadVideos.value = true
+  unreadError.value = ''
+  const offset = replace ? 0 : unreadVideos.value.length
+
+  try {
+    const page = await invoke<YoutubeUnreadVideoPage>('list_youtube_unread_videos', {
+      request: {
+        query: unreadQuery.value,
+        limit: VIDEO_PAGE_SIZE,
+        offset,
+      },
+    })
+    unreadVideos.value = replace ? page.items : [...unreadVideos.value, ...page.items]
+    unreadVideoTotal.value = page.total
+    hasMoreUnreadVideos.value = page.hasMore
+  } catch (error) {
+    unreadError.value = stringifyError(error, '读取未读更新失败')
+  } finally {
+    isLoadingUnreadVideos.value = false
+  }
+}
+
+const loadMoreUnreadVideos = async () => {
+  await loadUnreadVideos(false)
 }
 
 const refreshChannel = async (channelId: string) => {
@@ -906,6 +1157,10 @@ const reloadAfterChannelRefresh = async (channelId: string) => {
     resetVideos()
     await loadVideos(true)
   }
+  if (isUnreadView.value) {
+    resetUnreadVideos()
+    await loadUnreadVideos(true)
+  }
 }
 
 const markChannelSeen = async () => {
@@ -925,17 +1180,30 @@ const markChannelSeen = async () => {
 }
 
 const markAllChannelsSeen = async () => {
-  if (!canMarkAllChannelsSeen.value) {
+  if (!canMarkAllUnreadSeen.value) {
     return
   }
 
   isMarkingAllSeen.value = true
+  unreadError.value = ''
   channelError.value = ''
 
   try {
     channels.value = await invoke<YoutubeChannel[]>('mark_all_youtube_channels_seen')
+    resetUnreadVideos()
+    if (isUnreadView.value) {
+      await loadUnreadVideos(true)
+    }
+    if (activeChannelId.value) {
+      videos.value = videos.value.map((video) => ({ ...video, isUnread: false }))
+    }
   } catch (error) {
-    channelError.value = stringifyError(error, '标记全部已读失败')
+    const message = stringifyError(error, '标记全部已读失败')
+    if (isUnreadView.value) {
+      unreadError.value = message
+    } else {
+      channelError.value = message
+    }
   } finally {
     isMarkingAllSeen.value = false
   }
@@ -1112,12 +1380,12 @@ const goBackToList = async () => {
   await router.push({ name: 'YoutubeMonitor' })
 }
 
-const channelInitial = (channel: YoutubeChannel) => {
+const channelInitial = (channel: YoutubeChannelLike) => {
   const value = channel.title || channel.handle || '监'
   return value.trim().slice(0, 1).toUpperCase()
 }
 
-const channelStatusLabel = (channel: YoutubeChannel) => {
+const channelStatusLabel = (channel: YoutubeChannelLike) => {
   if (channel.status === 'checking' || isChannelRefreshing(channel.id)) {
     return '检查中'
   }
@@ -1130,7 +1398,7 @@ const channelStatusLabel = (channel: YoutubeChannel) => {
   return '已同步'
 }
 
-const channelStatusClass = (channel: YoutubeChannel) => ({
+const channelStatusClass = (channel: YoutubeChannelLike) => ({
   updated: channel.unreadCount > 0 && channel.status !== 'checking',
   checking: channel.status === 'checking' || isChannelRefreshing(channel.id),
   failed: channel.status === 'failed',

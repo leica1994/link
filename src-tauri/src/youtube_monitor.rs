@@ -131,6 +131,35 @@ pub struct YoutubeVideoPage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeUnreadVideoChannel {
+    pub id: String,
+    pub title: String,
+    pub handle: String,
+    pub url: String,
+    pub canonical_url: String,
+    pub status: String,
+    pub unread_count: u64,
+    pub video_count: u64,
+    pub last_checked_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeUnreadVideoItem {
+    pub video: YoutubeVideo,
+    pub channel: YoutubeUnreadVideoChannel,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeUnreadVideoPage {
+    pub items: Vec<YoutubeUnreadVideoItem>,
+    pub total: u64,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddYoutubeChannelRequest {
@@ -149,6 +178,14 @@ pub struct ListYoutubeVideosRequest {
     pub channel_id: String,
     pub query: Option<String>,
     pub unread_only: Option<bool>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListYoutubeUnreadVideosRequest {
+    pub query: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
 }
@@ -332,6 +369,23 @@ pub fn list_youtube_videos(
             limit,
             offset,
         )
+    })
+}
+
+#[tauri::command]
+pub fn list_youtube_unread_videos(
+    store: tauri::State<'_, SettingsStore>,
+    request: ListYoutubeUnreadVideosRequest,
+) -> Result<YoutubeUnreadVideoPage, String> {
+    let limit = request
+        .limit
+        .unwrap_or(DEFAULT_VIDEO_PAGE_SIZE)
+        .clamp(1, MAX_VIDEO_PAGE_SIZE);
+    let offset = request.offset.unwrap_or(0);
+    let query = request.query.unwrap_or_default();
+
+    store.with_connection(|connection| {
+        read_youtube_unread_videos_page(connection, &query, limit, offset)
     })
 }
 
@@ -1222,6 +1276,95 @@ fn read_youtube_videos_page(
     })
 }
 
+fn read_youtube_unread_videos_page(
+    connection: &rusqlite::Connection,
+    query: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<YoutubeUnreadVideoPage, String> {
+    let query_like = normalized_query_like(query);
+    let total = connection
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM youtube_videos
+            INNER JOIN youtube_channels
+              ON youtube_channels.id = youtube_videos.channel_id
+            WHERE youtube_videos.is_unread = 1
+              AND (
+                ?1 = ''
+                OR lower(youtube_videos.title) LIKE ?1
+                OR lower(youtube_videos.url) LIKE ?1
+                OR lower(youtube_channels.title) LIKE ?1
+                OR lower(youtube_channels.handle) LIKE ?1
+                OR lower(youtube_channels.url) LIKE ?1
+                OR lower(youtube_channels.canonical_url) LIKE ?1
+              )
+            ",
+            params![&query_like],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("无法统计未读更新: {error}"))?
+        .max(0) as u64;
+
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT youtube_videos.id,
+                   youtube_videos.channel_id,
+                   youtube_videos.external_id,
+                   youtube_videos.title,
+                   youtube_videos.url,
+                   youtube_videos.duration,
+                   youtube_videos.is_unread,
+                   youtube_videos.first_seen_at,
+                   youtube_videos.last_seen_at,
+                   youtube_videos.metadata,
+                   youtube_channels.id,
+                   youtube_channels.title,
+                   youtube_channels.handle,
+                   youtube_channels.url,
+                   youtube_channels.canonical_url,
+                   youtube_channels.status,
+                   youtube_channels.unread_count,
+                   youtube_channels.video_count,
+                   youtube_channels.last_checked_at
+            FROM youtube_videos
+            INNER JOIN youtube_channels
+              ON youtube_channels.id = youtube_videos.channel_id
+            WHERE youtube_videos.is_unread = 1
+              AND (
+                ?1 = ''
+                OR lower(youtube_videos.title) LIKE ?1
+                OR lower(youtube_videos.url) LIKE ?1
+                OR lower(youtube_channels.title) LIKE ?1
+                OR lower(youtube_channels.handle) LIKE ?1
+                OR lower(youtube_channels.url) LIKE ?1
+                OR lower(youtube_channels.canonical_url) LIKE ?1
+              )
+            ORDER BY
+              youtube_videos.published_rank DESC,
+              datetime(youtube_videos.first_seen_at) ASC
+            LIMIT ?2 OFFSET ?3
+            ",
+        )
+        .map_err(|error| format!("无法读取未读更新: {error}"))?;
+    let rows = statement
+        .query_map(params![&query_like, limit, offset], map_youtube_unread_video_item)
+        .map_err(|error| format!("无法读取未读更新: {error}"))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| format!("无法解析未读更新: {error}"))?);
+    }
+
+    let next_offset = offset as u64 + items.len() as u64;
+    Ok(YoutubeUnreadVideoPage {
+        items,
+        total,
+        has_more: next_offset < total,
+    })
+}
+
 fn map_youtube_video(row: &Row<'_>) -> rusqlite::Result<YoutubeVideo> {
     let metadata_text: String = row.get(9)?;
     let metadata = serde_json::from_str(&metadata_text).unwrap_or_else(|_| json!({}));
@@ -1238,6 +1381,36 @@ fn map_youtube_video(row: &Row<'_>) -> rusqlite::Result<YoutubeVideo> {
         last_seen_at: row.get(8)?,
         metadata,
     })
+}
+
+fn map_youtube_unread_video_item(row: &Row<'_>) -> rusqlite::Result<YoutubeUnreadVideoItem> {
+    let metadata_text: String = row.get(9)?;
+    let metadata = serde_json::from_str(&metadata_text).unwrap_or_else(|_| json!({}));
+    let video = YoutubeVideo {
+        id: row.get(0)?,
+        channel_id: row.get(1)?,
+        external_id: row.get(2)?,
+        title: row.get(3)?,
+        url: row.get(4)?,
+        duration: row.get(5)?,
+        is_unread: row.get::<_, i64>(6)? != 0,
+        first_seen_at: row.get(7)?,
+        last_seen_at: row.get(8)?,
+        metadata,
+    };
+    let channel = YoutubeUnreadVideoChannel {
+        id: row.get(10)?,
+        title: row.get(11)?,
+        handle: row.get(12)?,
+        url: row.get(13)?,
+        canonical_url: row.get(14)?,
+        status: row.get(15)?,
+        unread_count: row.get::<_, i64>(16)?.max(0) as u64,
+        video_count: row.get::<_, i64>(17)?.max(0) as u64,
+        last_checked_at: row.get(18)?,
+    };
+
+    Ok(YoutubeUnreadVideoItem { video, channel })
 }
 
 fn upsert_youtube_video(

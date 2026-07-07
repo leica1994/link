@@ -855,6 +855,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 ON youtube_videos(channel_id, is_unread, first_seen_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_videos_channel_rank
                 ON youtube_videos(channel_id, published_rank);
+            CREATE INDEX IF NOT EXISTS idx_youtube_videos_unread_rank
+                ON youtube_videos(is_unread, published_rank, first_seen_at);
             CREATE INDEX IF NOT EXISTS idx_youtube_refresh_runs_channel_started
                 ON youtube_refresh_runs(channel_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_home_video_tasks_updated_at
