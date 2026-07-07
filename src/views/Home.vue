@@ -2210,12 +2210,16 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     const refStatus = readStringValue(referenceCorrection.status)
     const refProgress = readNumberValue(referenceCorrection.progress)
     const hasCoverage = readNumberValue(match.tokenCoverage) !== undefined || readNumberValue(match.segmentCoverage) !== undefined
-    const rawRefStatus = refStatus === 'failed' ? 'failed' : refStatus === 'done' ? 'done' : refStatus === 'active' ? 'active' : hasCoverage ? 'done' : 'pending'
+
+    // 判断转录是否完成
+    const transcriptionStep = hasStageProgress && stageProgress.transcription ? readRecordValue(stageProgress.transcription) : null
+    const transcriptionStatus = transcriptionStep ? readStringValue(transcriptionStep.status) : ''
+    const isTranscriptionDone = transcriptionStatus === 'done' || !hasStageProgress
 
     // 1. 转录步骤
-    if (hasStageProgress && stageProgress.transcription) {
-      steps.push(detailStepFromRecord('transcription', '转录', readRecordValue(stageProgress.transcription)))
-    } else if (refStatus) {
+    if (hasStageProgress && stageProgress.transcription && transcriptionStep) {
+      steps.push(detailStepFromRecord('transcription', '转录', transcriptionStep))
+    } else if (refStatus && !hasStageProgress) {
       // 参考校正阶段，转录必定已完成
       steps.push({
         key: 'transcription',
@@ -2227,7 +2231,9 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     }
 
     // 2. 参考校正步骤
-    if (refStatus) {
+    // 只有在转录完成后，参考校正才能显示为 active
+    if (refStatus && isTranscriptionDone) {
+      const rawRefStatus = refStatus === 'failed' ? 'failed' : refStatus === 'done' ? 'done' : refStatus === 'active' ? 'active' : hasCoverage ? 'done' : 'pending'
       const referenceCorrectionStep: WorkbenchDetailStep = {
         key: 'subtitleReferenceCorrection',
         label: '参考校正',
