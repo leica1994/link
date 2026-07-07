@@ -394,7 +394,8 @@ pub fn compact_error(error: &str) -> String {
         line.to_ascii_lowercase()
             .contains("requested format is not available")
     }) {
-        return "当前视频没有返回可用下载格式，请确认 yt-dlp 已更新，并检查代理是否能访问该视频".to_string();
+        return "当前视频没有返回可用下载格式，请确认 yt-dlp 已更新，并检查代理是否能访问该视频"
+            .to_string();
     }
 
     if lines.iter().any(|line| {

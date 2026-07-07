@@ -287,11 +287,7 @@ where
     );
 
     progress_state.activate_step(ALIGNMENT_STEP_INPUT_VALIDATION, 20);
-    emit_progress(&progress_state.snapshot(
-        5,
-        "读取音视频信息",
-        ALIGNMENT_STEP_INPUT_VALIDATION,
-    ))?;
+    emit_progress(&progress_state.snapshot(5, "读取音视频信息", ALIGNMENT_STEP_INPUT_VALIDATION))?;
     let video_duration_ms = probe_media_duration_ms(&input.muted_video_path)?;
     if video_duration_ms == 0 {
         return Err("无声视频时长为 0，无法对齐".to_string());
@@ -393,11 +389,7 @@ where
     }
 
     progress_state.activate_step(ALIGNMENT_STEP_OUTPUT_FINALIZE, 0);
-    emit_progress(&progress_state.snapshot(
-        88,
-        "拼接对齐产物",
-        ALIGNMENT_STEP_OUTPUT_FINALIZE,
-    ))?;
+    emit_progress(&progress_state.snapshot(88, "拼接对齐产物", ALIGNMENT_STEP_OUTPUT_FINALIZE))?;
     let aligned_video_path = output_dir.join("aligned_muted_video.mp4");
     let aligned_audio_path = output_dir.join("aligned_tts_audio.wav");
     concat_media_files(
@@ -432,11 +424,7 @@ where
     };
 
     progress_state.set_step(ALIGNMENT_STEP_OUTPUT_FINALIZE, 62, "active");
-    emit_progress(&progress_state.snapshot(
-        94,
-        "生成对齐字幕",
-        ALIGNMENT_STEP_OUTPUT_FINALIZE,
-    ))?;
+    emit_progress(&progress_state.snapshot(94, "生成对齐字幕", ALIGNMENT_STEP_OUTPUT_FINALIZE))?;
     let aligned_subtitle_path = output_dir.join("aligned_subtitle.srt");
     write_aligned_subtitle(&aligned_subtitle_path, &segment_results)?;
 
@@ -950,9 +938,7 @@ fn build_segment_results(
     results
 }
 
-fn alignment_mode_counts(
-    segments: &[DubbingAlignmentSegmentResult],
-) -> BTreeMap<String, usize> {
+fn alignment_mode_counts(segments: &[DubbingAlignmentSegmentResult]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for segment in segments {
         *counts.entry(segment.video_mode.clone()).or_insert(0) += 1;

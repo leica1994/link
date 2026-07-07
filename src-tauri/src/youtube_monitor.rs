@@ -1350,7 +1350,10 @@ fn read_youtube_unread_videos_page(
         )
         .map_err(|error| format!("无法读取未读更新: {error}"))?;
     let rows = statement
-        .query_map(params![&query_like, limit, offset], map_youtube_unread_video_item)
+        .query_map(
+            params![&query_like, limit, offset],
+            map_youtube_unread_video_item,
+        )
         .map_err(|error| format!("无法读取未读更新: {error}"))?;
     let mut items = Vec::new();
     for row in rows {

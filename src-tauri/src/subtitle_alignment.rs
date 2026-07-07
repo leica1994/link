@@ -208,8 +208,12 @@ fn subtitle_indices_overlapping_time(
     downloaded_segments: &[TranscriptionSegment],
     asr_segment: &TranscriptionSegment,
 ) -> Vec<usize> {
-    let start = asr_segment.start_time.saturating_sub(REFERENCE_TIME_PADDING_MS);
-    let end = asr_segment.end_time.saturating_add(REFERENCE_TIME_PADDING_MS);
+    let start = asr_segment
+        .start_time
+        .saturating_sub(REFERENCE_TIME_PADDING_MS);
+    let end = asr_segment
+        .end_time
+        .saturating_add(REFERENCE_TIME_PADDING_MS);
     downloaded_segments
         .iter()
         .enumerate()
@@ -532,7 +536,10 @@ mod tests {
 
         assert!(result.report.token_coverage < MIN_TOKEN_COVERAGE);
         assert!(!result.report.warnings.is_empty());
-        assert_eq!(result.matches[0].reference_text, "completely different text");
+        assert_eq!(
+            result.matches[0].reference_text,
+            "completely different text"
+        );
     }
 
     #[test]
