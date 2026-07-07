@@ -2179,7 +2179,12 @@ const workbenchRunLabel = computed(() => {
   if (workbenchSnapshot.value?.status === 'failed' || workbenchSnapshot.value?.status === 'interrupted') {
     return '继续执行'
   }
-  if (workbenchSnapshot.value?.stages.some((stage) => ['done', 'skipped'].includes(stage.status))) {
+  // 只有核心处理阶段（准备字幕、翻译、配音、文案、导出）有完成进度时才显示"继续执行"
+  // 下载阶段完成不算作"继续执行"
+  const coreStageKeys = ['prepare-subtitle', 'translation', 'dubbing', 'copywriting', 'export']
+  if (workbenchSnapshot.value?.stages.some((stage) =>
+    coreStageKeys.includes(stage.key) && ['done', 'skipped'].includes(stage.status)
+  )) {
     return '继续执行'
   }
   return '开始执行'
