@@ -76,6 +76,8 @@ const ARTIFACT_DUBBED_SUBTITLE: &str = "dubbed-subtitle";
 const ARTIFACT_EXPORTED_VIDEO: &str = "exported-video";
 const ARTIFACT_EXPORTED_SUBTITLE: &str = "exported-subtitle";
 
+const DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION: &str = "2026-07-07-post-processing-v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HomeWorkbenchOptions {
@@ -978,7 +980,16 @@ async fn prepare_subtitle(
     options: &HomeWorkbenchOptions,
     video: &HomeVideoDownload,
 ) -> Result<PathBuf, String> {
-    if let Some(artifact) = reusable_prepared_downloaded_subtitle(store, task_id, options, video)? {
+    if let Some(artifact) =
+        reusable_prepared_downloaded_subtitle(store, task_id, options, video, settings)?
+    {
+        let artifact_path = artifact_path_value(&artifact);
+        let segments = load_subtitle_segments(&artifact_path).unwrap_or_default();
+        let stage_progress = artifact
+            .metadata
+            .get("stageProgress")
+            .cloned()
+            .unwrap_or_else(|| final_downloaded_reference_stage_progress(options));
         update_stage_snapshot_from_app(
             &app,
             task_id,
@@ -990,11 +1001,15 @@ async fn prepare_subtitle(
                 "path": artifact.path,
                 "fileSize": artifact.file_size,
                 "metadata": artifact.metadata,
+                "stageProgress": stage_progress,
+                "segments": segments,
+                "warnings": artifact.metadata.get("warnings").cloned().unwrap_or_else(|| json!([])),
+                "postProcessing": artifact.metadata.get("postProcessing").cloned().unwrap_or_else(|| json!({})),
                 "referenceCorrection": artifact.metadata.get("referenceCorrection").cloned().unwrap_or_else(|| json!({})),
                 "message": "复用已参考校正字幕",
             }),
         )?;
-        return Ok(artifact_path_value(&artifact));
+        return Ok(artifact_path);
     }
 
     if options.subtitle_source == SUBTITLE_SOURCE_DOWNLOADED {
@@ -1153,6 +1168,8 @@ async fn prepare_reference_corrected_downloaded_subtitle(
     )
     .await?;
 
+    let mut prepare_stage_progress = prepare_subtitle_stage_progress_after_transcription();
+
     // 第二阶段：参考校正
     update_reference_correction_state(
         &reference_correction_state,
@@ -1170,7 +1187,7 @@ async fn prepare_reference_corrected_downloaded_subtitle(
         json!({
             "mode": "downloaded-reference",
             "message": "匹配参考字幕",
-            "stageProgress": serde_json::Value::Null,
+            "stageProgress": prepare_stage_progress.clone(),
             "segments": result.segments,
             "warnings": result.warnings,
             "referenceCorrection": current_reference_correction_state(&reference_correction_state),
@@ -1256,7 +1273,7 @@ async fn prepare_reference_corrected_downloaded_subtitle(
                     json!({
                         "mode": "downloaded-reference",
                         "message": message,
-                        "stageProgress": serde_json::Value::Null,
+                        "stageProgress": prepare_stage_progress.clone(),
                         "segments": snapshot_segments,
                         "warnings": combined_warnings,
                         "referenceCorrection": state,
@@ -1313,55 +1330,85 @@ async fn prepare_reference_corrected_downloaded_subtitle(
             json!({
                 "mode": "downloaded-reference",
                 "message": "AI 智能断句中",
-                "stageProgress": json!({
-                    "smartSegmentation": {
-                        "progress": 0,
-                        "message": "AI 智能断句中",
-                        "status": "active"
-                    }
-                }),
+                "stageProgress": prepare_stage_progress_with_entry(
+                    &prepare_stage_progress,
+                    "smartSegmentation",
+                    0,
+                    "active",
+                    "AI 智能断句中",
+                ),
                 "segments": current_segments,
                 "warnings": result.warnings,
                 "referenceCorrection": reference_correction,
             }),
         )?;
 
-        let mut report_smart_segmentation = |progress: u8, message: &str, snapshot_segments: &[crate::transcription::TranscriptionSegment], snapshot_warnings: &[String]| {
-            let stage_progress = base_progress.saturating_add((progress.min(100) * 15) / 100).min(75);
-            let _ = update_stage_snapshot_from_app(
-                &app,
-                task_id,
-                STAGE_PREPARE_SUBTITLE,
-                stage_progress,
-                message,
-                json!({
-                    "mode": "downloaded-reference",
-                    "message": message,
-                    "stageProgress": json!({
-                        "smartSegmentation": {
-                            "progress": progress,
-                            "message": message,
-                            "status": if progress >= 100 { "done" } else { "active" }
-                        }
-                    }),
-                    "segments": snapshot_segments,
-                    "warnings": snapshot_warnings,
-                    "referenceCorrection": &reference_correction,
-                }),
-            );
-        };
+        let segmentation_result = {
+            let mut report_smart_segmentation =
+                |progress: u8,
+                 message: &str,
+                 snapshot_segments: &[crate::transcription::TranscriptionSegment],
+                 snapshot_warnings: &[String]| {
+                    let stage_progress = base_progress
+                        .saturating_add((progress.min(100) * 15) / 100)
+                        .min(75);
+                    let _ = update_stage_snapshot_from_app(
+                        &app,
+                        task_id,
+                        STAGE_PREPARE_SUBTITLE,
+                        stage_progress,
+                        message,
+                        json!({
+                                "mode": "downloaded-reference",
+                                "message": message,
+                                "stageProgress": prepare_stage_progress_with_entry(
+                                    &prepare_stage_progress,
+                                    "smartSegmentation",
+                                    progress,
+                                    if progress >= 100 { "done" } else { "active" },
+                                    message,
+                                ),
+                                "segments": snapshot_segments,
+                                "warnings": snapshot_warnings,
+                                "referenceCorrection": &reference_correction,
+                        }),
+                    );
+                };
 
-        let segmentation_result = crate::subtitle_ai::smart_segment_subtitles(
-            &run_settings,
-            ai_service,
-            &post_processing_log_session,
-            current_segments,
-            &mut report_smart_segmentation,
-            Some((store, &checkpoint_context.child("post-smart-segmentation"))),
-        )
-        .await;
+            crate::subtitle_ai::smart_segment_subtitles(
+                &run_settings,
+                ai_service,
+                &post_processing_log_session,
+                current_segments,
+                &mut report_smart_segmentation,
+                Some((store, &checkpoint_context.child("post-smart-segmentation"))),
+            )
+            .await
+        };
         current_segments = segmentation_result.segments;
         post_processing_warnings.extend(segmentation_result.warnings);
+        insert_prepare_stage_progress_entry(
+            &mut prepare_stage_progress,
+            "smartSegmentation",
+            100,
+            "done",
+            "AI 智能断句完成",
+        );
+        update_stage_snapshot_from_app(
+            &app,
+            task_id,
+            STAGE_PREPARE_SUBTITLE,
+            75,
+            "AI 智能断句完成",
+            json!({
+                "mode": "downloaded-reference",
+                "message": "AI 智能断句完成",
+                "stageProgress": prepare_stage_progress.clone(),
+                "segments": current_segments,
+                "warnings": combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]),
+                "referenceCorrection": &reference_correction,
+            }),
+        )?;
         post_processing_log_session.info(
             "smart_segmentation_completed",
             "AI 智能断句完成",
@@ -1386,55 +1433,91 @@ async fn prepare_reference_corrected_downloaded_subtitle(
             json!({
                 "mode": "downloaded-reference",
                 "message": "字幕校正中",
-                "stageProgress": json!({
-                    "subtitleCorrection": {
-                        "progress": 0,
-                        "message": "字幕校正中",
-                        "status": "active"
-                    }
-                }),
+                "stageProgress": prepare_stage_progress_with_entry(
+                    &prepare_stage_progress,
+                    "subtitleCorrection",
+                    0,
+                    "active",
+                    "字幕校正中",
+                ),
                 "segments": current_segments,
-                "warnings": post_processing_warnings,
+                "warnings": combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]),
                 "referenceCorrection": reference_correction,
             }),
         )?;
 
-        let mut report_correction = |progress: u8, message: &str, snapshot_segments: &[crate::transcription::TranscriptionSegment], snapshot_warnings: &[String]| {
-            let stage_progress = base_progress.saturating_add((progress.min(100) * 12) / 100).min(87);
-            let _ = update_stage_snapshot_from_app(
-                &app,
-                task_id,
-                STAGE_PREPARE_SUBTITLE,
-                stage_progress,
-                message,
-                json!({
-                    "mode": "downloaded-reference",
-                    "message": message,
-                    "stageProgress": json!({
-                        "subtitleCorrection": {
-                            "progress": progress,
-                            "message": message,
-                            "status": if progress >= 100 { "done" } else { "active" }
-                        }
-                    }),
-                    "segments": snapshot_segments,
-                    "warnings": snapshot_warnings,
-                    "referenceCorrection": &reference_correction,
-                }),
-            );
-        };
+        let correction_result = {
+            let correction_base_warnings =
+                combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]);
+            let mut report_correction =
+                |progress: u8,
+                 message: &str,
+                 snapshot_segments: &[crate::transcription::TranscriptionSegment],
+                 snapshot_warnings: &[String]| {
+                    let stage_progress = base_progress
+                        .saturating_add((progress.min(100) * 12) / 100)
+                        .min(87);
+                    let _ = update_stage_snapshot_from_app(
+                        &app,
+                        task_id,
+                        STAGE_PREPARE_SUBTITLE,
+                        stage_progress,
+                        message,
+                        json!({
+                                "mode": "downloaded-reference",
+                                "message": message,
+                                "stageProgress": prepare_stage_progress_with_entry(
+                                    &prepare_stage_progress,
+                                    "subtitleCorrection",
+                                    progress,
+                                    if progress >= 100 { "done" } else { "active" },
+                                    message,
+                                ),
+                                "segments": snapshot_segments,
+                                "warnings": combined_prepare_warnings(
+                                    &correction_base_warnings,
+                                    &[],
+                                    snapshot_warnings,
+                                ),
+                                "referenceCorrection": &reference_correction,
+                        }),
+                    );
+                };
 
-        let correction_result = crate::subtitle_ai::correct_subtitles(
-            &run_settings,
-            ai_service,
-            &post_processing_log_session,
-            current_segments,
-            &mut report_correction,
-            Some((store, &checkpoint_context.child("post-correction"))),
-        )
-        .await;
+            crate::subtitle_ai::correct_subtitles(
+                &run_settings,
+                ai_service,
+                &post_processing_log_session,
+                current_segments,
+                &mut report_correction,
+                Some((store, &checkpoint_context.child("post-correction"))),
+            )
+            .await
+        };
         current_segments = correction_result.segments;
         post_processing_warnings.extend(correction_result.warnings);
+        insert_prepare_stage_progress_entry(
+            &mut prepare_stage_progress,
+            "subtitleCorrection",
+            100,
+            "done",
+            "字幕校正完成",
+        );
+        update_stage_snapshot_from_app(
+            &app,
+            task_id,
+            STAGE_PREPARE_SUBTITLE,
+            87,
+            "字幕校正完成",
+            json!({
+                "mode": "downloaded-reference",
+                "message": "字幕校正完成",
+                "stageProgress": prepare_stage_progress.clone(),
+                "segments": current_segments,
+                "warnings": combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]),
+                "referenceCorrection": &reference_correction,
+            }),
+        )?;
         post_processing_log_session.info(
             "subtitle_correction_completed",
             "字幕校正完成",
@@ -1459,55 +1542,91 @@ async fn prepare_reference_corrected_downloaded_subtitle(
             json!({
                 "mode": "downloaded-reference",
                 "message": "AI 审核中",
-                "stageProgress": json!({
-                    "aiReview": {
-                        "progress": 0,
-                        "message": "AI 审核中",
-                        "status": "active"
-                    }
-                }),
+                "stageProgress": prepare_stage_progress_with_entry(
+                    &prepare_stage_progress,
+                    "aiReview",
+                    0,
+                    "active",
+                    "AI 审核中",
+                ),
                 "segments": current_segments,
-                "warnings": post_processing_warnings,
+                "warnings": combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]),
                 "referenceCorrection": reference_correction,
             }),
         )?;
 
-        let mut report_review = |progress: u8, message: &str, snapshot_segments: &[crate::transcription::TranscriptionSegment], snapshot_warnings: &[String]| {
-            let stage_progress = base_progress.saturating_add((progress.min(100) * 12) / 100).min(99);
-            let _ = update_stage_snapshot_from_app(
-                &app,
-                task_id,
-                STAGE_PREPARE_SUBTITLE,
-                stage_progress,
-                message,
-                json!({
-                    "mode": "downloaded-reference",
-                    "message": message,
-                    "stageProgress": json!({
-                        "aiReview": {
-                            "progress": progress,
-                            "message": message,
-                            "status": if progress >= 100 { "done" } else { "active" }
-                        }
-                    }),
-                    "segments": snapshot_segments,
-                    "warnings": snapshot_warnings,
-                    "referenceCorrection": &reference_correction,
-                }),
-            );
-        };
+        let review_result = {
+            let review_base_warnings =
+                combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]);
+            let mut report_review =
+                |progress: u8,
+                 message: &str,
+                 snapshot_segments: &[crate::transcription::TranscriptionSegment],
+                 snapshot_warnings: &[String]| {
+                    let stage_progress = base_progress
+                        .saturating_add((progress.min(100) * 12) / 100)
+                        .min(99);
+                    let _ = update_stage_snapshot_from_app(
+                        &app,
+                        task_id,
+                        STAGE_PREPARE_SUBTITLE,
+                        stage_progress,
+                        message,
+                        json!({
+                                "mode": "downloaded-reference",
+                                "message": message,
+                                "stageProgress": prepare_stage_progress_with_entry(
+                                    &prepare_stage_progress,
+                                    "aiReview",
+                                    progress,
+                                    if progress >= 100 { "done" } else { "active" },
+                                    message,
+                                ),
+                                "segments": snapshot_segments,
+                                "warnings": combined_prepare_warnings(
+                                    &review_base_warnings,
+                                    &[],
+                                    snapshot_warnings,
+                                ),
+                                "referenceCorrection": &reference_correction,
+                        }),
+                    );
+                };
 
-        let review_result = crate::subtitle_ai::review_source_subtitles(
-            &run_settings,
-            ai_service,
-            &post_processing_log_session,
-            current_segments,
-            &mut report_review,
-            Some((store, &checkpoint_context.child("post-review"))),
-        )
-        .await;
+            crate::subtitle_ai::review_source_subtitles(
+                &run_settings,
+                ai_service,
+                &post_processing_log_session,
+                current_segments,
+                &mut report_review,
+                Some((store, &checkpoint_context.child("post-review"))),
+            )
+            .await
+        };
         current_segments = review_result.segments;
         post_processing_warnings.extend(review_result.warnings);
+        insert_prepare_stage_progress_entry(
+            &mut prepare_stage_progress,
+            "aiReview",
+            100,
+            "done",
+            "AI 审核完成",
+        );
+        update_stage_snapshot_from_app(
+            &app,
+            task_id,
+            STAGE_PREPARE_SUBTITLE,
+            99,
+            "AI 审核完成",
+            json!({
+                "mode": "downloaded-reference",
+                "message": "AI 审核完成",
+                "stageProgress": prepare_stage_progress.clone(),
+                "segments": current_segments,
+                "warnings": combined_prepare_warnings(&result.warnings, &post_processing_warnings, &[]),
+                "referenceCorrection": &reference_correction,
+            }),
+        )?;
         post_processing_log_session.info(
             "ai_review_completed",
             "AI 审核完成",
@@ -1521,9 +1640,20 @@ async fn prepare_reference_corrected_downloaded_subtitle(
     result.subtitle_text =
         serialize_segments_for_export(&result.segments, output_format, Some(store), settings)?;
 
+    let post_processing =
+        downloaded_reference_post_processing_summary(options, &prepare_stage_progress);
+    let final_prepare_message = if has_enabled_downloaded_reference_post_processing(options) {
+        "字幕后处理完成"
+    } else {
+        "AI 参考校正完成"
+    };
+
     let mut metadata = json!({
         "mode": "downloaded-reference",
-        "referenceCorrection": reference_correction,
+        "pipelineVersion": DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION,
+        "stageProgress": prepare_stage_progress.clone(),
+        "postProcessing": post_processing.clone(),
+        "referenceCorrection": &reference_correction,
         "subtitleId": &subtitle.id,
         "language": &subtitle.language,
         "languageName": &subtitle.language_name,
@@ -1535,7 +1665,7 @@ async fn prepare_reference_corrected_downloaded_subtitle(
     metadata["logPath"] = json!(result.log_path);
     metadata["warnings"] = json!(result.warnings);
     metadata["input"] = json!(build_downloaded_subtitle_cache_key(
-        &subtitle, video, options
+        &subtitle, video, options, settings
     ));
 
     let stem = "reference-corrected";
@@ -1554,16 +1684,17 @@ async fn prepare_reference_corrected_downloaded_subtitle(
         task_id,
         STAGE_PREPARE_SUBTITLE,
         99,
-        "AI 参考校正完成",
+        final_prepare_message,
         json!({
             "mode": "downloaded-reference",
             "path": output_path.to_string_lossy(),
             "metadata": metadata,
-            "stageProgress": serde_json::Value::Null,
+            "stageProgress": prepare_stage_progress.clone(),
             "segments": result.segments,
             "warnings": result.warnings,
             "referenceCorrection": current_reference_correction_state(&reference_correction_state),
-            "message": "AI 参考校正完成",
+            "postProcessing": post_processing,
+            "message": final_prepare_message,
         }),
     )?;
     Ok(output_path)
@@ -1580,6 +1711,148 @@ fn current_reference_correction_state(state: &Arc<Mutex<Value>>) -> Value {
         .lock()
         .map(|value| value.clone())
         .unwrap_or_else(|_| json!({}))
+}
+
+fn prepare_subtitle_stage_progress_after_transcription() -> Value {
+    prepare_stage_progress_with_entry(
+        &json!({}),
+        "transcription",
+        100,
+        STAGE_STATUS_DONE,
+        "语音转录完成",
+    )
+}
+
+fn final_downloaded_reference_stage_progress(options: &HomeWorkbenchOptions) -> Value {
+    let mut stage_progress = prepare_subtitle_stage_progress_after_transcription();
+    if options.is_smart_segmentation_enabled {
+        insert_prepare_stage_progress_entry(
+            &mut stage_progress,
+            "smartSegmentation",
+            100,
+            STAGE_STATUS_DONE,
+            "AI 智能断句完成",
+        );
+    }
+    if options.is_subtitle_correction_enabled {
+        insert_prepare_stage_progress_entry(
+            &mut stage_progress,
+            "subtitleCorrection",
+            100,
+            STAGE_STATUS_DONE,
+            "字幕校正完成",
+        );
+    }
+    if options.is_ai_subtitle_review_enabled {
+        insert_prepare_stage_progress_entry(
+            &mut stage_progress,
+            "aiReview",
+            100,
+            STAGE_STATUS_DONE,
+            "AI 审核完成",
+        );
+    }
+    stage_progress
+}
+
+fn prepare_stage_progress_with_entry(
+    stage_progress: &Value,
+    key: &str,
+    progress: u8,
+    status: &str,
+    message: &str,
+) -> Value {
+    let mut object = stage_progress
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    object.insert(
+        key.to_string(),
+        json!({
+            "progress": progress.min(100),
+            "status": status,
+            "message": message,
+        }),
+    );
+    Value::Object(object)
+}
+
+fn insert_prepare_stage_progress_entry(
+    stage_progress: &mut Value,
+    key: &str,
+    progress: u8,
+    status: &str,
+    message: &str,
+) {
+    *stage_progress =
+        prepare_stage_progress_with_entry(stage_progress, key, progress, status, message);
+}
+
+fn has_enabled_downloaded_reference_post_processing(options: &HomeWorkbenchOptions) -> bool {
+    options.is_smart_segmentation_enabled
+        || options.is_subtitle_correction_enabled
+        || options.is_ai_subtitle_review_enabled
+}
+
+fn downloaded_reference_post_processing_summary(
+    options: &HomeWorkbenchOptions,
+    stage_progress: &Value,
+) -> Value {
+    json!({
+        "pipelineVersion": DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION,
+        "smartSegmentation": post_processing_step_summary(
+            stage_progress,
+            "smartSegmentation",
+            options.is_smart_segmentation_enabled,
+        ),
+        "subtitleCorrection": post_processing_step_summary(
+            stage_progress,
+            "subtitleCorrection",
+            options.is_subtitle_correction_enabled,
+        ),
+        "aiReview": post_processing_step_summary(
+            stage_progress,
+            "aiReview",
+            options.is_ai_subtitle_review_enabled,
+        ),
+    })
+}
+
+fn post_processing_step_summary(stage_progress: &Value, key: &str, enabled: bool) -> Value {
+    if !enabled {
+        return json!({
+            "enabled": false,
+            "progress": 100,
+            "status": STAGE_STATUS_SKIPPED,
+            "message": "已关闭",
+        });
+    }
+
+    let entry = stage_progress
+        .get(key)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "enabled": true,
+        "progress": entry.get("progress").and_then(Value::as_u64).unwrap_or(0).min(100),
+        "status": entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(STAGE_STATUS_PENDING),
+        "message": entry
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("等待执行"),
+    })
+}
+
+fn combined_prepare_warnings(first: &[String], second: &[String], third: &[String]) -> Vec<String> {
+    let mut warnings = Vec::with_capacity(first.len() + second.len() + third.len());
+    warnings.extend(first.iter().cloned());
+    warnings.extend(second.iter().cloned());
+    warnings.extend(third.iter().cloned());
+    warnings
 }
 
 async fn translate_subtitle(
@@ -2115,6 +2388,7 @@ fn reusable_prepared_downloaded_subtitle(
     task_id: &str,
     options: &HomeWorkbenchOptions,
     video: &HomeVideoDownload,
+    settings: &AppSettings,
 ) -> Result<Option<HomeWorkbenchArtifact>, String> {
     if options.subtitle_source != SUBTITLE_SOURCE_DOWNLOADED
         || options.subtitle_id.trim().is_empty()
@@ -2125,7 +2399,7 @@ fn reusable_prepared_downloaded_subtitle(
     let Some(subtitle) = selected_downloaded_subtitle(store, task_id, &options.subtitle_id)? else {
         return Ok(None);
     };
-    let expected_key = build_downloaded_subtitle_cache_key(&subtitle, video, options);
+    let expected_key = build_downloaded_subtitle_cache_key(&subtitle, video, options, settings);
     let Some(artifact) =
         workbench_artifact_file(store, task_id, ARTIFACT_REFERENCE_CORRECTED_SUBTITLE)?
     else {
@@ -2136,19 +2410,70 @@ fn reusable_prepared_downloaded_subtitle(
         .get("input")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if artifact_key == expected_key {
+    if artifact_key == expected_key && downloaded_reference_artifact_is_complete(&artifact) {
         return Ok(Some(artifact));
     }
 
     Ok(None)
 }
 
+fn downloaded_reference_artifact_is_complete(artifact: &HomeWorkbenchArtifact) -> bool {
+    if artifact
+        .metadata
+        .get("pipelineVersion")
+        .and_then(Value::as_str)
+        != Some(DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION)
+    {
+        return false;
+    }
+
+    let Some(input) = artifact.metadata.get("input").and_then(Value::as_object) else {
+        return false;
+    };
+    if input.get("pipelineVersion").and_then(Value::as_str)
+        != Some(DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION)
+    {
+        return false;
+    }
+
+    let Some(stage_progress) = artifact
+        .metadata
+        .get("stageProgress")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if !stage_progress_entry_is_done(stage_progress.get("transcription")) {
+        return false;
+    }
+
+    let required_steps = [
+        ("smartSegmentationEnabled", "smartSegmentation"),
+        ("subtitleCorrectionEnabled", "subtitleCorrection"),
+        ("aiSubtitleReviewEnabled", "aiReview"),
+    ];
+    required_steps.iter().all(|(flag, key)| {
+        let enabled = input.get(*flag).and_then(Value::as_bool).unwrap_or(false);
+        !enabled || stage_progress_entry_is_done(stage_progress.get(*key))
+    })
+}
+
+fn stage_progress_entry_is_done(entry: Option<&Value>) -> bool {
+    entry
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("status"))
+        .and_then(Value::as_str)
+        == Some(STAGE_STATUS_DONE)
+}
+
 fn build_downloaded_subtitle_cache_key(
     subtitle: &HomeVideoSubtitle,
     video: &HomeVideoDownload,
     options: &HomeWorkbenchOptions,
+    settings: &AppSettings,
 ) -> Value {
     json!({
+        "pipelineVersion": DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION,
         "referenceMatchVersion": reference_match_version(),
         "subtitleId": &subtitle.id,
         "subtitlePath": &subtitle.file_path,
@@ -2167,6 +2492,15 @@ fn build_downloaded_subtitle_cache_key(
         "videoContentType": &options.video_content_type,
         "translationBatchSize": options.translation_batch_size,
         "translationThreadCount": options.translation_thread_count,
+        "selectedLlmService": &settings.selected_llm_service,
+        "llmConfig": settings.llm_configs.get(&settings.selected_llm_service).map(|config| {
+            json!({
+                "baseUrl": &config.base_url,
+                "model": &config.model,
+                "reasoningEffort": &config.reasoning_effort,
+                "streaming": config.is_streaming,
+            })
+        }),
     })
 }
 
@@ -2216,6 +2550,10 @@ fn build_downloaded_reference_transcription_checkpoint_input(
         object.insert(
             "referenceMatchVersion".to_string(),
             json!(reference_match_version()),
+        );
+        object.insert(
+            "pipelineVersion".to_string(),
+            json!(DOWNLOADED_REFERENCE_PREPARE_PIPELINE_VERSION),
         );
     }
     value
