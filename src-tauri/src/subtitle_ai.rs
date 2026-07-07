@@ -153,10 +153,11 @@ impl VideoPromptStrategy for GeneralPromptStrategy {
 规则:
 1. 原文必须保持不变，不增删、不改写、不翻译，只插入 <br>。
 2. CJK 文本每段不超过 {max_word_count_cjk} 字；拉丁语言每段不超过 {max_word_count_english} 词。
-3. 保持每段语义完整，避免过短碎片。
+3. 保持每段语义完整，优先合并相邻短片段，避免把未完成短语单独成行。
 4. 倒计时、关键信息揭示前、转折和强调位置可适当分割。
 5. 如果自然句超过长度上限，必须继续在自然停顿点插入 <br>。
-6. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
+6. 英文短行只有在本身是完整回答、标题或独立短句时才保留；不要让字幕以助动词、介词、连词或疑问词短语结束。
+7. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
         )
     }
 
@@ -223,7 +224,8 @@ price action, trading setup, pullback, trend, breakout, reversal, channel, wedge
 3. 价格、百分比、杠杆、ticker、币种、K线周期、做多/做空、止损/止盈等关键信息不要拆散。
 4. 在交易观点切换、条件触发、风险提示、入场/出场说明处优先分割。
 5. 如果自然句超过长度上限，必须继续在交易信息边界插入 <br>。
-6. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
+6. 英文短行只有在本身是完整回答、标题或独立短句时才保留；不要让字幕以助动词、介词、连词或疑问词短语结束。
+7. 直接输出带 <br> 的文本，不要解释或 Markdown。"#
         )
     }
 
@@ -1505,7 +1507,9 @@ async fn split_chunk_by_llm(
         }
     }
 
-    let fallback_sentences = rule_split_word_units(&words);
+    let fallback_sentences =
+        repair_split_sentences_by_word_rules(&rule_split_word_units(&words), &words)
+            .unwrap_or_else(|_| rule_split_word_units(&words));
     match validate_split_result(&source_text, &fallback_sentences) {
         Ok(()) => {
             log_session.warn(
@@ -2432,7 +2436,16 @@ fn should_merge_short_fragment(previous: &[WordUnit], current: &[WordUnit]) -> b
 
     let previous_text = join_word_units(previous);
     let current_text = join_word_units(current);
-    if !is_short_orphan_fragment(&current_text) && !needs_previous_completion(&previous_text) {
+    let current_is_orphan = is_short_orphan_fragment(&current_text);
+    let previous_needs_completion = needs_previous_completion(&previous_text)
+        || is_incomplete_short_fragment(&previous_text)
+        || (is_opening_phrase_fragment(&previous_text)
+            && starts_with_continuation_word(&current_text));
+    if !current_is_orphan && !previous_needs_completion {
+        return false;
+    }
+
+    if is_terminal_text(&previous_text) {
         return false;
     }
 
@@ -2507,27 +2520,7 @@ fn needs_previous_completion(text: &str) -> bool {
         .unwrap_or_default()
         .trim_matches(|character: char| !character.is_alphanumeric());
 
-    trimmed.ends_with(',')
-        || trimmed.ends_with('，')
-        || matches!(
-            last_word,
-            "a" | "an"
-                | "the"
-                | "and"
-                | "or"
-                | "but"
-                | "of"
-                | "in"
-                | "at"
-                | "to"
-                | "for"
-                | "with"
-                | "from"
-                | "new"
-                | "another"
-                | "this"
-                | "that"
-        )
+    trimmed.ends_with(',') || trimmed.ends_with('，') || is_incomplete_tail_word(last_word)
 }
 
 fn is_short_orphan_fragment(text: &str) -> bool {
@@ -2539,8 +2532,184 @@ fn is_short_orphan_fragment(text: &str) -> bool {
     if is_mainly_no_space_language(trimmed) {
         normalized_len(trimmed) <= 4
     } else {
-        count_words(trimmed) <= 2
+        let words = normalized_latin_words(trimmed);
+        let word_count = words.len();
+        word_count <= 2
+            || (word_count <= 4
+                && (starts_lowercase(trimmed)
+                    || starts_with_continuation_word(trimmed)
+                    || is_incomplete_short_fragment(trimmed)))
     }
+}
+
+fn is_incomplete_short_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_terminal_text(trimmed) || is_mainly_no_space_language(trimmed) {
+        return false;
+    }
+
+    let words = normalized_latin_words(trimmed);
+    if words.is_empty() || words.len() > 5 {
+        return false;
+    }
+
+    let first_word = words.first().map(String::as_str).unwrap_or_default();
+    let last_word = words.last().map(String::as_str).unwrap_or_default();
+    is_incomplete_tail_word(last_word) || is_question_fragment_start(first_word)
+}
+
+fn is_opening_phrase_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || is_terminal_text(trimmed) || is_mainly_no_space_language(trimmed) {
+        return false;
+    }
+
+    let words = normalized_latin_words(trimmed);
+    if words.len() > 4 {
+        return false;
+    }
+
+    let first_word = words.first().map(String::as_str).unwrap_or_default();
+    first_word == "hello" && words.iter().any(|word| word == "welcome")
+}
+
+fn starts_with_continuation_word(text: &str) -> bool {
+    let words = normalized_latin_words(text);
+    let first_word = words.first().map(String::as_str).unwrap_or_default();
+    matches!(
+        first_word,
+        "to" | "for"
+            | "with"
+            | "from"
+            | "in"
+            | "on"
+            | "at"
+            | "of"
+            | "as"
+            | "by"
+            | "than"
+            | "that"
+            | "which"
+            | "who"
+            | "when"
+            | "where"
+            | "why"
+            | "how"
+            | "because"
+            | "and"
+            | "or"
+            | "but"
+            | "so"
+            | "then"
+            | "if"
+            | "into"
+            | "onto"
+            | "about"
+            | "over"
+            | "under"
+            | "through"
+            | "around"
+            | "without"
+            | "within"
+            | "back"
+    )
+}
+
+fn is_question_fragment_start(word: &str) -> bool {
+    matches!(
+        word,
+        "what" | "when" | "where" | "who" | "whom" | "whose" | "why" | "how"
+    )
+}
+
+fn is_incomplete_tail_word(word: &str) -> bool {
+    matches!(
+        word,
+        "a" | "an"
+            | "the"
+            | "and"
+            | "or"
+            | "but"
+            | "of"
+            | "in"
+            | "at"
+            | "to"
+            | "for"
+            | "with"
+            | "from"
+            | "by"
+            | "as"
+            | "than"
+            | "that"
+            | "this"
+            | "another"
+            | "new"
+            | "can"
+            | "cant"
+            | "can't"
+            | "cannot"
+            | "could"
+            | "couldnt"
+            | "couldn't"
+            | "will"
+            | "wont"
+            | "won't"
+            | "would"
+            | "wouldnt"
+            | "wouldn't"
+            | "should"
+            | "shouldnt"
+            | "shouldn't"
+            | "may"
+            | "might"
+            | "must"
+            | "do"
+            | "dont"
+            | "don't"
+            | "does"
+            | "doesnt"
+            | "doesn't"
+            | "did"
+            | "didnt"
+            | "didn't"
+            | "am"
+            | "is"
+            | "isnt"
+            | "isn't"
+            | "are"
+            | "arent"
+            | "aren't"
+            | "was"
+            | "wasnt"
+            | "wasn't"
+            | "were"
+            | "werent"
+            | "weren't"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "havent"
+            | "haven't"
+            | "has"
+            | "hasnt"
+            | "hasn't"
+            | "had"
+            | "hadnt"
+            | "hadn't"
+            | "not"
+    )
+}
+
+fn normalized_latin_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric() && character != '\'')
+                .replace('’', "'")
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 fn is_terminal_text(text: &str) -> bool {
@@ -3451,5 +3620,67 @@ mod tests {
             .expect("short orphan fragment should be repaired");
 
         assert_eq!(normalized, vec!["Another day living in Guangzhou, China"]);
+    }
+
+    #[test]
+    fn normalize_split_sentences_merges_incomplete_short_fragment() {
+        let segments = vec![
+            test_segment("What I can't", 40, 720, Vec::new()),
+            test_segment("know what you do to me", 1_000, 2_880, Vec::new()),
+        ];
+        let words = build_word_units(&segments);
+        let source_text = join_word_units(&words);
+        let sentences = vec![
+            "What I can't".to_string(),
+            "know what you do to me".to_string(),
+        ];
+
+        let normalized = normalize_split_sentences_by_rules(&source_text, &words, &sentences)
+            .expect("incomplete short fragment should be merged");
+
+        assert_eq!(normalized, vec!["What I can't know what you do to me"]);
+    }
+
+    #[test]
+    fn normalize_split_sentences_keeps_complete_short_sentence() {
+        let segments = vec![
+            test_segment(
+                "You back away in with without a cow",
+                8_130,
+                11_620,
+                Vec::new(),
+            ),
+            test_segment("I am missing you", 11_850, 14_337, Vec::new()),
+        ];
+        let words = build_word_units(&segments);
+        let source_text = join_word_units(&words);
+        let sentences = vec![
+            "You back away in with without a cow".to_string(),
+            "I am missing you".to_string(),
+        ];
+
+        let normalized = normalize_split_sentences_by_rules(&source_text, &words, &sentences)
+            .expect("complete short sentence should stay independent");
+
+        assert_eq!(
+            normalized,
+            vec!["You back away in with without a cow", "I am missing you"]
+        );
+    }
+
+    #[test]
+    fn normalize_split_sentences_completes_opening_phrase() {
+        let segments = vec![
+            test_segment("Hello and welcome", 14_660, 15_580, Vec::new()),
+            test_segment("to my channel", 15_720, 16_900, Vec::new()),
+        ];
+        let words = build_word_units(&segments);
+        let source_text = join_word_units(&words);
+        let sentences = vec!["Hello and welcome".to_string(), "to my channel".to_string()];
+
+        let normalized = normalize_split_sentences_by_rules(&source_text, &words, &sentences)
+            .expect("opening phrase should be completed by following continuation");
+
+        assert_eq!(normalized, vec!["Hello and welcome to my channel"]);
     }
 }
