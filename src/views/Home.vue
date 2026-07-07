@@ -2236,7 +2236,7 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     steps.push(referenceCorrectionStep)
 
     // 3. 后续步骤（智能断句、字幕校正、AI审核）
-    // 如果 stageProgress 有数据则使用，否则根据参考校正状态推断
+    // 如果 stageProgress 有数据则使用，否则根据配置显示待执行步骤
     if (hasStageProgress) {
       if (stageProgress.smartSegmentation) {
         steps.push(detailStepFromRecord('smartSegmentation', '智能断句', readRecordValue(stageProgress.smartSegmentation)))
@@ -2247,9 +2247,8 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
       if (stageProgress.aiReview) {
         steps.push(detailStepFromRecord('aiReview', 'AI审核', readRecordValue(stageProgress.aiReview)))
       }
-    } else if (refStatus === 'done') {
-      // 参考校正完成但后续步骤未开始，显示为 pending
-      // 这些步骤是否显示取决于用户的配置（从 workbenchOptions 读取）
+    } else if (refStatus) {
+      // 参考校正阶段（active 或 done），显示配置的后续步骤为 pending
       const options = workbenchOptions.value
       if (options.isSmartSegmentationEnabled) {
         steps.push({
@@ -2257,7 +2256,7 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
           label: '智能断句',
           progress: 0,
           status: 'pending',
-          message: '等待执行',
+          message: '等待参考校正完成',
         })
       }
       if (options.isSubtitleCorrectionEnabled) {
@@ -2266,7 +2265,7 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
           label: '字幕校正',
           progress: 0,
           status: 'pending',
-          message: '等待执行',
+          message: '等待前置处理完成',
         })
       }
       if (options.isAiSubtitleReviewEnabled) {
@@ -2275,7 +2274,7 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
           label: 'AI审核',
           progress: 0,
           status: 'pending',
-          message: '等待执行',
+          message: '等待前置处理完成',
         })
       }
     }
