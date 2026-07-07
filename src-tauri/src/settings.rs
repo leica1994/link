@@ -1,11 +1,12 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
 use crate::ai::AiService;
@@ -14,8 +15,10 @@ use crate::app_paths;
 
 const DATABASE_FILE_NAME: &str = "settings.db";
 const LLM_SERVICES: [&str; 3] = ["openai", "openai-responses", "anthropic"];
-const SETTINGS_BACKUP_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_BACKUP_SCHEMA_VERSION: u32 = 2;
+const MIN_SETTINGS_BACKUP_SCHEMA_VERSION: u32 = 1;
 const YOUTUBE_CHANNEL_STATUS_IDLE: &str = "idle";
+const DUBBING_MODELS_EVENT: &str = "dubbing-models-updated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,12 +72,28 @@ struct SettingsBackup {
     exported_at: String,
     settings: AppSettings,
     youtube_monitor: SettingsBackupYoutubeMonitor,
+    #[serde(default)]
+    subtitle_styles: SettingsBackupSubtitleStyles,
+    #[serde(default)]
+    dubbing: SettingsBackupDubbing,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsBackupYoutubeMonitor {
     channels: Vec<BackupYoutubeChannel>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsBackupSubtitleStyles {
+    styles: Vec<BackupSubtitleStyle>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsBackupDubbing {
+    models: Vec<BackupDubbingModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +111,67 @@ struct BackupYoutubeChannel {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupSubtitleStyle {
+    id: String,
+    name: String,
+    is_default: bool,
+    render_mode: String,
+    subtitle_layout: String,
+    preview_text_mode: String,
+    primary_font_name: String,
+    primary_font_size: u32,
+    primary_color: String,
+    primary_outline_color: String,
+    primary_outline_width: f64,
+    primary_spacing: f64,
+    primary_margin_bottom: u32,
+    secondary_font_name: String,
+    secondary_font_size: u32,
+    secondary_color: String,
+    secondary_outline_color: String,
+    secondary_outline_width: f64,
+    secondary_spacing: f64,
+    vertical_spacing: u32,
+    rounded_font_name: String,
+    rounded_font_size: u32,
+    rounded_text_color: String,
+    rounded_background_color: String,
+    rounded_corner_radius: u32,
+    rounded_padding_x: u32,
+    rounded_padding_y: u32,
+    rounded_margin_bottom: u32,
+    rounded_line_spacing: u32,
+    rounded_letter_spacing: u32,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupDubbingModel {
+    id: String,
+    engine: String,
+    model_key: String,
+    display_name: String,
+    locale: String,
+    gender: String,
+    enabled: bool,
+    metadata: Value,
+    scheduler_weight: f64,
+    success_count: u64,
+    failure_count: u64,
+    consecutive_failures: u64,
+    avg_latency_ms: Option<u64>,
+    cooldown_until: Option<String>,
+    last_error: String,
+    last_used_at: Option<String>,
+    last_checked_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsBackupSummary {
@@ -99,12 +179,22 @@ pub struct SettingsBackupSummary {
     pub channel_count: usize,
     pub added_channel_count: usize,
     pub updated_channel_count: usize,
+    pub subtitle_style_count: usize,
+    pub added_subtitle_style_count: usize,
+    pub updated_subtitle_style_count: usize,
+    pub dubbing_model_count: usize,
+    pub added_dubbing_model_count: usize,
+    pub updated_dubbing_model_count: usize,
 }
 
 #[derive(Debug, Default)]
-struct YoutubeChannelImportSummary {
+struct SettingsBackupImportSummary {
     added_channel_count: usize,
     updated_channel_count: usize,
+    added_subtitle_style_count: usize,
+    updated_subtitle_style_count: usize,
+    added_dubbing_model_count: usize,
+    updated_dubbing_model_count: usize,
 }
 
 pub struct SettingsStore {
@@ -296,20 +386,32 @@ impl SettingsStore {
 
     fn export_backup(&self) -> Result<SettingsBackup, String> {
         let settings = self.load()?;
-        let channels = self.with_connection(read_backup_youtube_channels)?;
+        let (channels, subtitle_styles, dubbing_models) = self.with_connection(|connection| {
+            Ok((
+                read_backup_youtube_channels(connection)?,
+                read_backup_subtitle_styles(connection)?,
+                read_backup_dubbing_models(connection)?,
+            ))
+        })?;
 
         Ok(SettingsBackup {
             schema_version: SETTINGS_BACKUP_SCHEMA_VERSION,
             exported_at: Utc::now().to_rfc3339(),
             settings,
             youtube_monitor: SettingsBackupYoutubeMonitor { channels },
+            subtitle_styles: SettingsBackupSubtitleStyles {
+                styles: subtitle_styles,
+            },
+            dubbing: SettingsBackupDubbing {
+                models: dubbing_models,
+            },
         })
     }
 
     fn import_backup(
         &self,
         backup: &SettingsBackup,
-    ) -> Result<YoutubeChannelImportSummary, String> {
+    ) -> Result<SettingsBackupImportSummary, String> {
         let mut connection = self
             .connection
             .lock()
@@ -319,8 +421,19 @@ impl SettingsStore {
             .map_err(|error| format!("无法开始导入设置备份: {error}"))?;
 
         save_settings_in_transaction(&transaction, &backup.settings)?;
-        let summary =
+        let mut summary =
             import_backup_youtube_channels(&transaction, &backup.youtube_monitor.channels)?;
+        let subtitle_summary =
+            import_backup_subtitle_styles(&transaction, &backup.subtitle_styles.styles)?;
+        summary.added_subtitle_style_count = subtitle_summary.added_subtitle_style_count;
+        summary.updated_subtitle_style_count = subtitle_summary.updated_subtitle_style_count;
+        ensure_selected_backup_subtitle_style(
+            &transaction,
+            &backup.settings.selected_subtitle_style_id,
+        )?;
+        let dubbing_summary = import_backup_dubbing_models(&transaction, &backup.dubbing.models)?;
+        summary.added_dubbing_model_count = dubbing_summary.added_dubbing_model_count;
+        summary.updated_dubbing_model_count = dubbing_summary.updated_dubbing_model_count;
 
         transaction
             .commit()
@@ -420,6 +533,12 @@ pub fn export_settings_backup(
         channel_count: backup.youtube_monitor.channels.len(),
         added_channel_count: 0,
         updated_channel_count: 0,
+        subtitle_style_count: backup.subtitle_styles.styles.len(),
+        added_subtitle_style_count: 0,
+        updated_subtitle_style_count: 0,
+        dubbing_model_count: backup.dubbing.models.len(),
+        added_dubbing_model_count: 0,
+        updated_dubbing_model_count: 0,
     };
     let content = serde_json::to_string_pretty(&backup)
         .map_err(|error| format!("无法生成设置备份 JSON: {error}"))?;
@@ -448,6 +567,8 @@ pub fn export_settings_backup(
         serde_json::json!({
             "settingCount": summary.setting_count,
             "channelCount": summary.channel_count,
+            "subtitleStyleCount": summary.subtitle_style_count,
+            "dubbingModelCount": summary.dubbing_model_count,
         }),
     );
     Ok(summary)
@@ -455,6 +576,7 @@ pub fn export_settings_backup(
 
 #[tauri::command]
 pub fn import_settings_backup(
+    app: AppHandle,
     store: tauri::State<'_, SettingsStore>,
     ai_service: tauri::State<'_, AiService>,
     app_logger: tauri::State<'_, AppLogger>,
@@ -494,11 +616,15 @@ pub fn import_settings_backup(
             return Err(message);
         }
     };
-    if backup.schema_version != SETTINGS_BACKUP_SCHEMA_VERSION {
+    if backup.schema_version < MIN_SETTINGS_BACKUP_SCHEMA_VERSION
+        || backup.schema_version > SETTINGS_BACKUP_SCHEMA_VERSION
+    {
         return Err(format!("不支持的设置备份版本: {}", backup.schema_version));
     }
 
     let channel_count = backup.youtube_monitor.channels.len();
+    let subtitle_style_count = backup.subtitle_styles.styles.len();
+    let dubbing_model_count = backup.dubbing.models.len();
     let translation_thread_count = backup.settings.translation_thread_count;
     let import_summary = match store.import_backup(&backup) {
         Ok(summary) => summary,
@@ -528,7 +654,16 @@ pub fn import_settings_backup(
         channel_count,
         added_channel_count: import_summary.added_channel_count,
         updated_channel_count: import_summary.updated_channel_count,
+        subtitle_style_count,
+        added_subtitle_style_count: import_summary.added_subtitle_style_count,
+        updated_subtitle_style_count: import_summary.updated_subtitle_style_count,
+        dubbing_model_count,
+        added_dubbing_model_count: import_summary.added_dubbing_model_count,
+        updated_dubbing_model_count: import_summary.updated_dubbing_model_count,
     };
+    if summary.added_dubbing_model_count > 0 || summary.updated_dubbing_model_count > 0 {
+        let _ = app.emit(DUBBING_MODELS_EVENT, serde_json::json!({}));
+    }
     app_logger.info(
         "settings",
         "backup_import_success",
@@ -538,6 +673,12 @@ pub fn import_settings_backup(
             "channelCount": summary.channel_count,
             "addedChannelCount": summary.added_channel_count,
             "updatedChannelCount": summary.updated_channel_count,
+            "subtitleStyleCount": summary.subtitle_style_count,
+            "addedSubtitleStyleCount": summary.added_subtitle_style_count,
+            "updatedSubtitleStyleCount": summary.updated_subtitle_style_count,
+            "dubbingModelCount": summary.dubbing_model_count,
+            "addedDubbingModelCount": summary.added_dubbing_model_count,
+            "updatedDubbingModelCount": summary.updated_dubbing_model_count,
         }),
     );
     Ok(summary)
@@ -1546,8 +1687,8 @@ fn read_backup_youtube_channels(
 fn import_backup_youtube_channels(
     transaction: &rusqlite::Transaction<'_>,
     channels: &[BackupYoutubeChannel],
-) -> Result<YoutubeChannelImportSummary, String> {
-    let mut summary = YoutubeChannelImportSummary::default();
+) -> Result<SettingsBackupImportSummary, String> {
+    let mut summary = SettingsBackupImportSummary::default();
 
     for channel in channels {
         let prepared = prepare_backup_youtube_channel(channel)?;
@@ -1673,6 +1814,728 @@ fn prepare_backup_youtube_channel(
     })
 }
 
+fn read_backup_subtitle_styles(
+    connection: &Connection,
+) -> Result<Vec<BackupSubtitleStyle>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT id, name, is_default,
+                   render_mode, subtitle_layout, preview_text_mode,
+                   primary_font_name, primary_font_size, primary_color,
+                   primary_outline_color, primary_outline_width, primary_spacing,
+                   primary_margin_bottom,
+                   secondary_font_name, secondary_font_size, secondary_color,
+                   secondary_outline_color, secondary_outline_width, secondary_spacing,
+                   vertical_spacing,
+                   rounded_font_name, rounded_font_size, rounded_text_color,
+                   rounded_background_color, rounded_corner_radius, rounded_padding_x,
+                   rounded_padding_y, rounded_margin_bottom, rounded_line_spacing,
+                   rounded_letter_spacing,
+                   created_at, updated_at
+            FROM subtitle_styles
+            ORDER BY is_default DESC, datetime(created_at) ASC, name COLLATE NOCASE ASC
+            ",
+        )
+        .map_err(|error| format!("无法读取字幕样式备份: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(BackupSubtitleStyle {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                is_default: row.get::<_, i64>(2)? != 0,
+                render_mode: row.get(3)?,
+                subtitle_layout: row.get(4)?,
+                preview_text_mode: row.get(5)?,
+                primary_font_name: row.get(6)?,
+                primary_font_size: row.get(7)?,
+                primary_color: row.get(8)?,
+                primary_outline_color: row.get(9)?,
+                primary_outline_width: row.get(10)?,
+                primary_spacing: row.get(11)?,
+                primary_margin_bottom: row.get(12)?,
+                secondary_font_name: row.get(13)?,
+                secondary_font_size: row.get(14)?,
+                secondary_color: row.get(15)?,
+                secondary_outline_color: row.get(16)?,
+                secondary_outline_width: row.get(17)?,
+                secondary_spacing: row.get(18)?,
+                vertical_spacing: row.get(19)?,
+                rounded_font_name: row.get(20)?,
+                rounded_font_size: row.get(21)?,
+                rounded_text_color: row.get(22)?,
+                rounded_background_color: row.get(23)?,
+                rounded_corner_radius: row.get(24)?,
+                rounded_padding_x: row.get(25)?,
+                rounded_padding_y: row.get(26)?,
+                rounded_margin_bottom: row.get(27)?,
+                rounded_line_spacing: row.get(28)?,
+                rounded_letter_spacing: row.get(29)?,
+                created_at: row.get(30)?,
+                updated_at: row.get(31)?,
+            })
+        })
+        .map_err(|error| format!("无法读取字幕样式备份: {error}"))?;
+
+    let mut styles = Vec::new();
+    for row in rows {
+        styles.push(row.map_err(|error| format!("无法解析字幕样式备份: {error}"))?);
+    }
+
+    Ok(styles)
+}
+
+fn import_backup_subtitle_styles(
+    transaction: &rusqlite::Transaction<'_>,
+    styles: &[BackupSubtitleStyle],
+) -> Result<SettingsBackupImportSummary, String> {
+    let mut summary = SettingsBackupImportSummary::default();
+    if styles.is_empty() {
+        return Ok(summary);
+    }
+
+    let mut default_style_id = None;
+
+    for style in styles {
+        let prepared = prepare_backup_subtitle_style(style)?;
+        if prepared.is_default && default_style_id.is_none() {
+            default_style_id = Some(prepared.id.clone());
+        }
+
+        let existing_id = find_existing_backup_subtitle_style(transaction, &prepared)?;
+        if let Some(existing_id) = existing_id {
+            rename_conflicting_subtitle_style_name(transaction, &prepared.name, &existing_id)?;
+            update_backup_subtitle_style(transaction, &existing_id, &prepared)?;
+            summary.updated_subtitle_style_count += 1;
+            continue;
+        }
+
+        insert_backup_subtitle_style(transaction, &prepared)?;
+        summary.added_subtitle_style_count += 1;
+    }
+
+    if let Some(style_id) = default_style_id {
+        set_single_default_subtitle_style(transaction, &style_id)?;
+    } else {
+        ensure_any_default_subtitle_style(transaction)?;
+    }
+
+    Ok(summary)
+}
+
+fn prepare_backup_subtitle_style(
+    style: &BackupSubtitleStyle,
+) -> Result<BackupSubtitleStyle, String> {
+    let name = style.name.trim();
+    if name.is_empty() {
+        return Err("设置备份中存在缺少名称的字幕样式".to_string());
+    }
+
+    let now = Utc::now().to_rfc3339();
+    Ok(BackupSubtitleStyle {
+        id: read_backup_id(&style.id),
+        name: name.to_string(),
+        is_default: style.is_default,
+        render_mode: read_backup_string(&style.render_mode, "ass"),
+        subtitle_layout: read_backup_string(&style.subtitle_layout, "target-above"),
+        preview_text_mode: read_backup_string(&style.preview_text_mode, "medium"),
+        primary_font_name: read_backup_string(&style.primary_font_name, "Microsoft YaHei"),
+        primary_font_size: style.primary_font_size,
+        primary_color: read_backup_string(&style.primary_color, "#FFFFFF"),
+        primary_outline_color: read_backup_string(&style.primary_outline_color, "#000000"),
+        primary_outline_width: style.primary_outline_width,
+        primary_spacing: style.primary_spacing,
+        primary_margin_bottom: style.primary_margin_bottom,
+        secondary_font_name: read_backup_string(&style.secondary_font_name, "Microsoft YaHei"),
+        secondary_font_size: style.secondary_font_size,
+        secondary_color: read_backup_string(&style.secondary_color, "#FFFFFF"),
+        secondary_outline_color: read_backup_string(&style.secondary_outline_color, "#000000"),
+        secondary_outline_width: style.secondary_outline_width,
+        secondary_spacing: style.secondary_spacing,
+        vertical_spacing: style.vertical_spacing,
+        rounded_font_name: read_backup_string(&style.rounded_font_name, "Microsoft YaHei"),
+        rounded_font_size: style.rounded_font_size,
+        rounded_text_color: read_backup_string(&style.rounded_text_color, "#FFFFFF"),
+        rounded_background_color: read_backup_string(&style.rounded_background_color, "#191919CC"),
+        rounded_corner_radius: style.rounded_corner_radius,
+        rounded_padding_x: style.rounded_padding_x,
+        rounded_padding_y: style.rounded_padding_y,
+        rounded_margin_bottom: style.rounded_margin_bottom,
+        rounded_line_spacing: style.rounded_line_spacing,
+        rounded_letter_spacing: style.rounded_letter_spacing,
+        created_at: read_backup_timestamp(&style.created_at, &now),
+        updated_at: read_backup_timestamp(&style.updated_at, &now),
+    })
+}
+
+fn find_existing_backup_subtitle_style(
+    transaction: &rusqlite::Transaction<'_>,
+    style: &BackupSubtitleStyle,
+) -> Result<Option<String>, String> {
+    if let Some(existing_id) = transaction
+        .query_row(
+            "SELECT id FROM subtitle_styles WHERE id = ?1 LIMIT 1",
+            params![&style.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法检查字幕样式是否已存在: {error}"))?
+    {
+        return Ok(Some(existing_id));
+    }
+
+    transaction
+        .query_row(
+            "SELECT id FROM subtitle_styles WHERE name = ?1 LIMIT 1",
+            params![&style.name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法检查字幕样式名称是否已存在: {error}"))
+}
+
+fn rename_conflicting_subtitle_style_name(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    keep_id: &str,
+) -> Result<(), String> {
+    let conflicting_id = transaction
+        .query_row(
+            "SELECT id FROM subtitle_styles WHERE name = ?1 AND id <> ?2 LIMIT 1",
+            params![name, keep_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法检查字幕样式名称冲突: {error}"))?;
+
+    if let Some(conflicting_id) = conflicting_id {
+        let renamed = unique_subtitle_style_name(transaction, name, Some(&conflicting_id))?;
+        transaction
+            .execute(
+                "UPDATE subtitle_styles SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![conflicting_id, renamed, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| format!("无法保留本机同名字幕样式: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn unique_subtitle_style_name(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    exclude_id: Option<&str>,
+) -> Result<String, String> {
+    for index in 1..=100 {
+        let candidate = if index == 1 {
+            format!("{name}（本机保留）")
+        } else {
+            format!("{name}（本机保留 {index}）")
+        };
+
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM subtitle_styles WHERE name = ?1 AND (?2 IS NULL OR id <> ?2))",
+                params![candidate, exclude_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(|error| format!("无法生成字幕样式保留名称: {error}"))?;
+
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+
+    Err("无法生成不冲突的字幕样式名称".to_string())
+}
+
+fn update_backup_subtitle_style(
+    transaction: &rusqlite::Transaction<'_>,
+    existing_id: &str,
+    style: &BackupSubtitleStyle,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "
+            UPDATE subtitle_styles
+            SET id = ?1,
+                name = ?2,
+                is_default = 0,
+                render_mode = ?3,
+                subtitle_layout = ?4,
+                preview_text_mode = ?5,
+                primary_font_name = ?6,
+                primary_font_size = ?7,
+                primary_color = ?8,
+                primary_outline_color = ?9,
+                primary_outline_width = ?10,
+                primary_spacing = ?11,
+                primary_margin_bottom = ?12,
+                secondary_font_name = ?13,
+                secondary_font_size = ?14,
+                secondary_color = ?15,
+                secondary_outline_color = ?16,
+                secondary_outline_width = ?17,
+                secondary_spacing = ?18,
+                vertical_spacing = ?19,
+                rounded_font_name = ?20,
+                rounded_font_size = ?21,
+                rounded_text_color = ?22,
+                rounded_background_color = ?23,
+                rounded_corner_radius = ?24,
+                rounded_padding_x = ?25,
+                rounded_padding_y = ?26,
+                rounded_margin_bottom = ?27,
+                rounded_line_spacing = ?28,
+                rounded_letter_spacing = ?29,
+                created_at = ?30,
+                updated_at = ?31
+            WHERE id = ?32
+            ",
+            params![
+                &style.id,
+                &style.name,
+                &style.render_mode,
+                &style.subtitle_layout,
+                &style.preview_text_mode,
+                &style.primary_font_name,
+                style.primary_font_size,
+                &style.primary_color,
+                &style.primary_outline_color,
+                style.primary_outline_width,
+                style.primary_spacing,
+                style.primary_margin_bottom,
+                &style.secondary_font_name,
+                style.secondary_font_size,
+                &style.secondary_color,
+                &style.secondary_outline_color,
+                style.secondary_outline_width,
+                style.secondary_spacing,
+                style.vertical_spacing,
+                &style.rounded_font_name,
+                style.rounded_font_size,
+                &style.rounded_text_color,
+                &style.rounded_background_color,
+                style.rounded_corner_radius,
+                style.rounded_padding_x,
+                style.rounded_padding_y,
+                style.rounded_margin_bottom,
+                style.rounded_line_spacing,
+                style.rounded_letter_spacing,
+                &style.created_at,
+                &style.updated_at,
+                existing_id,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法更新字幕样式备份数据: {error}"))
+}
+
+fn insert_backup_subtitle_style(
+    transaction: &rusqlite::Transaction<'_>,
+    style: &BackupSubtitleStyle,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "
+            INSERT INTO subtitle_styles (
+                id, name, is_default,
+                render_mode, subtitle_layout, preview_text_mode,
+                primary_font_name, primary_font_size, primary_color,
+                primary_outline_color, primary_outline_width, primary_spacing,
+                primary_margin_bottom,
+                secondary_font_name, secondary_font_size, secondary_color,
+                secondary_outline_color, secondary_outline_width, secondary_spacing,
+                vertical_spacing,
+                rounded_font_name, rounded_font_size, rounded_text_color,
+                rounded_background_color, rounded_corner_radius, rounded_padding_x,
+                rounded_padding_y, rounded_margin_bottom, rounded_line_spacing,
+                rounded_letter_spacing,
+                created_at, updated_at
+            )
+            VALUES (
+                ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+            )
+            ",
+            params![
+                &style.id,
+                &style.name,
+                &style.render_mode,
+                &style.subtitle_layout,
+                &style.preview_text_mode,
+                &style.primary_font_name,
+                style.primary_font_size,
+                &style.primary_color,
+                &style.primary_outline_color,
+                style.primary_outline_width,
+                style.primary_spacing,
+                style.primary_margin_bottom,
+                &style.secondary_font_name,
+                style.secondary_font_size,
+                &style.secondary_color,
+                &style.secondary_outline_color,
+                style.secondary_outline_width,
+                style.secondary_spacing,
+                style.vertical_spacing,
+                &style.rounded_font_name,
+                style.rounded_font_size,
+                &style.rounded_text_color,
+                &style.rounded_background_color,
+                style.rounded_corner_radius,
+                style.rounded_padding_x,
+                style.rounded_padding_y,
+                style.rounded_margin_bottom,
+                style.rounded_line_spacing,
+                style.rounded_letter_spacing,
+                &style.created_at,
+                &style.updated_at,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法新增字幕样式备份数据: {error}"))
+}
+
+fn set_single_default_subtitle_style(
+    transaction: &rusqlite::Transaction<'_>,
+    style_id: &str,
+) -> Result<(), String> {
+    let fallback_id = if subtitle_style_exists(transaction, style_id)? {
+        style_id.to_string()
+    } else {
+        fallback_subtitle_style_id(transaction)?
+    };
+
+    transaction
+        .execute(
+            "UPDATE subtitle_styles SET is_default = CASE WHEN id = ?1 THEN 1 ELSE 0 END",
+            params![fallback_id],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法恢复默认字幕样式: {error}"))
+}
+
+fn ensure_any_default_subtitle_style(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), String> {
+    let has_default = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM subtitle_styles WHERE is_default = 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|error| format!("无法检查默认字幕样式: {error}"))?;
+
+    if has_default {
+        return Ok(());
+    }
+
+    let fallback_id = fallback_subtitle_style_id(transaction)?;
+    set_single_default_subtitle_style(transaction, &fallback_id)
+}
+
+fn ensure_selected_backup_subtitle_style(
+    transaction: &rusqlite::Transaction<'_>,
+    selected_style_id: &str,
+) -> Result<(), String> {
+    let selected_style_id = selected_style_id.trim();
+    let restored_id = if !selected_style_id.is_empty()
+        && subtitle_style_exists(transaction, selected_style_id)?
+    {
+        selected_style_id.to_string()
+    } else {
+        fallback_subtitle_style_id(transaction)?
+    };
+
+    upsert_setting(transaction, "selected_subtitle_style_id", &restored_id)
+}
+
+fn subtitle_style_exists(
+    transaction: &rusqlite::Transaction<'_>,
+    style_id: &str,
+) -> Result<bool, String> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM subtitle_styles WHERE id = ?1)",
+            params![style_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|error| format!("无法检查字幕样式是否存在: {error}"))
+}
+
+fn fallback_subtitle_style_id(transaction: &rusqlite::Transaction<'_>) -> Result<String, String> {
+    for sql in [
+        "SELECT id FROM subtitle_styles WHERE id = 'default' LIMIT 1",
+        "SELECT id FROM subtitle_styles WHERE is_default = 1 ORDER BY datetime(created_at) ASC LIMIT 1",
+        "SELECT id FROM subtitle_styles ORDER BY datetime(created_at) ASC LIMIT 1",
+    ] {
+        if let Some(id) = transaction
+            .query_row(sql, [], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|error| format!("无法读取备用字幕样式: {error}"))?
+        {
+            return Ok(id);
+        }
+    }
+
+    Err("未找到可用字幕样式".to_string())
+}
+
+fn read_backup_dubbing_models(connection: &Connection) -> Result<Vec<BackupDubbingModel>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT id, engine, model_key, display_name, locale, gender, enabled, metadata,
+                   scheduler_weight, success_count, failure_count, consecutive_failures,
+                   avg_latency_ms, cooldown_until, last_error, last_used_at, last_checked_at,
+                   created_at, updated_at
+            FROM dubbing_models
+            ORDER BY datetime(created_at) ASC, display_name COLLATE NOCASE ASC
+            ",
+        )
+        .map_err(|error| format!("无法读取配音模型备份: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            let metadata_text: String = row.get(7)?;
+            let metadata =
+                serde_json::from_str(&metadata_text).unwrap_or_else(|_| serde_json::json!({}));
+            Ok(BackupDubbingModel {
+                id: row.get(0)?,
+                engine: row.get(1)?,
+                model_key: row.get(2)?,
+                display_name: row.get(3)?,
+                locale: row.get(4)?,
+                gender: row.get(5)?,
+                enabled: row.get::<_, i64>(6)? != 0,
+                metadata,
+                scheduler_weight: row.get(8)?,
+                success_count: row.get::<_, i64>(9)?.max(0) as u64,
+                failure_count: row.get::<_, i64>(10)?.max(0) as u64,
+                consecutive_failures: row.get::<_, i64>(11)?.max(0) as u64,
+                avg_latency_ms: row
+                    .get::<_, Option<i64>>(12)?
+                    .map(|value| value.max(0) as u64),
+                cooldown_until: row.get(13)?,
+                last_error: row.get(14)?,
+                last_used_at: row.get(15)?,
+                last_checked_at: row.get(16)?,
+                created_at: row.get(17)?,
+                updated_at: row.get(18)?,
+            })
+        })
+        .map_err(|error| format!("无法读取配音模型备份: {error}"))?;
+
+    let mut models = Vec::new();
+    for row in rows {
+        models.push(row.map_err(|error| format!("无法解析配音模型备份: {error}"))?);
+    }
+
+    Ok(models)
+}
+
+fn import_backup_dubbing_models(
+    transaction: &rusqlite::Transaction<'_>,
+    models: &[BackupDubbingModel],
+) -> Result<SettingsBackupImportSummary, String> {
+    let mut summary = SettingsBackupImportSummary::default();
+
+    for model in models {
+        let prepared = prepare_backup_dubbing_model(model)?;
+        let existing_id = find_existing_backup_dubbing_model(transaction, &prepared)?;
+        if let Some(existing_id) = existing_id {
+            update_backup_dubbing_model(transaction, &existing_id, &prepared)?;
+            summary.updated_dubbing_model_count += 1;
+            continue;
+        }
+
+        insert_backup_dubbing_model(transaction, &prepared)?;
+        summary.added_dubbing_model_count += 1;
+    }
+
+    Ok(summary)
+}
+
+fn prepare_backup_dubbing_model(model: &BackupDubbingModel) -> Result<BackupDubbingModel, String> {
+    let engine = model.engine.trim();
+    let model_key = model.model_key.trim();
+    if engine.is_empty() || model_key.is_empty() {
+        return Err("设置备份中存在缺少引擎或模型标识的配音模型".to_string());
+    }
+
+    let now = Utc::now().to_rfc3339();
+    Ok(BackupDubbingModel {
+        id: read_backup_id(&model.id),
+        engine: engine.to_string(),
+        model_key: model_key.to_string(),
+        display_name: read_backup_string(&model.display_name, model_key),
+        locale: model.locale.trim().to_string(),
+        gender: model.gender.trim().to_string(),
+        enabled: model.enabled,
+        metadata: model.metadata.clone(),
+        scheduler_weight: model.scheduler_weight.clamp(10.0, 200.0),
+        success_count: model.success_count,
+        failure_count: model.failure_count,
+        consecutive_failures: model.consecutive_failures,
+        avg_latency_ms: model.avg_latency_ms,
+        cooldown_until: read_optional_backup_timestamp(&model.cooldown_until),
+        last_error: model.last_error.trim().to_string(),
+        last_used_at: read_optional_backup_timestamp(&model.last_used_at),
+        last_checked_at: read_optional_backup_timestamp(&model.last_checked_at),
+        created_at: read_backup_timestamp(&model.created_at, &now),
+        updated_at: read_backup_timestamp(&model.updated_at, &now),
+    })
+}
+
+fn find_existing_backup_dubbing_model(
+    transaction: &rusqlite::Transaction<'_>,
+    model: &BackupDubbingModel,
+) -> Result<Option<String>, String> {
+    if let Some(existing_id) = transaction
+        .query_row(
+            "SELECT id FROM dubbing_models WHERE id = ?1 LIMIT 1",
+            params![&model.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法检查配音模型是否已存在: {error}"))?
+    {
+        return Ok(Some(existing_id));
+    }
+
+    let mut statement = transaction
+        .prepare(
+            "
+            SELECT id, metadata
+            FROM dubbing_models
+            WHERE engine = ?1 AND model_key = ?2
+            ORDER BY datetime(created_at) ASC
+            ",
+        )
+        .map_err(|error| format!("无法检查配音模型合集: {error}"))?;
+    let rows = statement
+        .query_map(params![&model.engine, &model.model_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("无法检查配音模型合集: {error}"))?;
+
+    for row in rows {
+        let (id, metadata_text) = row.map_err(|error| format!("无法解析配音模型合集: {error}"))?;
+        let metadata =
+            serde_json::from_str::<Value>(&metadata_text).unwrap_or_else(|_| serde_json::json!({}));
+        if metadata == model.metadata {
+            return Ok(Some(id));
+        }
+    }
+
+    Ok(None)
+}
+
+fn update_backup_dubbing_model(
+    transaction: &rusqlite::Transaction<'_>,
+    existing_id: &str,
+    model: &BackupDubbingModel,
+) -> Result<(), String> {
+    let metadata = serde_json::to_string(&model.metadata)
+        .map_err(|error| format!("无法序列化配音模型: {error}"))?;
+    transaction
+        .execute(
+            "
+            UPDATE dubbing_models
+            SET id = ?1,
+                engine = ?2,
+                model_key = ?3,
+                display_name = ?4,
+                locale = ?5,
+                gender = ?6,
+                enabled = ?7,
+                metadata = ?8,
+                scheduler_weight = ?9,
+                success_count = ?10,
+                failure_count = ?11,
+                consecutive_failures = ?12,
+                avg_latency_ms = ?13,
+                cooldown_until = ?14,
+                last_error = ?15,
+                last_used_at = ?16,
+                last_checked_at = ?17,
+                created_at = ?18,
+                updated_at = ?19
+            WHERE id = ?20
+            ",
+            params![
+                &model.id,
+                &model.engine,
+                &model.model_key,
+                &model.display_name,
+                &model.locale,
+                &model.gender,
+                if model.enabled { 1 } else { 0 },
+                metadata,
+                model.scheduler_weight,
+                u64_to_i64(model.success_count),
+                u64_to_i64(model.failure_count),
+                u64_to_i64(model.consecutive_failures),
+                model.avg_latency_ms.map(u64_to_i64),
+                model.cooldown_until.as_deref(),
+                &model.last_error,
+                model.last_used_at.as_deref(),
+                model.last_checked_at.as_deref(),
+                &model.created_at,
+                &model.updated_at,
+                existing_id,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法更新配音模型备份数据: {error}"))
+}
+
+fn insert_backup_dubbing_model(
+    transaction: &rusqlite::Transaction<'_>,
+    model: &BackupDubbingModel,
+) -> Result<(), String> {
+    let metadata = serde_json::to_string(&model.metadata)
+        .map_err(|error| format!("无法序列化配音模型: {error}"))?;
+    transaction
+        .execute(
+            "
+            INSERT INTO dubbing_models (
+                id, engine, model_key, display_name, locale, gender, enabled, metadata,
+                scheduler_weight, success_count, failure_count, consecutive_failures,
+                avg_latency_ms, cooldown_until, last_error, last_used_at, last_checked_at,
+                created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            ",
+            params![
+                &model.id,
+                &model.engine,
+                &model.model_key,
+                &model.display_name,
+                &model.locale,
+                &model.gender,
+                if model.enabled { 1 } else { 0 },
+                metadata,
+                model.scheduler_weight,
+                u64_to_i64(model.success_count),
+                u64_to_i64(model.failure_count),
+                u64_to_i64(model.consecutive_failures),
+                model.avg_latency_ms.map(u64_to_i64),
+                model.cooldown_until.as_deref(),
+                &model.last_error,
+                model.last_used_at.as_deref(),
+                model.last_checked_at.as_deref(),
+                &model.created_at,
+                &model.updated_at,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("无法新增配音模型备份数据: {error}"))
+}
+
 fn read_backup_id(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1680,6 +2543,27 @@ fn read_backup_id(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn read_backup_string(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn read_optional_backup_timestamp(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 fn read_backup_timestamp(value: &str, fallback: &str) -> String {

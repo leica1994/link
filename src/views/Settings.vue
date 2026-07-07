@@ -1054,6 +1054,12 @@ type SettingsBackupSummary = {
   channelCount: number
   addedChannelCount: number
   updatedChannelCount: number
+  subtitleStyleCount: number
+  addedSubtitleStyleCount: number
+  updatedSubtitleStyleCount: number
+  dubbingModelCount: number
+  addedDubbingModelCount: number
+  updatedDubbingModelCount: number
 }
 
 type SettingsBackupStatus = 'idle' | 'success' | 'error'
@@ -1612,14 +1618,14 @@ const isSettingsBackupBusy = computed(() => isExportingSettingsBackup.value || i
 
 const settingsBackupSubtitle = computed(() => {
   if (isExportingSettingsBackup.value) {
-    return '正在导出设置和监控博主'
+    return '正在导出设置、字幕样式、配音模型和监控博主'
   }
 
   if (isImportingSettingsBackup.value) {
-    return '正在导入设置并合并监控博主'
+    return '正在导入设置并恢复字幕样式、配音模型和监控博主'
   }
 
-  return settingsBackupMessage.value || '导出或导入配置 JSON，包含 API Key 和监控博主'
+  return settingsBackupMessage.value || '导出或导入配置 JSON，包含 API Key、字幕样式、配音模型和监控博主'
 })
 
 const settingsBackupSubtitleClass = computed(() => ({
@@ -1862,7 +1868,7 @@ const exportSettingsBackup = async () => {
     await flushPendingSave()
     const summary = await invoke<SettingsBackupSummary>('export_settings_backup', { path: selected })
     settingsBackupStatus.value = 'success'
-    settingsBackupMessage.value = `已导出 ${summary.settingCount} 项设置，${summary.channelCount} 个博主`
+    settingsBackupMessage.value = `已导出 ${summary.settingCount} 项设置，${summary.subtitleStyleCount} 个字幕样式，${summary.dubbingModelCount} 个配音模型，${summary.channelCount} 个博主`
   } catch (error) {
     settingsBackupStatus.value = 'error'
     settingsBackupMessage.value = stringifyError(error, '导出设置失败')
@@ -1907,7 +1913,7 @@ const importSettingsBackup = async () => {
     const summary = await invoke<SettingsBackupSummary>('import_settings_backup', { path: selected })
     await loadStoredSettings()
     settingsBackupStatus.value = 'success'
-    settingsBackupMessage.value = `已导入 ${summary.settingCount} 项设置，新增 ${summary.addedChannelCount} 个博主，更新 ${summary.updatedChannelCount} 个博主`
+    settingsBackupMessage.value = `已导入 ${summary.settingCount} 项设置，字幕样式新增 ${summary.addedSubtitleStyleCount} 个、更新 ${summary.updatedSubtitleStyleCount} 个，配音模型新增 ${summary.addedDubbingModelCount} 个、更新 ${summary.updatedDubbingModelCount} 个，博主新增 ${summary.addedChannelCount} 个、更新 ${summary.updatedChannelCount} 个`
   } catch (error) {
     settingsBackupStatus.value = 'error'
     settingsBackupMessage.value = stringifyError(error, '导入设置失败')
