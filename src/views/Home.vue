@@ -2221,11 +2221,27 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
     const transcriptionStatus = transcriptionStep ? readStringValue(transcriptionStep.status) : ''
     const isTranscriptionDone = transcriptionStatus === 'done' || !hasStageProgress
 
+    // 判断是否有后处理步骤正在执行或已完成（说明转录和参考校正都已完成）
+    const hasPostProcessingProgress = hasStageProgress && (
+      stageProgress.smartSegmentation ||
+      stageProgress.subtitleCorrection ||
+      stageProgress.aiReview
+    )
+
     // 1. 转录步骤
     if (hasStageProgress && stageProgress.transcription && transcriptionStep) {
       steps.push(detailStepFromRecord('transcription', '转录', transcriptionStep))
     } else if (refStatus && !hasStageProgress) {
       // 参考校正阶段，转录必定已完成
+      steps.push({
+        key: 'transcription',
+        label: '转录',
+        progress: 100,
+        status: 'done',
+        message: '语音转录完成',
+      })
+    } else if (hasPostProcessingProgress) {
+      // 后处理阶段，转录必定已完成（即使 stageProgress.transcription 不存在）
       steps.push({
         key: 'transcription',
         label: '转录',
@@ -2247,6 +2263,15 @@ const workbenchPrepareSubtitleSteps = computed<WorkbenchDetailStep[]>(() => {
         message: subtitleReferenceCorrectionMessage(referenceCorrection),
       }
       steps.push(referenceCorrectionStep)
+    } else if (hasPostProcessingProgress) {
+      // 后处理阶段正在执行，参考校正必定已完成
+      steps.push({
+        key: 'subtitleReferenceCorrection',
+        label: '参考校正',
+        progress: 100,
+        status: 'done',
+        message: 'AI 参考校正完成',
+      })
     } else {
       // 转录阶段，参考校正显示为 pending
       steps.push({
