@@ -364,17 +364,17 @@
                   <button
                     class="settings-action youtube-monitor-action primary"
                     type="button"
-                    :disabled="isPageRefreshing || isChannelRefreshing(activeChannel.id) || !ytdlpStatus.isAvailable"
+                    :disabled="isPageRefreshing || isChannelChecking(activeChannel) || !ytdlpStatus.isAvailable"
                     @click="refreshChannel(activeChannel.id)"
                   >
                     <LoaderCircle
-                      v-if="isChannelRefreshing(activeChannel.id)"
+                      v-if="isChannelChecking(activeChannel)"
                       class="spinning"
                       :stroke-width="2.1"
                       aria-hidden="true"
                     />
                     <RefreshCw v-else :stroke-width="2.1" aria-hidden="true" />
-                    <span>{{ isChannelRefreshing(activeChannel.id) ? '检查中' : isPageRefreshing ? '批量检查中' : '检查更新' }}</span>
+                    <span>{{ isChannelChecking(activeChannel) ? '检查中' : isPageRefreshing ? '批量检查中' : '检查更新' }}</span>
                   </button>
                   <button class="settings-action youtube-monitor-action" type="button" @click="markChannelSeen">
                     <CheckCheck :stroke-width="2.1" aria-hidden="true" />
@@ -834,9 +834,9 @@ const filteredChannels = computed(() => {
     const matchesFilter =
       channelFilter.value === 'all' ||
       (channelFilter.value === 'updated' && channel.unreadCount > 0) ||
-      (channelFilter.value === 'checking' && channel.status === 'checking') ||
+      (channelFilter.value === 'checking' && isChannelChecking(channel)) ||
       (channelFilter.value === 'failed' && channel.status === 'failed') ||
-      (channelFilter.value === 'idle' && channel.status !== 'checking' && channel.status !== 'failed' && channel.unreadCount === 0)
+      (channelFilter.value === 'idle' && !isChannelChecking(channel) && channel.status !== 'failed' && channel.unreadCount === 0)
 
     return matchesQuery && matchesFilter
   })
@@ -856,7 +856,7 @@ const pageRefreshLabel = computed(() => {
     : '检查中'
 })
 const checkingChannelCount = computed(() => {
-  return channels.value.filter((channel) => channel.status === 'checking' || isChannelRefreshing(channel.id)).length
+  return channels.value.filter(isChannelChecking).length
 })
 const canMarkAllUnreadSeen = computed(() => {
   return isTauriRuntime() &&
@@ -1365,7 +1365,7 @@ const registerRefreshListener = async () => {
     if (run.status === 'done' || run.status === 'failed') {
       const hadWaiters = resolveRefreshWaiters(run)
       setChannelRefreshing(run.channelId, false)
-      if (!hadWaiters && !isPageRefreshing.value) {
+      if (!hadWaiters) {
         await reloadAfterChannelRefresh(run.channelId)
       }
     } else {
@@ -1419,6 +1419,15 @@ const setChannelRefreshing = (channelId: string, refreshing: boolean) => {
 
 const isChannelRefreshing = (channelId: string) => refreshingChannelIds.value.has(channelId)
 
+const isChannelChecking = (channel: YoutubeChannelLike) => {
+  const batch = activeRefreshBatch.value
+  if (batch?.status === 'running') {
+    return batch.currentChannelId === channel.id
+  }
+
+  return channel.status === 'checking' || isChannelRefreshing(channel.id)
+}
+
 const openAddDialog = () => {
   draftChannelUrl.value = ''
   addError.value = ''
@@ -1448,7 +1457,7 @@ const channelInitial = (channel: YoutubeChannelLike) => {
 }
 
 const channelStatusLabel = (channel: YoutubeChannelLike) => {
-  if (channel.status === 'checking' || isChannelRefreshing(channel.id)) {
+  if (isChannelChecking(channel)) {
     return '检查中'
   }
   if (channel.status === 'failed') {
@@ -1460,11 +1469,14 @@ const channelStatusLabel = (channel: YoutubeChannelLike) => {
   return '已同步'
 }
 
-const channelStatusClass = (channel: YoutubeChannelLike) => ({
-  updated: channel.unreadCount > 0 && channel.status !== 'checking',
-  checking: channel.status === 'checking' || isChannelRefreshing(channel.id),
-  failed: channel.status === 'failed',
-})
+const channelStatusClass = (channel: YoutubeChannelLike) => {
+  const checking = isChannelChecking(channel)
+  return {
+    updated: channel.unreadCount > 0 && !checking,
+    checking,
+    failed: channel.status === 'failed' && !checking,
+  }
+}
 
 const refreshRunDotClass = (run: YoutubeRefreshRun) => {
   if (run.status === 'done') {
