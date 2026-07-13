@@ -29,11 +29,12 @@
         >
           <LoaderCircle v-if="isPageRefreshing" class="spinning" :stroke-width="2.1" aria-hidden="true" />
           <RefreshCw v-else :stroke-width="2.1" aria-hidden="true" />
-          <span>{{ isPageRefreshing ? '检查中' : '刷新页面' }}</span>
+          <span>{{ pageRefreshLabel }}</span>
         </button>
         <button
           class="settings-action youtube-monitor-action primary"
           type="button"
+          :disabled="isPageRefreshing"
           @click="openAddDialog"
         >
           <Plus :stroke-width="2.1" aria-hidden="true" />
@@ -363,7 +364,7 @@
                   <button
                     class="settings-action youtube-monitor-action primary"
                     type="button"
-                    :disabled="isChannelRefreshing(activeChannel.id) || !ytdlpStatus.isAvailable"
+                    :disabled="isPageRefreshing || isChannelRefreshing(activeChannel.id) || !ytdlpStatus.isAvailable"
                     @click="refreshChannel(activeChannel.id)"
                   >
                     <LoaderCircle
@@ -373,13 +374,18 @@
                       aria-hidden="true"
                     />
                     <RefreshCw v-else :stroke-width="2.1" aria-hidden="true" />
-                    <span>{{ isChannelRefreshing(activeChannel.id) ? '检查中' : '检查更新' }}</span>
+                    <span>{{ isChannelRefreshing(activeChannel.id) ? '检查中' : isPageRefreshing ? '批量检查中' : '检查更新' }}</span>
                   </button>
                   <button class="settings-action youtube-monitor-action" type="button" @click="markChannelSeen">
                     <CheckCheck :stroke-width="2.1" aria-hidden="true" />
                     <span>全部已读</span>
                   </button>
-                  <button class="settings-action youtube-monitor-action danger" type="button" @click="openDeleteDialog">
+                  <button
+                    class="settings-action youtube-monitor-action danger"
+                    type="button"
+                    :disabled="isPageRefreshing"
+                    @click="openDeleteDialog"
+                  >
                     <Trash2 :stroke-width="2.1" aria-hidden="true" />
                     <span>删除</span>
                   </button>
@@ -723,6 +729,18 @@ type YoutubeRefreshRun = {
   finishedAt?: string | null
 }
 
+type YoutubeRefreshBatch = {
+  id: string
+  status: string
+  totalCount: number
+  completedCount: number
+  failedCount: number
+  currentChannelId: string
+  message: string
+  startedAt: string
+  finishedAt?: string | null
+}
+
 const VIDEO_PAGE_SIZE = 100
 
 const route = useRoute()
@@ -750,7 +768,6 @@ const unreadOnly = ref(false)
 const isLoadingChannels = ref(false)
 const isLoadingVideos = ref(false)
 const isLoadingUnreadVideos = ref(false)
-const isPageRefreshing = ref(false)
 const isMarkingAllSeen = ref(false)
 const isAddDialogOpen = ref(false)
 const isDeleteDialogOpen = ref(false)
@@ -764,11 +781,13 @@ const taskAddError = ref('')
 const isAddingChannel = ref(false)
 const isDeletingChannel = ref(false)
 const activeRefreshRun = ref<YoutubeRefreshRun | null>(null)
+const activeRefreshBatch = ref<YoutubeRefreshBatch | null>(null)
 const refreshingChannelIds = ref(new Set<string>())
 const queuedVideoUrls = ref(new Set<string>())
 const addingVideoIds = ref(new Set<string>())
 const refreshWaiters = new Map<string, Array<(run: YoutubeRefreshRun) => void>>()
 let unlistenRefresh: UnlistenFn | undefined
+let unlistenRefreshBatch: UnlistenFn | undefined
 
 const channelFilterOptions: { value: ChannelStatusFilter; label: string }[] = [
   { value: 'all', label: '全部' },
@@ -825,6 +844,17 @@ const filteredChannels = computed(() => {
 
 const totalUnreadCount = computed(() => channels.value.reduce((total, channel) => total + channel.unreadCount, 0))
 const totalVideoCount = computed(() => channels.value.reduce((total, channel) => total + channel.videoCount, 0))
+const isPageRefreshing = computed(() => activeRefreshBatch.value?.status === 'running')
+const pageRefreshLabel = computed(() => {
+  const batch = activeRefreshBatch.value
+  if (!batch || batch.status !== 'running') {
+    return '刷新页面'
+  }
+
+  return batch.totalCount > 0
+    ? `检查中 ${batch.completedCount}/${batch.totalCount}`
+    : '检查中'
+})
 const checkingChannelCount = computed(() => {
   return channels.value.filter((channel) => channel.status === 'checking' || isChannelRefreshing(channel.id)).length
 })
@@ -905,10 +935,8 @@ const refreshPage = async () => {
     return
   }
 
-  isPageRefreshing.value = true
   channelError.value = ''
   videosError.value = ''
-  let failedCount = 0
 
   try {
     await loadYtdlpStatus()
@@ -916,27 +944,32 @@ const refreshPage = async () => {
       return
     }
 
-    const channelIds = channels.value.map((channel) => channel.id)
-    for (const channelId of channelIds) {
-      if (isChannelRefreshing(channelId)) {
-        continue
-      }
+    const batch = await invoke<YoutubeRefreshBatch>('refresh_all_youtube_channels')
+    applyRefreshBatch(batch)
+    if (batch.status !== 'running') {
+      await loadAll()
+      showRefreshBatchResult(batch)
+    }
+  } catch (error) {
+    channelError.value = stringifyError(error, '刷新页面失败')
+  }
+}
 
-      try {
-        const run = await refreshChannelAndWait(channelId, false)
-        if (run.status === 'failed') {
-          failedCount += 1
-        }
-      } catch {
-        failedCount += 1
+const loadRefreshBatch = async () => {
+  if (!isTauriRuntime()) {
+    return
+  }
+
+  try {
+    const batch = await invoke<YoutubeRefreshBatch | null>('get_youtube_refresh_batch')
+    if (batch) {
+      applyRefreshBatch(batch)
+      if (batch.status !== 'running') {
+        showRefreshBatchResult(batch)
       }
     }
-  } finally {
-    await loadAll()
-    if (failedCount > 0) {
-      channelError.value = '部分博主检查失败，请查看异常状态'
-    }
-    isPageRefreshing.value = false
+  } catch (error) {
+    channelError.value = stringifyError(error, '读取刷新状态失败')
   }
 }
 
@@ -1339,6 +1372,35 @@ const registerRefreshListener = async () => {
       setChannelRefreshing(run.channelId, true)
     }
   })
+
+  unlistenRefreshBatch = await listen<YoutubeRefreshBatch>('youtube-monitor-refresh-batch', async (event) => {
+    const batch = event.payload
+    applyRefreshBatch(batch)
+    if (batch.status !== 'running') {
+      await loadAll()
+      showRefreshBatchResult(batch)
+    }
+  })
+}
+
+const applyRefreshBatch = (batch: YoutubeRefreshBatch) => {
+  const previousChannelId = activeRefreshBatch.value?.currentChannelId
+  if (previousChannelId && previousChannelId !== batch.currentChannelId) {
+    setChannelRefreshing(previousChannelId, false)
+  }
+
+  activeRefreshBatch.value = batch
+  if (batch.status === 'running' && batch.currentChannelId) {
+    setChannelRefreshing(batch.currentChannelId, true)
+  } else if (batch.currentChannelId) {
+    setChannelRefreshing(batch.currentChannelId, false)
+  }
+}
+
+const showRefreshBatchResult = (batch: YoutubeRefreshBatch) => {
+  if (batch.failedCount > 0) {
+    channelError.value = `${batch.failedCount} 个博主检查失败，请查看异常状态`
+  }
 }
 
 const updateChannel = (updated: YoutubeChannel) => {
@@ -1481,14 +1543,20 @@ const stringifyError = (error: unknown, fallback: string) => {
   return fallback
 }
 
+const initializeMonitor = async () => {
+  await registerRefreshListener()
+  await loadAll()
+  await loadRefreshBatch()
+}
+
 onMounted(() => {
-  void loadAll()
-  void registerRefreshListener()
+  void initializeMonitor()
   window.addEventListener('keydown', handleKeydown)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   unlistenRefresh?.()
+  unlistenRefreshBatch?.()
 })
 </script>

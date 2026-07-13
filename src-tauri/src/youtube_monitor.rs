@@ -15,6 +15,7 @@ use crate::settings::SettingsStore;
 use crate::ytdlp::{self, YoutubeClientStrategy, YtdlpStatus};
 
 const REFRESH_EVENT: &str = "youtube-monitor-refresh";
+const REFRESH_BATCH_EVENT: &str = "youtube-monitor-refresh-batch";
 const CHANNEL_STATUS_IDLE: &str = "idle";
 const CHANNEL_STATUS_CHECKING: &str = "checking";
 const CHANNEL_STATUS_FAILED: &str = "failed";
@@ -25,23 +26,42 @@ const DEFAULT_VIDEO_PAGE_SIZE: u32 = 100;
 const MAX_VIDEO_PAGE_SIZE: u32 = 200;
 
 pub struct YoutubeMonitorService {
-    running_channels: Mutex<HashSet<String>>,
+    runtime: Mutex<YoutubeMonitorRuntime>,
+}
+
+#[derive(Default)]
+struct YoutubeMonitorRuntime {
+    running_channels: HashSet<String>,
+    refresh_batch: Option<YoutubeRefreshBatch>,
 }
 
 impl YoutubeMonitorService {
     pub fn new() -> Self {
         Self {
-            running_channels: Mutex::new(HashSet::new()),
+            runtime: Mutex::new(YoutubeMonitorRuntime::default()),
         }
     }
 
-    fn acquire_channel(&self, channel_id: &str) -> Result<RefreshGuard<'_>, String> {
-        let mut running = self
-            .running_channels
+    fn acquire_channel(
+        &self,
+        channel_id: &str,
+        allow_during_batch: bool,
+    ) -> Result<RefreshGuard<'_>, String> {
+        let mut runtime = self
+            .runtime
             .lock()
             .map_err(|error| format!("监控任务锁定失败: {error}"))?;
 
-        if !running.insert(channel_id.to_string()) {
+        if !allow_during_batch
+            && runtime
+                .refresh_batch
+                .as_ref()
+                .is_some_and(|batch| batch.status == RUN_STATUS_RUNNING)
+        {
+            return Err("正在刷新全部博主，请稍后再试".to_string());
+        }
+
+        if !runtime.running_channels.insert(channel_id.to_string()) {
             return Err("该博主正在检查更新".to_string());
         }
 
@@ -52,9 +72,122 @@ impl YoutubeMonitorService {
     }
 
     fn release_channel(&self, channel_id: &str) {
-        if let Ok(mut running) = self.running_channels.lock() {
-            running.remove(channel_id);
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.running_channels.remove(channel_id);
         }
+    }
+
+    fn start_refresh_batch(&self, total_count: u64) -> Result<(YoutubeRefreshBatch, bool), String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|error| format!("监控任务锁定失败: {error}"))?;
+
+        if let Some(batch) = runtime
+            .refresh_batch
+            .as_ref()
+            .filter(|batch| batch.status == RUN_STATUS_RUNNING)
+        {
+            return Ok((batch.clone(), false));
+        }
+        if !runtime.running_channels.is_empty() {
+            return Err("有博主正在检查更新，请稍后再刷新页面".to_string());
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let batch = YoutubeRefreshBatch {
+            id: Uuid::new_v4().to_string(),
+            status: if total_count == 0 {
+                RUN_STATUS_DONE.to_string()
+            } else {
+                RUN_STATUS_RUNNING.to_string()
+            },
+            total_count,
+            completed_count: 0,
+            failed_count: 0,
+            current_channel_id: String::new(),
+            message: if total_count == 0 {
+                "没有需要检查的博主".to_string()
+            } else {
+                format!("准备检查 {total_count} 个博主")
+            },
+            started_at: now.clone(),
+            finished_at: (total_count == 0).then_some(now),
+        };
+        runtime.refresh_batch = Some(batch.clone());
+        Ok((batch, true))
+    }
+
+    fn refresh_batch(&self) -> Result<Option<YoutubeRefreshBatch>, String> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|error| format!("监控任务锁定失败: {error}"))?;
+        Ok(runtime.refresh_batch.clone())
+    }
+
+    fn set_refresh_batch_channel(
+        &self,
+        batch_id: &str,
+        channel_id: &str,
+    ) -> Result<YoutubeRefreshBatch, String> {
+        self.update_refresh_batch(batch_id, |batch| {
+            batch.current_channel_id = channel_id.to_string();
+            batch.message = format!(
+                "正在检查第 {} / {} 个博主",
+                batch.completed_count + 1,
+                batch.total_count
+            );
+        })
+    }
+
+    fn complete_refresh_batch_channel(
+        &self,
+        batch_id: &str,
+        failed: bool,
+    ) -> Result<YoutubeRefreshBatch, String> {
+        self.update_refresh_batch(batch_id, |batch| {
+            batch.completed_count += 1;
+            if failed {
+                batch.failed_count += 1;
+            }
+            batch.current_channel_id.clear();
+            batch.message = format!(
+                "已检查 {} / {} 个博主",
+                batch.completed_count, batch.total_count
+            );
+        })
+    }
+
+    fn finish_refresh_batch(&self, batch_id: &str) -> Result<YoutubeRefreshBatch, String> {
+        self.update_refresh_batch(batch_id, |batch| {
+            batch.status = RUN_STATUS_DONE.to_string();
+            batch.current_channel_id.clear();
+            batch.finished_at = Some(Utc::now().to_rfc3339());
+            batch.message = if batch.failed_count == 0 {
+                format!("全部 {} 个博主检查完成", batch.total_count)
+            } else {
+                format!("检查完成，{} 个博主失败", batch.failed_count)
+            };
+        })
+    }
+
+    fn update_refresh_batch(
+        &self,
+        batch_id: &str,
+        update: impl FnOnce(&mut YoutubeRefreshBatch),
+    ) -> Result<YoutubeRefreshBatch, String> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|error| format!("监控任务锁定失败: {error}"))?;
+        let batch = runtime
+            .refresh_batch
+            .as_mut()
+            .filter(|batch| batch.id == batch_id)
+            .ok_or_else(|| "未找到刷新页面任务".to_string())?;
+        update(batch);
+        Ok(batch.clone())
     }
 }
 
@@ -119,6 +252,20 @@ pub struct YoutubeRefreshRun {
     pub updated_count: u64,
     pub message: String,
     pub error_message: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeRefreshBatch {
+    pub id: String,
+    pub status: String,
+    pub total_count: u64,
+    pub completed_count: u64,
+    pub failed_count: u64,
+    pub current_channel_id: String,
+    pub message: String,
     pub started_at: String,
     pub finished_at: Option<String>,
 }
@@ -524,7 +671,7 @@ pub fn refresh_youtube_channel(
     request: YoutubeChannelRequest,
 ) -> Result<YoutubeRefreshRun, String> {
     let channel_id = request.channel_id.clone();
-    let guard = service.acquire_channel(&channel_id)?;
+    let guard = service.acquire_channel(&channel_id, false)?;
     let channel =
         store.with_connection(|connection| read_youtube_channel_by_id(connection, &channel_id))?;
     let settings = store.load()?;
@@ -539,40 +686,182 @@ pub fn refresh_youtube_channel(
     let returned_run = run.clone();
     thread::spawn(move || {
         let store = background_app.state::<SettingsStore>();
-        let log_session = ytdlp::start_log_session(&background_app, "youtube_monitor_refresh");
-        let result = run_ytdlp_refresh(
+        execute_youtube_channel_refresh(
             &background_app,
             &store,
             &channel,
             run.clone(),
             &ytdlp_config,
-            log_session.as_ref(),
+            &background_channel_id,
+            &background_run_id,
         );
-
-        if let Err(error) = result {
-            if let Some(log_session) = log_session.as_ref() {
-                log_session.error(
-                    "youtube_monitor_refresh_failed",
-                    "监控博主刷新失败",
-                    json!({
-                        "channelId": &background_channel_id,
-                        "runId": &background_run_id,
-                        "error": ytdlp::compact_error(&error),
-                    }),
-                );
-            }
-            if let Ok(failed_run) =
-                fail_refresh_run(&store, &background_channel_id, &background_run_id, &error)
-            {
-                emit_refresh(&background_app, &failed_run);
-            }
-        }
 
         let service = background_app.state::<YoutubeMonitorService>();
         service.release_channel(&background_channel_id);
     });
 
     Ok(returned_run)
+}
+
+#[tauri::command]
+pub fn get_youtube_refresh_batch(
+    service: tauri::State<'_, YoutubeMonitorService>,
+) -> Result<Option<YoutubeRefreshBatch>, String> {
+    service.refresh_batch()
+}
+
+#[tauri::command]
+pub fn refresh_all_youtube_channels(
+    app: AppHandle,
+    store: tauri::State<'_, SettingsStore>,
+    service: tauri::State<'_, YoutubeMonitorService>,
+) -> Result<YoutubeRefreshBatch, String> {
+    let channels = store.with_connection(read_youtube_channels)?;
+    let settings = store.load()?;
+    let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
+    let (batch, started) = service.start_refresh_batch(channels.len() as u64)?;
+    emit_refresh_batch(&app, &batch);
+
+    if !started || batch.status != RUN_STATUS_RUNNING {
+        return Ok(batch);
+    }
+
+    let app_logger = app.state::<AppLogger>();
+    app_logger.info(
+        "youtube_monitor",
+        "refresh_batch_start",
+        "开始刷新全部监控博主",
+        json!({ "batchId": &batch.id, "channelCount": batch.total_count }),
+    );
+
+    let background_app = app.clone();
+    let background_batch_id = batch.id.clone();
+    thread::spawn(move || {
+        for channel in channels {
+            let service = background_app.state::<YoutubeMonitorService>();
+            if let Ok(updated_batch) =
+                service.set_refresh_batch_channel(&background_batch_id, &channel.id)
+            {
+                emit_refresh_batch(&background_app, &updated_batch);
+            }
+
+            let channel_id = channel.id.clone();
+            let failed = match service.acquire_channel(&channel_id, true) {
+                Ok(_guard) => {
+                    let store = background_app.state::<SettingsStore>();
+                    match create_refresh_run(&store, &channel_id) {
+                        Ok(run) => {
+                            emit_refresh(&background_app, &run);
+                            let run_id = run.id.clone();
+                            !execute_youtube_channel_refresh(
+                                &background_app,
+                                &store,
+                                &channel,
+                                run,
+                                &ytdlp_config,
+                                &channel_id,
+                                &run_id,
+                            )
+                        }
+                        Err(error) => {
+                            let app_logger = background_app.state::<AppLogger>();
+                            app_logger.error(
+                                "youtube_monitor",
+                                "refresh_batch_channel_start_failed",
+                                "监控博主刷新启动失败",
+                                json!({
+                                    "batchId": &background_batch_id,
+                                    "channelId": &channel_id,
+                                    "error": ytdlp::compact_error(&error),
+                                }),
+                            );
+                            true
+                        }
+                    }
+                }
+                Err(error) => {
+                    let app_logger = background_app.state::<AppLogger>();
+                    app_logger.warn(
+                        "youtube_monitor",
+                        "refresh_batch_channel_busy",
+                        "监控博主未能进入刷新队列",
+                        json!({
+                            "batchId": &background_batch_id,
+                            "channelId": &channel_id,
+                            "error": &error,
+                        }),
+                    );
+                    true
+                }
+            };
+
+            if let Ok(updated_batch) =
+                service.complete_refresh_batch_channel(&background_batch_id, failed)
+            {
+                emit_refresh_batch(&background_app, &updated_batch);
+            }
+        }
+
+        let service = background_app.state::<YoutubeMonitorService>();
+        if let Ok(finished_batch) = service.finish_refresh_batch(&background_batch_id) {
+            emit_refresh_batch(&background_app, &finished_batch);
+            let app_logger = background_app.state::<AppLogger>();
+            let fields = json!({
+                "batchId": &finished_batch.id,
+                "channelCount": finished_batch.total_count,
+                "failedCount": finished_batch.failed_count,
+            });
+            if finished_batch.failed_count == 0 {
+                app_logger.info(
+                    "youtube_monitor",
+                    "refresh_batch_success",
+                    "全部监控博主刷新完成",
+                    fields,
+                );
+            } else {
+                app_logger.warn(
+                    "youtube_monitor",
+                    "refresh_batch_partial_failure",
+                    "监控博主批量刷新部分失败",
+                    fields,
+                );
+            }
+        }
+    });
+
+    Ok(batch)
+}
+
+fn execute_youtube_channel_refresh(
+    app: &AppHandle,
+    store: &SettingsStore,
+    channel: &YoutubeChannel,
+    run: YoutubeRefreshRun,
+    ytdlp_config: &ytdlp::YtdlpConfig,
+    channel_id: &str,
+    run_id: &str,
+) -> bool {
+    let log_session = ytdlp::start_log_session(app, "youtube_monitor_refresh");
+    let result = run_ytdlp_refresh(app, store, channel, run, ytdlp_config, log_session.as_ref());
+    if let Err(error) = result {
+        if let Some(log_session) = log_session.as_ref() {
+            log_session.error(
+                "youtube_monitor_refresh_failed",
+                "监控博主刷新失败",
+                json!({
+                    "channelId": channel_id,
+                    "runId": run_id,
+                    "error": ytdlp::compact_error(&error),
+                }),
+            );
+        }
+        if let Ok(failed_run) = fail_refresh_run(store, channel_id, run_id, &error) {
+            emit_refresh(app, &failed_run);
+        }
+        return false;
+    }
+
+    true
 }
 
 fn run_ytdlp_refresh(
@@ -1816,9 +2105,55 @@ fn emit_refresh(app: &AppHandle, run: &YoutubeRefreshRun) {
     let _ = app.emit(REFRESH_EVENT, run);
 }
 
+fn emit_refresh_batch(app: &AppHandle, batch: &YoutubeRefreshBatch) {
+    let _ = app.emit(REFRESH_BATCH_EVENT, batch);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_batch_tracks_every_channel_and_blocks_manual_refreshes() {
+        let service = YoutubeMonitorService::new();
+        let (batch, started) = service.start_refresh_batch(2).unwrap();
+        assert!(started);
+        assert_eq!(batch.status, RUN_STATUS_RUNNING);
+        assert_eq!(batch.total_count, 2);
+
+        let (same_batch, started_again) = service.start_refresh_batch(2).unwrap();
+        assert!(!started_again);
+        assert_eq!(same_batch.id, batch.id);
+        assert!(service.acquire_channel("manual", false).is_err());
+
+        let first = service
+            .set_refresh_batch_channel(&batch.id, "channel-1")
+            .unwrap();
+        assert_eq!(first.current_channel_id, "channel-1");
+        {
+            let _guard = service.acquire_channel("channel-1", true).unwrap();
+            assert!(service.acquire_channel("channel-1", true).is_err());
+        }
+        let first_done = service
+            .complete_refresh_batch_channel(&batch.id, false)
+            .unwrap();
+        assert_eq!(first_done.completed_count, 1);
+        assert_eq!(first_done.failed_count, 0);
+
+        service
+            .set_refresh_batch_channel(&batch.id, "channel-2")
+            .unwrap();
+        let second_done = service
+            .complete_refresh_batch_channel(&batch.id, true)
+            .unwrap();
+        assert_eq!(second_done.completed_count, 2);
+        assert_eq!(second_done.failed_count, 1);
+
+        let finished = service.finish_refresh_batch(&batch.id).unwrap();
+        assert_eq!(finished.status, RUN_STATUS_DONE);
+        assert_eq!(finished.completed_count, finished.total_count);
+        assert!(finished.finished_at.is_some());
+    }
 
     #[test]
     fn recognizes_ytdlp_extractor_errors() {

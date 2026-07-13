@@ -59,9 +59,10 @@ use transcription::{
     start_transcription,
 };
 use youtube_monitor::{
-    add_youtube_channel, delete_youtube_channel, get_ytdlp_status, list_youtube_channels,
-    list_youtube_unread_videos, list_youtube_videos, mark_all_youtube_channels_seen,
-    mark_youtube_channel_seen, refresh_youtube_channel, YoutubeMonitorService,
+    add_youtube_channel, delete_youtube_channel, get_youtube_refresh_batch, get_ytdlp_status,
+    list_youtube_channels, list_youtube_unread_videos, list_youtube_videos,
+    mark_all_youtube_channels_seen, mark_youtube_channel_seen, refresh_all_youtube_channels,
+    refresh_youtube_channel, YoutubeMonitorService,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -183,6 +184,8 @@ pub fn run() {
             list_youtube_videos,
             mark_all_youtube_channels_seen,
             mark_youtube_channel_seen,
+            get_youtube_refresh_batch,
+            refresh_all_youtube_channels,
             refresh_youtube_channel,
         ])
         .run(tauri::generate_context!())
