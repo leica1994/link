@@ -18,6 +18,12 @@ export default createRouter({
     { path: '/subtitle-style', name: 'SubtitleStyle', component: SubtitleStyle },
     { path: '/subtitle-burn', name: 'SubtitleBurn', component: SubtitleBurn, meta: { keepAlive: true } },
     { path: '/copywriting', name: 'ContentCopy', component: ContentCopy, meta: { keepAlive: true } },
+    {
+      path: '/subtitle-review',
+      name: 'SubtitleReview',
+      component: () => import('../views/SubtitleReview.vue'),
+      meta: { keepAlive: true },
+    },
     { path: '/youtube-monitor', name: 'YoutubeMonitor', component: YoutubeMonitor },
     { path: '/youtube-monitor/unread', name: 'YoutubeMonitorUnread', component: YoutubeMonitor },
     { path: '/youtube-monitor/:channelId', name: 'YoutubeMonitorDetail', component: YoutubeMonitor },

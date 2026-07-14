@@ -14,6 +14,7 @@ mod subtitle_ai;
 mod subtitle_alignment;
 mod subtitle_burn;
 mod subtitle_export;
+mod subtitle_review;
 mod subtitle_style;
 mod subtitle_translation;
 mod transcription;
@@ -46,6 +47,11 @@ use settings::{
     export_settings_backup, import_settings_backup, load_settings, save_settings, SettingsStore,
 };
 use subtitle_burn::start_subtitle_burn;
+use subtitle_review::{
+    cancel_subtitle_review_export, cancel_subtitle_review_proxy, prepare_subtitle_review,
+    prepare_subtitle_review_proxy, release_subtitle_review_session, start_subtitle_review_export,
+    subtitle_review_stream_response, update_subtitle_review, SubtitleReviewRuntime,
+};
 use subtitle_style::{
     create_subtitle_style, delete_subtitle_style, get_subtitle_style, list_subtitle_styles,
     select_subtitle_style, update_subtitle_style,
@@ -67,7 +73,27 @@ use youtube_monitor::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let subtitle_review_runtime = SubtitleReviewRuntime::default();
+    let subtitle_review_stream_runtime = subtitle_review_runtime.clone();
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol(
+            "review-video",
+            move |_context, request, responder| {
+                let response =
+                    subtitle_review_stream_response(&subtitle_review_stream_runtime, request)
+                        .unwrap_or_else(|error| {
+                            tauri::http::Response::builder()
+                                .status(tauri::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                .header(
+                                    tauri::http::header::CONTENT_TYPE,
+                                    "text/plain; charset=utf-8",
+                                )
+                                .body(error.into_bytes())
+                                .expect("failed to build review video stream error response")
+                        });
+                responder.respond(response);
+            },
+        )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -77,7 +103,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             let store = SettingsStore::new(app.handle()).map_err(|error| {
                 Box::<dyn std::error::Error>::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -112,6 +138,7 @@ pub fn run() {
             app.manage(dubbing_tts_scheduler);
             app.manage(youtube_monitor_service);
             app.manage(home_workbench_runtime);
+            app.manage(subtitle_review_runtime);
 
             let window_config = app
                 .config()
@@ -146,6 +173,13 @@ pub fn run() {
             start_subtitle_translation,
             save_subtitle_translation_file,
             start_subtitle_burn,
+            prepare_subtitle_review,
+            update_subtitle_review,
+            prepare_subtitle_review_proxy,
+            cancel_subtitle_review_proxy,
+            start_subtitle_review_export,
+            cancel_subtitle_review_export,
+            release_subtitle_review_session,
             list_subtitle_styles,
             get_subtitle_style,
             create_subtitle_style,

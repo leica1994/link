@@ -24,6 +24,10 @@
       <SquarePen class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
       <span>文案</span>
     </RouterLink>
+    <RouterLink to="/subtitle-review" class="nav-item" :class="{ active: route.path === '/subtitle-review' }">
+      <BadgeCheck class="nav-icon" :stroke-width="2.4" aria-hidden="true" />
+      <span>审核</span>
+    </RouterLink>
     <RouterLink
       to="/youtube-monitor"
       class="nav-item"
@@ -40,7 +44,7 @@
 </template>
 
 <script setup lang="ts">
-import { Flame, House, Languages, MicVocal, Radar, Settings, SquarePen, Type } from 'lucide-vue-next'
+import { BadgeCheck, Flame, House, Languages, MicVocal, Radar, Settings, SquarePen, Type } from 'lucide-vue-next'
 import { useRoute, RouterLink } from 'vue-router'
 
 const route = useRoute()
