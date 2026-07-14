@@ -174,7 +174,7 @@
             <div class="subtitle-review-main-grid">
               <div class="subtitle-review-video-column">
                 <div ref="videoFrameRef" class="subtitle-review-video-frame">
-                  <div class="subtitle-review-video-stage" :style="videoStageStyle" @click="toggleVideoPlayback">
+                  <div ref="videoStageRef" class="subtitle-review-video-stage" :style="videoStageStyle" @click="toggleVideoPlayback">
                     <video
                       ref="videoRef"
                       class="subtitle-review-video"
@@ -190,16 +190,15 @@
                       @error="handleVideoError"
                     />
                     <canvas ref="videoCanvasRef" class="subtitle-review-frame-canvas" aria-hidden="true" />
-                    <canvas
-                      ref="subtitleCanvasRef"
-                      class="subtitle-review-subtitle-canvas"
-                      :class="{ ready: isRendererReady }"
+                    <div
+                      ref="subtitleLayerRef"
+                      class="subtitle-review-subtitle-layer"
+                      :class="{ ready: isRendererReady, obscured: activePreviewCues.length > 0 }"
                       aria-hidden="true"
                     />
                     <div
                       v-if="activePreviewCues.length > 0"
                       class="subtitle-review-caption-fallback"
-                      :class="captionFallbackPlacement"
                       aria-hidden="true"
                     >
                       <span
@@ -518,6 +517,7 @@ import SubtitleTimeline from '../components/SubtitleTimeline.vue'
 import {
   DEFAULT_CUE_DURATION_MS,
   MIN_CUE_DURATION_MS,
+  clampNumber,
   cloneReviewCues,
   findActiveCueIds,
   findPlaybackCueId,
@@ -583,18 +583,42 @@ type AssPreviewStyle = {
   fontSize: number
   primaryColor: string
   outlineColor: string
+  backgroundColor: string
   bold: boolean
   italic: boolean
   underline: boolean
+  strikeOut: boolean
+  scaleX: number
+  scaleY: number
+  spacing: number
+  angle: number
+  borderStyle: number
   outline: number
   shadow: number
   alignment: number
+  marginL: number
+  marginR: number
   marginV: number
 }
 
 type AssPreviewConfig = {
+  playResX: number
   playResY: number
   styles: Record<string, AssPreviewStyle>
+}
+
+type AssInlineOverrides = {
+  alignment?: number
+  position?: { x: number; y: number }
+  fontFamily?: string
+  fontSize?: number
+  primaryColor?: string
+  outlineColor?: string
+  bold?: boolean
+  italic?: boolean
+  underline?: boolean
+  outline?: number
+  shadow?: number
 }
 
 const videoExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v'] as const
@@ -603,8 +627,9 @@ const VIDEO_STREAM_CHUNK_BYTES = 2 * 1024 * 1024
 const MAX_DIRECT_PREVIEW_BYTES = 256 * 1024 * 1024
 const videoRef = ref<HTMLVideoElement | null>(null)
 const videoFrameRef = ref<HTMLElement | null>(null)
+const videoStageRef = ref<HTMLElement | null>(null)
 const videoCanvasRef = ref<HTMLCanvasElement | null>(null)
-const subtitleCanvasRef = ref<HTMLCanvasElement | null>(null)
+const subtitleLayerRef = ref<HTMLElement | null>(null)
 const cueListRef = ref<HTMLElement | null>(null)
 const videoFrameSize = ref({ width: 0, height: 0 })
 const naturalVideoSize = ref({ width: 0, height: 0 })
@@ -667,6 +692,7 @@ let videoSourceGeneration = 0
 let videoSourceAbortController: AbortController | null = null
 let previewObjectUrl = ''
 let isReplacingVideoSource = false
+let subtitleCanvasElement: HTMLCanvasElement | null = null
 
 const isTauriRuntime = () => '__TAURI_INTERNALS__' in window
 const filesReady = computed(() => Boolean(selectedVideoPath.value && selectedSubtitlePath.value))
@@ -688,12 +714,6 @@ const activePreviewCues = computed(() =>
     (cue) => cue.startTime <= currentTimeMs.value && currentTimeMs.value < cue.endTime,
   ),
 )
-const captionFallbackPlacement = computed(() => {
-  const style = previewStyleForCue(activePreviewCues.value[0])
-  if (style.alignment >= 7) return 'top'
-  if (style.alignment >= 4) return 'middle'
-  return 'bottom'
-})
 const selectedCueGroup = computed(
   () => sortedCueGroups.value.find((group) => group.id === selectedCueId.value) ?? null,
 )
@@ -737,21 +757,34 @@ const videoDetail = computed(() => {
   const codec = videoMetadata.value.videoCodec ? videoMetadata.value.videoCodec.toUpperCase() : '视频'
   return `${videoMetadata.value.width}×${videoMetadata.value.height} · ${codec} · ${formatReviewTime(videoDurationMs.value)}`
 })
-const videoStageStyle = computed(() => {
+const videoStageSize = computed(() => {
   const frameWidth = videoFrameSize.value.width
   const frameHeight = videoFrameSize.value.height
   const sourceWidth = naturalVideoSize.value.width || videoMetadata.value?.width || 0
   const sourceHeight = naturalVideoSize.value.height || videoMetadata.value?.height || 0
-  if (frameWidth <= 0 || frameHeight <= 0 || sourceWidth <= 0 || sourceHeight <= 0) {
-    return { width: '100%', height: '100%' }
+  if (frameWidth <= 0 || frameHeight <= 0) {
+    return { width: 0, height: 0 }
+  }
+  if (sourceWidth <= 0 || sourceHeight <= 0) {
+    return { width: frameWidth, height: frameHeight }
   }
   const videoRatio = sourceWidth / sourceHeight
   const frameRatio = frameWidth / frameHeight
   const width = frameRatio > videoRatio ? frameHeight * videoRatio : frameWidth
   const height = frameRatio > videoRatio ? frameHeight : frameWidth / videoRatio
   return {
-    width: `${Math.max(1, Math.round(width))}px`,
-    height: `${Math.max(1, Math.round(height))}px`,
+    width: Math.max(1, Math.round(width)),
+    height: Math.max(1, Math.round(height)),
+  }
+})
+const videoStageStyle = computed(() => {
+  const { width, height } = videoStageSize.value
+  if (width <= 0 || height <= 0) {
+    return { width: '100%', height: '100%' }
+  }
+  return {
+    width: `${width}px`,
+    height: `${height}px`,
   }
 })
 const canExport = computed(
@@ -988,8 +1021,12 @@ const observeVideoFrame = () => {
 const initializeRenderer = async (assContent: string) => {
   await destroyRenderer()
   const video = videoRef.value
-  const canvas = subtitleCanvasRef.value
-  if (!video || !canvas) return
+  const layer = subtitleLayerRef.value
+  if (!video || !layer) return
+  const canvas = document.createElement('canvas')
+  canvas.className = 'subtitle-review-subtitle-canvas'
+  layer.replaceChildren(canvas)
+  subtitleCanvasElement = canvas
   isRendererLoading.value = true
   isRendererReady.value = false
   try {
@@ -1584,6 +1621,9 @@ const destroyRenderer = async () => {
   renderer.value = null
   isRendererReady.value = false
   if (instance) await instance.destroy().catch(() => undefined)
+  subtitleCanvasElement?.remove()
+  subtitleCanvasElement = null
+  subtitleLayerRef.value?.replaceChildren()
 }
 
 const registerProgressListeners = async () => {
@@ -1811,6 +1851,7 @@ const cueRoleLabel = (cue: ReviewCue, index: number, group: ReviewCueGroup) => {
 
 function createDefaultAssPreviewConfig(): AssPreviewConfig {
   return {
+    playResX: 1280,
     playResY: 720,
     styles: {
       default: {
@@ -1818,12 +1859,21 @@ function createDefaultAssPreviewConfig(): AssPreviewConfig {
         fontSize: 32,
         primaryColor: 'rgba(255, 255, 255, 1)',
         outlineColor: 'rgba(0, 0, 0, 1)',
+        backgroundColor: 'rgba(0, 0, 0, 0.78)',
         bold: true,
         italic: false,
         underline: false,
+        strikeOut: false,
+        scaleX: 100,
+        scaleY: 100,
+        spacing: 0,
+        angle: 0,
+        borderStyle: 1,
         outline: 2,
         shadow: 0,
         alignment: 2,
+        marginL: 10,
+        marginR: 10,
         marginV: 24,
       },
     },
@@ -1833,6 +1883,7 @@ function createDefaultAssPreviewConfig(): AssPreviewConfig {
 function parseAssPreviewConfig(content: string): AssPreviewConfig {
   const fallback = createDefaultAssPreviewConfig()
   const styles: Record<string, AssPreviewStyle> = {}
+  let playResX = fallback.playResX
   let playResY = fallback.playResY
   let section = ''
   let styleFormat: string[] = []
@@ -1846,7 +1897,9 @@ function parseAssPreviewConfig(content: string): AssPreviewConfig {
     }
     if (section === '[script info]') {
       const [key, value] = line.split(':', 2)
-      if (key?.trim().toLowerCase() === 'playresy') playResY = Math.max(1, Number(value) || playResY)
+      const normalizedKey = key?.trim().toLowerCase()
+      if (normalizedKey === 'playresx') playResX = Math.max(1, Number(value) || playResX)
+      if (normalizedKey === 'playresy') playResY = Math.max(1, Number(value) || playResY)
       continue
     }
     if (section !== '[v4+ styles]' && section !== '[v4 styles]') continue
@@ -1860,21 +1913,51 @@ function parseAssPreviewConfig(content: string): AssPreviewConfig {
     const name = fields.name || 'Default'
     const fallbackStyle = fallback.styles.default!
     styles[name.toLowerCase()] = {
-      fontFamily: fields.fontname ? `'${fields.fontname}', Microsoft YaHei, sans-serif` : fallbackStyle.fontFamily,
-      fontSize: Math.max(1, Number(fields.fontsize) || fallbackStyle.fontSize),
+      fontFamily: fields.fontname ? `${quoteCssFontFamily(fields.fontname)}, Microsoft YaHei, sans-serif` : fallbackStyle.fontFamily,
+      fontSize: positiveNumber(fields.fontsize, fallbackStyle.fontSize),
       primaryColor: assColorToCss(fields.primarycolour, fallbackStyle.primaryColor),
       outlineColor: assColorToCss(fields.outlinecolour, fallbackStyle.outlineColor),
-      bold: Number(fields.bold) !== 0,
-      italic: Number(fields.italic) !== 0,
-      underline: Number(fields.underline) !== 0,
-      outline: Math.max(0, Number(fields.outline) || 0),
-      shadow: Math.max(0, Number(fields.shadow) || 0),
-      alignment: Math.min(9, Math.max(1, Number(fields.alignment) || fallbackStyle.alignment)),
-      marginV: Math.max(0, Number(fields.marginv) || fallbackStyle.marginV),
+      backgroundColor: assColorToCss(fields.backcolour, fallbackStyle.backgroundColor),
+      bold: assBoolean(fields.bold, fallbackStyle.bold),
+      italic: assBoolean(fields.italic, fallbackStyle.italic),
+      underline: assBoolean(fields.underline, fallbackStyle.underline),
+      strikeOut: assBoolean(fields.strikeout, fallbackStyle.strikeOut),
+      scaleX: positiveNumber(fields.scalex, fallbackStyle.scaleX),
+      scaleY: positiveNumber(fields.scaley, fallbackStyle.scaleY),
+      spacing: finiteNumber(fields.spacing, fallbackStyle.spacing),
+      angle: finiteNumber(fields.angle, fallbackStyle.angle),
+      borderStyle: Math.round(clampNumber(finiteNumber(fields.borderstyle, fallbackStyle.borderStyle), 1, 4)),
+      outline: Math.max(0, finiteNumber(fields.outline, fallbackStyle.outline)),
+      shadow: Math.max(0, finiteNumber(fields.shadow, fallbackStyle.shadow)),
+      alignment: Math.round(clampNumber(finiteNumber(fields.alignment, fallbackStyle.alignment), 1, 9)),
+      marginL: Math.max(0, finiteNumber(fields.marginl, fallbackStyle.marginL)),
+      marginR: Math.max(0, finiteNumber(fields.marginr, fallbackStyle.marginR)),
+      marginV: Math.max(0, finiteNumber(fields.marginv, fallbackStyle.marginV)),
     }
   }
 
-  return { playResY, styles: Object.keys(styles).length > 0 ? styles : fallback.styles }
+  return { playResX, playResY, styles: Object.keys(styles).length > 0 ? styles : fallback.styles }
+}
+
+function finiteNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function positiveNumber(value: string | undefined, fallback: number): number {
+  const parsed = finiteNumber(value, fallback)
+  return parsed > 0 ? parsed : fallback
+}
+
+function assBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === '') return fallback
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed !== 0 : fallback
+}
+
+function quoteCssFontFamily(value: string): string {
+  const sanitized = value.trim().replace(/['\\]/g, '\\$&')
+  return sanitized ? `'${sanitized}'` : 'Microsoft YaHei'
 }
 
 function assColorToCss(value: string | undefined, fallback: string): string {
@@ -1898,31 +1981,246 @@ function captionFallbackText(cue: ReviewCue): string {
 
 function captionFallbackStyle(cue: ReviewCue): CSSProperties {
   const style = previewStyleForCue(cue)
-  const stageHeight = Number.parseFloat(String(videoStageStyle.value.height ?? '')) || videoFrameSize.value.height || 720
-  const scale = stageHeight / Math.max(1, assPreviewConfig.value.playResY)
-  const fontSize = Math.max(9, style.fontSize * scale)
-  const outline = Math.max(0.5, style.outline * scale)
-  const shadow = Math.max(0, style.shadow * scale)
+  const overrides = parseAssInlineOverrides(cue)
+  const stage = getCaptionStageSize()
+  const scaleX = stage.width / Math.max(1, assPreviewConfig.value.playResX)
+  const scaleY = stage.height / Math.max(1, assPreviewConfig.value.playResY)
+  const alignment = Math.round(clampNumber(overrides.alignment ?? style.alignment, 1, 9))
+  const horizontal = assHorizontalAlignment(alignment)
+  const vertical = assVerticalAlignment(alignment)
+  const positioned = overrides.position
+  const marginL = cueMarginValue(cue.marginL, style.marginL) * scaleX
+  const marginR = cueMarginValue(cue.marginR, style.marginR) * scaleX
+  const marginV = cueMarginValue(cue.marginV, style.marginV) * scaleY
+  const fontSize = Math.max(9, (overrides.fontSize ?? style.fontSize) * scaleY * (style.scaleY / 100))
+  const outline = Math.max(0, (overrides.outline ?? style.outline) * scaleY)
+  const shadow = Math.max(0, (overrides.shadow ?? style.shadow) * scaleY)
+  const lineHeight = fontSize * 1.18
+  const maxWidth = Math.max(40, stage.width - marginL - marginR)
+  const lineCount = estimateCaptionLineCount(cue, fontSize, maxWidth)
+  const paddingY = style.borderStyle === 3 ? Math.max(2, outline) * 2 : 0
+  const boxHeight = lineHeight * lineCount + paddingY
+  const stackGap = Math.max(2, 5 * scaleY)
+  const stackOffset = positioned ? 0 : captionFallbackStackOffset(cue, alignment, vertical, boxHeight, stackGap)
+  const textColor = overrides.primaryColor ?? style.primaryColor
+  const outlineColor = overrides.outlineColor ?? style.outlineColor
   const textShadow = [
-    `${outline}px 0 ${style.outlineColor}`,
-    `${-outline}px 0 ${style.outlineColor}`,
-    `0 ${outline}px ${style.outlineColor}`,
-    `0 ${-outline}px ${style.outlineColor}`,
-    `${outline}px ${outline}px ${style.outlineColor}`,
-    `${-outline}px ${outline}px ${style.outlineColor}`,
-    `${outline}px ${-outline}px ${style.outlineColor}`,
-    `${-outline}px ${-outline}px ${style.outlineColor}`,
-  ]
-  if (shadow > 0) textShadow.push(`${shadow}px ${shadow}px ${style.outlineColor}`)
-  return {
-    color: style.primaryColor,
-    fontFamily: style.fontFamily,
+    outline > 0 ? `${outline}px 0 ${outlineColor}` : '',
+    outline > 0 ? `${-outline}px 0 ${outlineColor}` : '',
+    outline > 0 ? `0 ${outline}px ${outlineColor}` : '',
+    outline > 0 ? `0 ${-outline}px ${outlineColor}` : '',
+    outline > 0 ? `${outline}px ${outline}px ${outlineColor}` : '',
+    outline > 0 ? `${-outline}px ${outline}px ${outlineColor}` : '',
+    outline > 0 ? `${outline}px ${-outline}px ${outlineColor}` : '',
+    outline > 0 ? `${-outline}px ${-outline}px ${outlineColor}` : '',
+    shadow > 0 ? `${shadow}px ${shadow}px ${outlineColor}` : '',
+  ].filter(Boolean)
+  const transform: string[] = []
+  const base: CSSProperties = {
+    position: 'absolute',
+    color: textColor,
+    fontFamily: overrides.fontFamily
+      ? `${quoteCssFontFamily(overrides.fontFamily)}, ${style.fontFamily}`
+      : style.fontFamily,
     fontSize: `${fontSize}px`,
-    fontWeight: style.bold ? 700 : 400,
-    fontStyle: style.italic ? 'italic' : 'normal',
-    textDecoration: style.underline ? 'underline' : 'none',
-    textShadow: textShadow.join(', '),
+    fontWeight: (overrides.bold ?? style.bold) ? 700 : 400,
+    fontStyle: (overrides.italic ?? style.italic) ? 'italic' : 'normal',
+    textDecoration: [
+      (overrides.underline ?? style.underline) ? 'underline' : '',
+      style.strikeOut ? 'line-through' : '',
+    ]
+      .filter(Boolean)
+      .join(' ') || 'none',
+    letterSpacing: style.spacing ? `${style.spacing * scaleX}px` : '0',
+    lineHeight: `${lineHeight}px`,
+    maxWidth: `${maxWidth}px`,
+    overflowWrap: 'anywhere',
+    textAlign: horizontal,
+    textShadow: style.borderStyle === 3 ? undefined : textShadow.join(', '),
+    whiteSpace: 'pre-wrap',
   }
+
+  if (style.borderStyle === 3) {
+    base.backgroundColor = style.backgroundColor
+    base.borderRadius = '4px'
+    base.padding = `${Math.max(2, outline)}px ${Math.max(5, outline * 1.8)}px`
+  }
+
+  if (positioned) {
+    base.left = `${positioned.x * scaleX}px`
+    base.top = `${positioned.y * scaleY}px`
+    const translateX = horizontal === 'center' ? '-50%' : horizontal === 'right' ? '-100%' : '0'
+    const translateY = vertical === 'middle' ? '-50%' : vertical === 'bottom' ? '-100%' : '0'
+    if (translateX !== '0' || translateY !== '0') transform.push(`translate(${translateX}, ${translateY})`)
+  } else {
+    base.left = `${marginL}px`
+    base.right = `${marginR}px`
+    if (vertical === 'top') {
+      base.top = `${marginV + stackOffset}px`
+    } else if (vertical === 'middle') {
+      base.top = `calc(50% + ${stackOffset}px)`
+      transform.push('translateY(-50%)')
+    } else {
+      base.bottom = `${marginV + stackOffset}px`
+    }
+  }
+
+  if (style.angle) transform.push(`rotate(${style.angle}deg)`)
+  if (transform.length > 0) base.transform = transform.join(' ')
+  return base
+}
+
+function captionFallbackStackOffset(
+  cue: ReviewCue,
+  alignment: number,
+  vertical: 'top' | 'middle' | 'bottom',
+  boxHeight: number,
+  gap: number,
+): number {
+  const stackItems = activePreviewCues.value.filter((item) => {
+    const itemStyle = previewStyleForCue(item)
+    const itemOverrides = parseAssInlineOverrides(item)
+    if (itemOverrides.position) return false
+    const itemAlignment = Math.round(clampNumber(itemOverrides.alignment ?? itemStyle.alignment, 1, 9))
+    return itemAlignment === alignment
+  })
+  if (stackItems.length <= 1) return 0
+
+  const itemHeights = stackItems.map((item) => {
+    if (item.id === cue.id) return boxHeight
+    return captionFallbackBoxHeight(item)
+  })
+  const index = stackItems.findIndex((item) => item.id === cue.id)
+  if (index < 0) return 0
+
+  if (vertical === 'bottom') {
+    return itemHeights.slice(0, index).reduce((sum, height) => sum + height + gap, 0)
+  }
+  if (vertical === 'top') {
+    return itemHeights.slice(0, index).reduce((sum, height) => sum + height + gap, 0)
+  }
+
+  const totalHeight = itemHeights.reduce((sum, height) => sum + height, 0) + gap * (itemHeights.length - 1)
+  const beforeHeight = itemHeights.slice(0, index).reduce((sum, height) => sum + height + gap, 0)
+  return beforeHeight + itemHeights[index]! / 2 - totalHeight / 2
+}
+
+function captionFallbackBoxHeight(cue: ReviewCue): number {
+  const style = previewStyleForCue(cue)
+  const overrides = parseAssInlineOverrides(cue)
+  const stage = getCaptionStageSize()
+  const scaleX = stage.width / Math.max(1, assPreviewConfig.value.playResX)
+  const scaleY = stage.height / Math.max(1, assPreviewConfig.value.playResY)
+  const marginL = cueMarginValue(cue.marginL, style.marginL) * scaleX
+  const marginR = cueMarginValue(cue.marginR, style.marginR) * scaleX
+  const fontSize = Math.max(9, (overrides.fontSize ?? style.fontSize) * scaleY * (style.scaleY / 100))
+  const outline = Math.max(0, (overrides.outline ?? style.outline) * scaleY)
+  const paddingY = style.borderStyle === 3 ? Math.max(2, outline) * 2 : 0
+  const maxWidth = Math.max(40, stage.width - marginL - marginR)
+  const lineCount = estimateCaptionLineCount(cue, fontSize, maxWidth)
+  return fontSize * 1.18 * lineCount + paddingY
+}
+
+function estimateCaptionLineCount(cue: ReviewCue, fontSize: number, maxWidth: number): number {
+  return captionFallbackText(cue)
+    .split('\n')
+    .reduce((count, line) => {
+      const visualWidth = Array.from(line).reduce((sum, character) => {
+        return sum + fontSize * (/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3040-\u30FF\uAC00-\uD7AF]/u.test(character) ? 1 : 0.55)
+      }, 0)
+      return count + Math.max(1, Math.ceil(visualWidth / Math.max(1, maxWidth)))
+    }, 0)
+}
+
+function getCaptionStageSize() {
+  const stage = videoStageSize.value
+  return {
+    width: stage.width > 0 ? stage.width : assPreviewConfig.value.playResX,
+    height: stage.height > 0 ? stage.height : assPreviewConfig.value.playResY,
+  }
+}
+
+function cueMarginValue(value: string, fallback: number): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function assHorizontalAlignment(alignment: number): 'left' | 'center' | 'right' {
+  const column = ((alignment - 1) % 3) + 1
+  if (column === 1) return 'left'
+  if (column === 3) return 'right'
+  return 'center'
+}
+
+function assVerticalAlignment(alignment: number): 'top' | 'middle' | 'bottom' {
+  if (alignment >= 7) return 'top'
+  if (alignment >= 4) return 'middle'
+  return 'bottom'
+}
+
+function parseAssInlineOverrides(cue: ReviewCue): AssInlineOverrides {
+  if (cue.textMode !== 'raw' || !cue.rawText.includes('{')) return {}
+  const overrides: AssInlineOverrides = {}
+  const tags = cue.rawText.match(/\{[^}]*\}/g) ?? []
+  for (const rawTag of tags) {
+    const tag = rawTag.slice(1, -1)
+    const alignment = tag.match(/\\an([1-9])/i)
+    if (alignment) overrides.alignment = Number(alignment[1])
+
+    const position = tag.match(/\\pos\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)/i)
+    if (position) {
+      overrides.position = { x: Number(position[1]), y: Number(position[2]) }
+    }
+
+    const move = tag.match(
+      /\\move\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?:\s*,\s*(\d+)\s*,\s*(\d+))?\s*\)/i,
+    )
+    if (move) {
+      const start = { x: Number(move[1]), y: Number(move[2]) }
+      const end = { x: Number(move[3]), y: Number(move[4]) }
+      const moveStart = Number(move[5] ?? 0)
+      const moveEnd = Number(move[6] ?? Math.max(1, cue.endTime - cue.startTime))
+      const elapsed = clampNumber(currentTimeMs.value - cue.startTime, moveStart, moveEnd)
+      const ratio = moveEnd > moveStart ? (elapsed - moveStart) / (moveEnd - moveStart) : 1
+      overrides.position = {
+        x: start.x + (end.x - start.x) * ratio,
+        y: start.y + (end.y - start.y) * ratio,
+      }
+    }
+
+    applyNumericAssOverride(tag, /\\fs(\d+(?:\.\d+)?)/i, (value) => {
+      overrides.fontSize = value
+    })
+    applyNumericAssOverride(tag, /\\bord(\d+(?:\.\d+)?)/i, (value) => {
+      overrides.outline = value
+    })
+    applyNumericAssOverride(tag, /\\shad(\d+(?:\.\d+)?)/i, (value) => {
+      overrides.shadow = value
+    })
+
+    const primaryColor = tag.match(/\\(?:1c|c)&H([0-9a-f]{6,8})&?/i)
+    if (primaryColor) overrides.primaryColor = assColorToCss(`&H${primaryColor[1]}`, overrides.primaryColor ?? '#fff')
+    const outlineColor = tag.match(/\\3c&H([0-9a-f]{6,8})&?/i)
+    if (outlineColor) overrides.outlineColor = assColorToCss(`&H${outlineColor[1]}`, overrides.outlineColor ?? '#000')
+
+    const fontFamily = tag.match(/\\fn([^\\}]+)/i)
+    if (fontFamily) overrides.fontFamily = fontFamily[1]?.trim()
+
+    const bold = tag.match(/\\b(-?1|0)?/i)
+    if (bold && bold[1] !== undefined) overrides.bold = Number(bold[1]) !== 0
+    const italic = tag.match(/\\i(-?1|0)?/i)
+    if (italic && italic[1] !== undefined) overrides.italic = Number(italic[1]) !== 0
+    const underline = tag.match(/\\u(-?1|0)?/i)
+    if (underline && underline[1] !== undefined) overrides.underline = Number(underline[1]) !== 0
+  }
+  return overrides
+}
+
+function applyNumericAssOverride(tag: string, pattern: RegExp, apply: (value: number) => void) {
+  const match = tag.match(pattern)
+  if (!match) return
+  const value = Number(match[1])
+  if (Number.isFinite(value)) apply(value)
 }
 
 const stringifyError = (error: unknown, fallback: string) => {
@@ -1979,9 +2277,18 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.subtitle-review-workspace { gap: 22px; }
+.subtitle-review-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
 
-.subtitle-review-header { gap: 18px; }
+.subtitle-review-workspace > .settings-section + .settings-section { margin-top: 0; }
+
+.subtitle-review-header {
+  min-height: 46px;
+  gap: 18px;
+}
 
 .subtitle-review-title-group,
 .subtitle-review-header-actions,
@@ -2012,7 +2319,12 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
 }
 
-.subtitle-review-header-actions { margin-left: auto; gap: 8px; }
+.subtitle-review-header-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-left: auto;
+  gap: 8px;
+}
 .settings-action.icon-only { width: 36px; padding: 0; justify-content: center; }
 
 .subtitle-review-primary-action {
@@ -2046,6 +2358,9 @@ onBeforeUnmount(() => {
 .subtitle-review-heading-meta { margin-left: auto; color: var(--text-subtle); font-size: 11px; font-weight: 600; }
 
 .subtitle-review-editor-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   overflow: hidden;
   padding: 0;
   border-radius: var(--radius-panel);
@@ -2053,13 +2368,16 @@ onBeforeUnmount(() => {
 
 .subtitle-review-filebar {
   min-height: 55px;
-  gap: 18px;
-  padding: 8px 14px;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--bg-surface) 82%, var(--bg));
 }
 
 .subtitle-review-filebar-item {
   min-width: 0;
+  flex: 0 1 min(360px, 38%);
   display: grid;
   grid-template-columns: 18px minmax(0, auto);
   column-gap: 8px;
@@ -2078,9 +2396,14 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 700;
+  background: color-mix(in srgb, var(--bg) 46%, transparent);
 }
 .subtitle-review-validation-summary svg { width: 15px; height: 15px; }
 .subtitle-review-validation-summary.error { color: #b73b31; }
@@ -2114,9 +2437,9 @@ onBeforeUnmount(() => {
 
 .subtitle-review-main-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.8fr);
-  height: clamp(620px, calc(100vh - 300px), 860px);
-  min-height: 620px;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, clamp(380px, 30vw, 470px));
+  height: clamp(650px, calc(100dvh - var(--titlebar-h) - 222px), 920px);
+  min-height: 650px;
   overflow: hidden;
 }
 
@@ -2125,8 +2448,8 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 14px;
-  gap: 0;
+  padding: 16px;
+  gap: 10px;
   border-right: 1px solid var(--hairline);
   background: color-mix(in srgb, var(--bg) 52%, var(--bg-surface));
 }
@@ -2141,7 +2464,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  border-radius: 12px;
+  border-radius: 10px;
   background: #0d0d0d;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
@@ -2180,39 +2503,35 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
-.subtitle-review-subtitle-canvas {
+.subtitle-review-subtitle-layer {
   position: absolute !important;
   inset: 0;
   z-index: 2;
-  width: 100% !important;
-  height: 100% !important;
   opacity: 0;
-  background: transparent !important;
   pointer-events: none;
   transition: opacity 0.12s ease;
 }
-.subtitle-review-subtitle-canvas.ready { opacity: 1; }
+.subtitle-review-subtitle-layer.ready { opacity: 1; }
+.subtitle-review-subtitle-layer.obscured { opacity: 0; }
+
+.subtitle-review-subtitle-layer :deep(.subtitle-review-subtitle-canvas) {
+  position: absolute !important;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
+  background: transparent !important;
+  pointer-events: none;
+}
 
 .subtitle-review-caption-fallback {
   position: absolute;
   inset: 0;
   z-index: 3;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 1px;
-  padding: 2% 3%;
+  overflow: hidden;
   pointer-events: none;
 }
-.subtitle-review-caption-fallback.top { justify-content: flex-start; }
-.subtitle-review-caption-fallback.middle { justify-content: center; }
 .subtitle-review-caption-fallback span {
-  max-width: 96%;
-  white-space: pre-wrap;
-  text-align: center;
-  line-height: 1.18;
-  overflow-wrap: anywhere;
+  display: block;
 }
 
 .subtitle-review-video-loading,
@@ -2234,7 +2553,11 @@ onBeforeUnmount(() => {
 }
 .subtitle-review-video-loading svg { width: 17px; height: 17px; }
 
-.subtitle-review-transport { min-height: 48px; gap: 7px; padding-top: 10px; }
+.subtitle-review-transport {
+  min-height: 42px;
+  flex-wrap: wrap;
+  gap: 7px;
+}
 .subtitle-review-time-readout { color: var(--text-muted); font-family: Consolas, 'SFMono-Regular', monospace; font-size: 11px; }
 .subtitle-review-time-readout i { margin: 0 5px; color: var(--text-subtle); font-style: normal; }
 .settings-action.compact { min-height: 31px; padding: 5px 9px; font-size: 11px; }
@@ -2244,10 +2567,17 @@ onBeforeUnmount(() => {
   width: 100%;
   overflow: hidden;
   border: 1px solid var(--hairline);
-  border-radius: 10px;
+  border-radius: 9px;
 }
 
-.subtitle-review-cue-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-surface); }
+.subtitle-review-cue-pane {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg-surface) 92%, var(--bg));
+}
 
 .subtitle-review-cue-toolbar {
   min-height: 49px;
@@ -2400,7 +2730,11 @@ onBeforeUnmount(() => {
 @keyframes subtitle-review-spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 1120px) {
-  .subtitle-review-main-grid { grid-template-columns: minmax(0, 1.15fr) minmax(330px, 0.85fr); }
+  .subtitle-review-main-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(330px, 390px);
+    height: clamp(620px, calc(100dvh - var(--titlebar-h) - 210px), 860px);
+    min-height: 620px;
+  }
   .subtitle-review-transport .settings-action span { display: none; }
 }
 
