@@ -15,13 +15,14 @@
           <h1 class="page-title">{{ pageTitle }}</h1>
           <div class="youtube-monitor-status-line" :class="toolStatusClass">
             <span class="translate-status-dot" :class="toolStatusDotClass" aria-hidden="true" />
-            <span :title="ytdlpStatus.resolvedPath">{{ ytdlpStatus.message }}</span>
+            <span :title="toolStatusTitle">{{ toolStatusMessage }}</span>
           </div>
         </div>
       </div>
 
       <div v-if="isDetailView && activeTask" class="translate-actions home-header-actions">
         <button
+          v-if="!isActiveTaskLocal"
           class="settings-action youtube-monitor-action primary"
           type="button"
           :disabled="isRefreshingDetail || !ytdlpStatus.isAvailable"
@@ -138,28 +139,34 @@
                 v-for="task in filteredTasks"
                 :key="task.id"
                 class="home-task-row"
+                :class="{ local: isLocalTask(task) }"
                 :to="{ name: 'HomeTaskDetail', params: { taskId: task.id } }"
-                :aria-label="`查看待办任务：${task.title || task.url}`"
+                :aria-label="`查看待办任务：${taskDisplayTitle(task)}`"
                 role="row"
               >
                 <span class="home-task-thumb" role="cell">
                   <img v-if="displayThumbnailUrl(task)" :src="displayThumbnailUrl(task)" alt="" />
+                  <Film v-else-if="isLocalTask(task)" :stroke-width="2.1" aria-hidden="true" />
                   <Video v-else :stroke-width="2.1" aria-hidden="true" />
                 </span>
 
                 <span class="home-task-main" role="cell">
-                  <span class="home-task-title">{{ task.title || '待读取视频详情' }}</span>
-                  <span class="home-task-url">{{ task.webpageUrl || task.url }}</span>
+                  <span class="home-task-title">
+                    <span class="home-task-title-text">{{ taskDisplayTitle(task) }}</span>
+                    <span v-if="isLocalTask(task)" class="home-task-source-pill">本地</span>
+                  </span>
+                  <span class="home-task-url">{{ taskSecondaryText(task) }}</span>
                 </span>
 
                 <span class="home-task-channel" role="cell">
-                  <span class="youtube-channel-meta-label">博主</span>
-                  <span>{{ task.channelTitle || '--' }}</span>
+                  <span class="youtube-channel-meta-label">{{ isLocalTask(task) ? '来源' : '博主' }}</span>
+                  <span>{{ taskSourceText(task) }}</span>
                 </span>
 
                 <span class="youtube-video-meta" role="cell">
-                  <Clock :stroke-width="2.1" aria-hidden="true" />
-                  {{ formatDuration(task.duration) }}
+                  <FileCheck2 v-if="isLocalTask(task)" :stroke-width="2.1" aria-hidden="true" />
+                  <Clock v-else :stroke-width="2.1" aria-hidden="true" />
+                  {{ taskListMeta(task) }}
                 </span>
 
                 <span class="youtube-video-status" :class="taskStatusClass(task)" role="cell">
@@ -208,8 +215,46 @@
               </div>
             </div>
 
-            <div class="settings-panel home-detail-panel">
-              <div class="home-video-overview">
+            <div class="settings-panel home-detail-panel" :class="{ local: isActiveTaskLocal }">
+              <div v-if="isActiveTaskLocal" class="home-local-overview">
+                <div class="home-local-file-head">
+                  <span class="home-local-file-icon" aria-hidden="true">
+                    <Film :stroke-width="2.1" />
+                  </span>
+                  <div class="home-local-file-copy">
+                    <div class="home-local-file-title-line">
+                      <h2>{{ activeLocalFileName }}</h2>
+                      <span class="youtube-video-status" :class="taskStatusClass(activeTask)">
+                        {{ taskStatusLabel(activeTask) }}
+                      </span>
+                    </div>
+                    <span class="home-local-file-path" :title="activeLocalOriginalPath || activeLocalCachedPath">
+                      {{ activeLocalOriginalPath || activeLocalCachedPath }}
+                    </span>
+                  </div>
+                </div>
+
+                <div class="home-local-file-grid" aria-label="本地视频文件信息">
+                  <div class="home-local-file-stat">
+                    <span class="youtube-channel-meta-label">格式</span>
+                    <span>{{ activeLocalFormat }}</span>
+                  </div>
+                  <div class="home-local-file-stat">
+                    <span class="youtube-channel-meta-label">大小</span>
+                    <span>{{ activeLocalSize }}</span>
+                  </div>
+                  <div class="home-local-file-stat wide">
+                    <span class="youtube-channel-meta-label">缓存位置</span>
+                    <span :title="activeLocalCachedPath">{{ activeLocalCachedPath }}</span>
+                  </div>
+                  <div class="home-local-file-stat">
+                    <span class="youtube-channel-meta-label">加入时间</span>
+                    <span>{{ formatDateTime(activeTask.createdAt) }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="home-video-overview">
                 <div ref="videoSideRef" class="home-video-side">
                   <div class="home-video-cover">
                     <img v-if="displayThumbnailUrl(activeTask)" :src="displayThumbnailUrl(activeTask)" alt="" />
@@ -257,11 +302,10 @@
                   </p>
                 </div>
               </div>
-
             </div>
           </section>
 
-          <section class="settings-section" aria-labelledby="home-video-download-title">
+          <section v-if="!isActiveTaskLocal" class="settings-section" aria-labelledby="home-video-download-title">
             <div id="home-video-download-title" class="section-heading">
               <Video aria-hidden="true" />
               <span>视频文件</span>
@@ -356,7 +400,7 @@
             </div>
           </section>
 
-          <section class="settings-section" aria-labelledby="home-subtitle-options-title">
+          <section v-if="!isActiveTaskLocal" class="settings-section" aria-labelledby="home-subtitle-options-title">
             <div id="home-subtitle-options-title" class="section-heading">
               <Captions aria-hidden="true" />
               <span>字幕文件</span>
@@ -1004,7 +1048,22 @@
           <h2 id="home-add-dialog-title" class="dialog-title">添加视频</h2>
 
           <div class="settings-panel home-add-panel dialog-panel">
-            <label class="home-url-field">
+            <div class="home-add-source-toggle" role="group" aria-label="视频来源">
+              <button
+                v-for="option in addVideoSourceOptions"
+                :key="option.value"
+                class="home-add-source-button"
+                :class="{ active: addVideoSource === option.value }"
+                type="button"
+                :aria-pressed="addVideoSource === option.value"
+                @click="selectAddVideoSource(option.value)"
+              >
+                <component :is="option.icon" :stroke-width="2.1" aria-hidden="true" />
+                <span>{{ option.label }}</span>
+              </button>
+            </div>
+
+            <label v-if="addVideoSource === AddVideoSource.Youtube" class="home-url-field">
               <Link2 :stroke-width="2.1" aria-hidden="true" />
               <input
                 v-model="draftUrl"
@@ -1018,6 +1077,22 @@
                 @keydown.enter.prevent="addTaskFromInput"
               />
             </label>
+
+            <div v-else class="home-local-picker">
+              <span class="home-local-picker-icon" aria-hidden="true">
+                <Film :stroke-width="2.1" />
+              </span>
+              <span class="home-local-picker-copy">
+                <span class="home-local-picker-title">{{ draftLocalVideoName }}</span>
+                <span class="home-local-picker-path" :title="draftLocalVideoPath">
+                  {{ draftLocalVideoPath || '选择 MP4、MOV、MKV、AVI、FLV、WMV、WEBM 或 M4V 视频文件' }}
+                </span>
+              </span>
+              <button class="settings-action youtube-monitor-action" type="button" @click="selectLocalVideoFile">
+                <FolderOpen :stroke-width="2.1" aria-hidden="true" />
+                <span>选择文件</span>
+              </button>
+            </div>
           </div>
 
           <div v-if="addError" class="translate-alert" role="alert">
@@ -1030,12 +1105,12 @@
             <button
               class="settings-action youtube-monitor-action primary"
               type="button"
-              :disabled="isAddingTask || !draftUrl.trim()"
+              :disabled="isAddingTask || !canSubmitAddTask"
               @click="addTaskFromInput"
             >
               <LoaderCircle v-if="isAddingTask" class="spinning" :stroke-width="2.1" aria-hidden="true" />
               <Plus v-else :stroke-width="2.1" aria-hidden="true" />
-              <span>{{ isAddingTask ? '添加中' : '加入待办' }}</span>
+              <span>{{ isAddingTask ? '添加中' : addTaskSubmitLabel }}</span>
             </button>
           </div>
         </section>
@@ -1412,6 +1487,7 @@ import {
 defineOptions({ name: 'Home' })
 
 type TaskStatusFilter = 'all' | 'pending' | 'ready' | 'failed'
+type HomeTaskSourceKind = 'youtube' | 'local'
 type DownloadProgressStatus = 'active' | 'done' | 'failed'
 type DownloadProgressKind = 'video' | 'subtitle'
 type WorkbenchStatus = 'idle' | 'running' | 'done' | 'failed' | 'interrupted'
@@ -1440,6 +1516,11 @@ enum WorkbenchParameterPanel {
   Translation = 'translation',
   Dubbing = 'dubbing',
   Export = 'export',
+}
+
+enum AddVideoSource {
+  Youtube = 'youtube',
+  Local = 'local',
 }
 
 type DialogOption = {
@@ -1510,6 +1591,7 @@ type HomeVideoDownloadProgress = {
 type HomeVideoTask = {
   id: string
   url: string
+  sourceKind: HomeTaskSourceKind
   sourceChannelId: string
   sourceVideoId: string
   externalId: string
@@ -1721,6 +1803,8 @@ const ytdlpStatus = ref<YtdlpStatus>({
   configPolicy: 'ignoreConfig',
 })
 const draftUrl = ref('')
+const draftLocalVideoPath = ref('')
+const addVideoSource = ref<AddVideoSource>(AddVideoSource.Youtube)
 const taskQuery = ref('')
 const taskFilter = ref<TaskStatusFilter>('all')
 const isLoadingTasks = ref(false)
@@ -1800,6 +1884,12 @@ const taskFilterOptions: { value: TaskStatusFilter; label: string }[] = [
   { value: 'failed', label: '异常' },
 ]
 
+const localVideoExtensions = ['mp4', 'mov', 'mkv', 'avi', 'flv', 'wmv', 'webm', 'm4v']
+const addVideoSourceOptions = [
+  { value: AddVideoSource.Youtube, label: 'YouTube 地址', icon: Link2 },
+  { value: AddVideoSource.Local, label: '本地视频', icon: Film },
+]
+
 const workbenchTranscribeOption: DialogOption = { value: 'transcribe', label: '自动转录' }
 const workbenchDownloadedSubtitleOption: DialogOption = { value: 'downloaded', label: '使用最新已下载字幕' }
 
@@ -1814,12 +1904,14 @@ const isDetailView = computed(() => Boolean(activeTaskId.value))
 
 const activeTask = computed(() => tasks.value.find((task) => task.id === activeTaskId.value) ?? null)
 
+const isActiveTaskLocal = computed(() => isLocalTask(activeTask.value))
+
 const pageTitle = computed(() => {
   if (!isDetailView.value) {
     return '主页'
   }
 
-  return activeTask.value?.title || '视频详情'
+  return activeTask.value ? taskDisplayTitle(activeTask.value) : '视频详情'
 })
 
 const filteredTasks = computed(() => {
@@ -1836,7 +1928,10 @@ const filteredTasks = computed(() => {
       task.title.toLowerCase().includes(query) ||
       task.channelTitle.toLowerCase().includes(query) ||
       task.url.toLowerCase().includes(query) ||
-      task.webpageUrl.toLowerCase().includes(query)
+      task.webpageUrl.toLowerCase().includes(query) ||
+      taskLocalFileName(task).toLowerCase().includes(query) ||
+      taskLocalOriginalPath(task).toLowerCase().includes(query) ||
+      taskLocalCachedPath(task).toLowerCase().includes(query)
 
     return matchesStatus && matchesQuery
   })
@@ -1850,16 +1945,66 @@ const subtitleCount = computed(() => {
   return tasks.value.reduce((total, task) => total + task.downloadedSubtitles.length, 0)
 })
 
+const draftLocalVideoName = computed(() =>
+  draftLocalVideoPath.value ? fileNameFromPath(draftLocalVideoPath.value) : '尚未选择本地视频',
+)
+
+const canSubmitAddTask = computed(() => {
+  if (addVideoSource.value === AddVideoSource.Local) {
+    return Boolean(draftLocalVideoPath.value)
+  }
+  return Boolean(draftUrl.value.trim())
+})
+
+const addTaskSubmitLabel = computed(() =>
+  addVideoSource.value === AddVideoSource.Local ? '加入工作台' : '加入待办',
+)
+
+const activeLocalFileName = computed(() => (activeTask.value ? taskLocalFileName(activeTask.value) : '本地视频'))
+const activeLocalCachedPath = computed(() => (activeTask.value ? taskLocalCachedPath(activeTask.value) : ''))
+const activeLocalOriginalPath = computed(() => (activeTask.value ? taskLocalOriginalPath(activeTask.value) : ''))
+const activeLocalFormat = computed(() => {
+  const task = activeTask.value
+  if (!task) {
+    return '--'
+  }
+  return taskLocalFormat(task).toUpperCase() || '--'
+})
+const activeLocalSize = computed(() => {
+  const task = activeTask.value
+  if (!task) {
+    return '--'
+  }
+  return formatFileSize(taskLocalFileSize(task))
+})
+
 const toolStatusClass = computed(() => ({
-  ready: ytdlpStatus.value.isAvailable,
-  error: !ytdlpStatus.value.isAvailable,
+  ready: isActiveTaskLocal.value || ytdlpStatus.value.isAvailable,
+  error: !isActiveTaskLocal.value && !ytdlpStatus.value.isAvailable,
 }))
 
-const toolStatusDotClass = computed(() => (ytdlpStatus.value.isAvailable ? 'success' : 'error'))
+const toolStatusDotClass = computed(() => (isActiveTaskLocal.value || ytdlpStatus.value.isAvailable ? 'success' : 'error'))
+
+const toolStatusMessage = computed(() => {
+  if (isActiveTaskLocal.value) {
+    return '本地视频已就绪'
+  }
+  return ytdlpStatus.value.message
+})
+
+const toolStatusTitle = computed(() => {
+  if (isActiveTaskLocal.value) {
+    return activeLocalCachedPath.value || activeLocalOriginalPath.value
+  }
+  return ytdlpStatus.value.resolvedPath
+})
 
 const detailMessage = computed(() => {
   if (!activeTask.value) {
     return ''
+  }
+  if (isActiveTaskLocal.value) {
+    return activeTask.value.downloadedVideo ? '本地视频已加入任务' : '本地视频缓存不存在，请重新添加'
   }
   if (isRefreshingDetail.value || activeTask.value.detailStatus === 'loading') {
     return '正在使用 yt-dlp 读取视频详情'
@@ -1877,8 +2022,10 @@ const detailMessage = computed(() => {
 })
 
 const detailMessageClass = computed(() => ({
-  error: Boolean(activeTask.value?.errorMessage),
-  ready: activeTask.value?.detailStatus === 'ready' && !activeTask.value?.errorMessage,
+  error: isActiveTaskLocal.value ? !activeTask.value?.downloadedVideo : Boolean(activeTask.value?.errorMessage),
+  ready: isActiveTaskLocal.value
+    ? Boolean(activeTask.value?.downloadedVideo)
+    : activeTask.value?.detailStatus === 'ready' && !activeTask.value?.errorMessage,
 }))
 
 const subtitleEmptyText = computed(() => {
@@ -2043,7 +2190,7 @@ const deleteTargetLabel = computed(() => {
     return '该待办任务'
   }
 
-  return task.title || task.webpageUrl || task.url
+  return taskDisplayTitle(task) || taskSecondaryText(task)
 })
 
 const isWorkbenchRunning = computed(() => isWorkbenchStarting.value || workbenchSnapshot.value?.status === 'running')
@@ -2117,7 +2264,13 @@ const workbenchStatusDotClass = computed(() => {
 })
 
 const canStartWorkbench = computed(() => {
-  return Boolean(activeTask.value && ytdlpStatus.value.isAvailable && !isWorkbenchRunning.value && !isWorkbenchLoading.value)
+  if (!activeTask.value || isWorkbenchRunning.value || isWorkbenchLoading.value) {
+    return false
+  }
+  if (isActiveTaskLocal.value) {
+    return Boolean(activeTask.value.downloadedVideo)
+  }
+  return ytdlpStatus.value.isAvailable
 })
 
 const workbenchTranscriptionModelLabel = computed(() =>
@@ -2738,7 +2891,8 @@ const saveWorkbenchOptions = async () => {
 
 const addTaskFromInput = async () => {
   const url = draftUrl.value.trim()
-  if (!url || isAddingTask.value || !isTauriRuntime()) {
+  const filePath = draftLocalVideoPath.value.trim()
+  if (!canSubmitAddTask.value || isAddingTask.value || !isTauriRuntime()) {
     return
   }
 
@@ -2747,12 +2901,33 @@ const addTaskFromInput = async () => {
 
   try {
     const task = await invoke<HomeVideoTask>('add_home_video_task', {
-      request: { url },
+      request:
+        addVideoSource.value === AddVideoSource.Local
+          ? { sourceKind: 'local', filePath }
+          : { sourceKind: 'youtube', url },
     })
     upsertTask(task)
-    draftUrl.value = ''
+
+    let snapshot: HomeWorkbenchSnapshot | null = null
+    if (isLocalTask(task)) {
+      try {
+        snapshot = await invoke<HomeWorkbenchSnapshot>('add_home_workbench_video_input', {
+          request: { taskId: task.id },
+        })
+      } catch (error) {
+        pageError.value = stringifyError(error, '添加本地视频到工作台失败')
+      }
+    }
+
+    resetAddDrafts()
     await router.push({ name: 'HomeTaskDetail', params: { taskId: task.id } })
-    maybeAutoRefreshActiveTask()
+    if (snapshot) {
+      applyWorkbenchSnapshot(snapshot)
+    } else if (isLocalTask(task)) {
+      await loadWorkbenchSnapshot()
+    } else {
+      maybeAutoRefreshActiveTask()
+    }
   } catch (error) {
     addError.value = stringifyError(error, '添加待办任务失败')
   } finally {
@@ -2764,7 +2939,7 @@ const addTaskFromInput = async () => {
 }
 
 const maybeAutoRefreshActiveTask = () => {
-  if (!activeTask.value || !ytdlpStatus.value.isAvailable || isRefreshingDetail.value) {
+  if (!activeTask.value || isActiveTaskLocal.value || !ytdlpStatus.value.isAvailable || isRefreshingDetail.value) {
     return
   }
   const status = normalizedTaskStatus(activeTask.value)
@@ -2781,7 +2956,7 @@ const maybeAutoRefreshActiveTask = () => {
 }
 
 const refreshActiveTaskDetail = async () => {
-  if (!activeTask.value || isRefreshingDetail.value || !isTauriRuntime()) {
+  if (!activeTask.value || isActiveTaskLocal.value || isRefreshingDetail.value || !isTauriRuntime()) {
     return
   }
 
@@ -3614,8 +3789,58 @@ const goBackToQueue = async () => {
   await router.push({ name: 'Home' })
 }
 
-const openAddDialog = () => {
+const selectAddVideoSource = (source: AddVideoSource) => {
+  addVideoSource.value = source
+  addError.value = ''
+}
+
+const resetAddDrafts = () => {
   draftUrl.value = ''
+  draftLocalVideoPath.value = ''
+  addVideoSource.value = AddVideoSource.Youtube
+}
+
+const selectLocalVideoFile = async () => {
+  if (!isTauriRuntime()) {
+    addError.value = '请在桌面应用中选择本地视频'
+    return
+  }
+
+  try {
+    const selected = await open({
+      title: '选择本地视频',
+      multiple: false,
+      filters: [
+        {
+          name: '视频文件',
+          extensions: localVideoExtensions,
+        },
+      ],
+    })
+
+    if (typeof selected !== 'string') {
+      return
+    }
+
+    applyLocalVideoFile(selected)
+  } catch (error) {
+    addError.value = stringifyError(error, '选择本地视频失败')
+  }
+}
+
+const applyLocalVideoFile = (path: string) => {
+  const extension = fileExtension(path)
+  if (!localVideoExtensions.includes(extension)) {
+    addError.value = '请选择 MP4、MOV、MKV、AVI、FLV、WMV、WEBM 或 M4V 视频文件'
+    return
+  }
+
+  draftLocalVideoPath.value = path
+  addError.value = ''
+}
+
+const openAddDialog = () => {
+  resetAddDrafts()
   addError.value = ''
   isAddDialogOpen.value = true
 }
@@ -3625,6 +3850,7 @@ const closeAddDialog = () => {
     return
   }
   isAddDialogOpen.value = false
+  addError.value = ''
 }
 
 const openDeleteDialog = (task: HomeVideoTask) => {
@@ -3661,9 +3887,66 @@ const handleKeydown = (event: KeyboardEvent) => {
   closeDeleteDialog()
 }
 
+const isLocalTask = (task?: HomeVideoTask | null) => task?.sourceKind === 'local'
+
+const taskDisplayTitle = (task: HomeVideoTask) => {
+  if (isLocalTask(task)) {
+    return taskLocalFileName(task)
+  }
+  return task.title || '待读取视频详情'
+}
+
+const taskSecondaryText = (task: HomeVideoTask) => {
+  if (isLocalTask(task)) {
+    return taskLocalOriginalPath(task) || taskLocalCachedPath(task) || '本地视频'
+  }
+  return task.webpageUrl || task.url
+}
+
+const taskSourceText = (task: HomeVideoTask) => {
+  return isLocalTask(task) ? '本地视频' : task.channelTitle || '--'
+}
+
+const taskListMeta = (task: HomeVideoTask) => {
+  return isLocalTask(task) ? formatFileSize(taskLocalFileSize(task)) : formatDuration(task.duration)
+}
+
+const taskLocalFileName = (task: HomeVideoTask) => {
+  const metadata = readRecordValue(task.metadata)
+  return (
+    task.downloadedVideo?.fileName ||
+    readStringValue(metadata.fileName) ||
+    fileNameFromPath(taskLocalOriginalPath(task)) ||
+    task.title ||
+    '本地视频'
+  )
+}
+
+const taskLocalOriginalPath = (task: HomeVideoTask) => {
+  return readStringValue(readRecordValue(task.metadata).originalPath)
+}
+
+const taskLocalCachedPath = (task: HomeVideoTask) => {
+  const metadata = readRecordValue(task.metadata)
+  return task.downloadedVideo?.filePath || readStringValue(metadata.cachedPath)
+}
+
+const taskLocalFormat = (task: HomeVideoTask) => {
+  const metadata = readRecordValue(task.metadata)
+  return task.downloadedVideo?.format || readStringValue(metadata.format) || fileExtension(taskLocalFileName(task))
+}
+
+const taskLocalFileSize = (task: HomeVideoTask) => {
+  const metadata = readRecordValue(task.metadata)
+  return task.downloadedVideo?.fileSize || readNumberValue(metadata.fileSize) || 0
+}
+
 const normalizedTaskStatus = (task: HomeVideoTask) => task.detailStatus || 'pending'
 
 const taskStatusLabel = (task: HomeVideoTask) => {
+  if (isLocalTask(task)) {
+    return task.downloadedVideo ? '已就绪' : '缓存缺失'
+  }
   const status = normalizedTaskStatus(task)
   if (status === 'loading') {
     return '读取中'
@@ -3678,9 +3961,9 @@ const taskStatusLabel = (task: HomeVideoTask) => {
 }
 
 const taskStatusClass = (task: HomeVideoTask) => ({
-  unread: normalizedTaskStatus(task) === 'ready',
-  checking: normalizedTaskStatus(task) === 'loading',
-  failed: normalizedTaskStatus(task) === 'failed',
+  unread: isLocalTask(task) ? Boolean(task.downloadedVideo) : normalizedTaskStatus(task) === 'ready',
+  checking: !isLocalTask(task) && normalizedTaskStatus(task) === 'loading',
+  failed: isLocalTask(task) ? !task.downloadedVideo : normalizedTaskStatus(task) === 'failed',
 })
 
 const normalizeWorkbenchOptions = (options: HomeWorkbenchOptions): HomeWorkbenchOptions => {
@@ -4024,6 +4307,17 @@ const formatSegmentTime = (ms: number) => {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds
     .toString()
     .padStart(2, '0')}.${millis.toString().padStart(3, '0')}`
+}
+
+const fileNameFromPath = (path: string) => {
+  const normalized = path.replace(/\\/g, '/')
+  return normalized.split('/').filter(Boolean).pop() || path
+}
+
+const fileExtension = (path: string) => {
+  const fileName = fileNameFromPath(path)
+  const index = fileName.lastIndexOf('.')
+  return index >= 0 ? fileName.slice(index + 1).toLowerCase() : ''
 }
 
 const formatDuration = (duration?: number | null) => {

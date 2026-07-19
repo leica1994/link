@@ -26,8 +26,12 @@ const DETAIL_STATUS_PENDING: &str = "pending";
 const DETAIL_STATUS_LOADING: &str = "loading";
 const DETAIL_STATUS_READY: &str = "ready";
 const DETAIL_STATUS_FAILED: &str = "failed";
+const TASK_SOURCE_YOUTUBE: &str = "youtube";
+const TASK_SOURCE_LOCAL: &str = "local";
+const LOCAL_TASK_URL_PREFIX: &str = "local:";
 const SUBTITLE_SOURCE_MANUAL: &str = "manual";
 const SUBTITLE_SOURCE_AUTOMATIC: &str = "automatic";
+const LOCAL_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "flv", "wmv", "webm", "m4v"];
 const THUMBNAIL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const MAX_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 const HOME_VIDEO_DOWNLOAD_PROGRESS_EVENT: &str = "home-video-download-progress";
@@ -47,6 +51,7 @@ const YTDLP_POSTPROCESS_PROGRESS_TEMPLATE: &str =
 pub struct HomeVideoTask {
     pub id: String,
     pub url: String,
+    pub source_kind: String,
     pub source_channel_id: String,
     pub source_video_id: String,
     pub external_id: String,
@@ -123,7 +128,9 @@ pub struct HomeVideoPartialDownload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddHomeVideoTaskRequest {
-    pub url: String,
+    pub source_kind: Option<String>,
+    pub url: Option<String>,
+    pub file_path: Option<String>,
     pub title: Option<String>,
     pub source_channel_id: Option<String>,
     pub source_video_id: Option<String>,
@@ -361,7 +368,20 @@ pub fn add_home_video_task(
     app_logger: tauri::State<'_, AppLogger>,
     request: AddHomeVideoTaskRequest,
 ) -> Result<HomeVideoTask, String> {
-    let url = normalize_youtube_video_url(&request.url)?;
+    let source_kind = normalize_task_source_kind(request.source_kind.as_deref());
+    if source_kind == TASK_SOURCE_LOCAL {
+        return add_local_home_video_task(&store, &app_logger, request);
+    }
+
+    add_youtube_home_video_task(&store, &app_logger, request)
+}
+
+fn add_youtube_home_video_task(
+    store: &SettingsStore,
+    app_logger: &AppLogger,
+    request: AddHomeVideoTaskRequest,
+) -> Result<HomeVideoTask, String> {
+    let url = normalize_youtube_video_url(request.url.as_deref().unwrap_or_default())?;
     let title = request.title.unwrap_or_default();
     let source_channel_id = request.source_channel_id.unwrap_or_default();
     let source_video_id = request.source_video_id.unwrap_or_default();
@@ -420,14 +440,15 @@ pub fn add_home_video_task(
             .execute(
                 "
                 INSERT INTO home_video_tasks (
-                    id, url, source_channel_id, source_video_id, external_id, title,
+                    id, url, source_kind, source_channel_id, source_video_id, external_id, title,
                     detail_status, subtitle_options, metadata, created_at, updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', '{}', ?8, ?9)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', '{}', ?9, ?10)
                 ",
                 params![
                     &id,
                     &url,
+                    TASK_SOURCE_YOUTUBE,
                     &source_channel_id,
                     &source_video_id,
                     &external_id,
@@ -466,6 +487,190 @@ pub fn add_home_video_task(
             Err(error)
         }
     }
+}
+
+fn add_local_home_video_task(
+    store: &SettingsStore,
+    app_logger: &AppLogger,
+    request: AddHomeVideoTaskRequest,
+) -> Result<HomeVideoTask, String> {
+    let source_path_text = request
+        .file_path
+        .as_deref()
+        .or(request.url.as_deref())
+        .unwrap_or_default()
+        .trim();
+    if source_path_text.is_empty() {
+        return Err("请选择本地视频文件".to_string());
+    }
+
+    let source_path = fs::canonicalize(source_path_text)
+        .map_err(|error| format!("无法读取本地视频文件: {error}"))?;
+    let source_metadata =
+        fs::metadata(&source_path).map_err(|error| format!("无法读取本地视频文件: {error}"))?;
+    if !source_metadata.is_file() {
+        return Err("请选择本地视频文件".to_string());
+    }
+
+    let format = file_extension(&source_path).ok_or_else(|| "请选择支持的视频文件".to_string())?;
+    if !LOCAL_VIDEO_EXTENSIONS.contains(&format.as_str()) {
+        return Err("请选择 MP4、MOV、MKV、AVI、FLV、WMV、WEBM 或 M4V 视频文件".to_string());
+    }
+
+    let file_name = source_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "无法读取本地视频文件名".to_string())?;
+    let title = request
+        .title
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            source_path
+                .file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| file_name.clone())
+        });
+    let source_path_string = source_path.to_string_lossy().to_string();
+    let local_url = format!("{LOCAL_TASK_URL_PREFIX}{source_path_string}");
+
+    app_logger.info(
+        "home_tasks",
+        "local_task_add_start",
+        "开始添加本地视频任务",
+        json!({
+            "path": &source_path_string,
+            "fileName": &file_name,
+            "format": &format,
+        }),
+    );
+
+    if let Some(existing_id) = store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT id FROM home_video_tasks WHERE url = ?1 LIMIT 1",
+                params![&local_url],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法检查本地视频任务: {error}"))
+    })? {
+        return store
+            .with_connection(|connection| read_home_video_task_by_id(connection, &existing_id));
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let output = copy_local_video_to_task_cache(&id, &source_path, &file_name, &format)?;
+    let now = Utc::now().to_rfc3339();
+    let cached_path_string = output.path.to_string_lossy().to_string();
+    let metadata = serde_json::to_string(&json!({
+        "source": TASK_SOURCE_LOCAL,
+        "originalPath": &source_path_string,
+        "cachedPath": &cached_path_string,
+        "fileName": &output.file_name,
+        "format": &output.format,
+        "fileSize": output.file_size,
+        "addedAt": &now,
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+
+    let result = store.with_connection(|connection| {
+        connection
+            .execute(
+                "
+                INSERT INTO home_video_tasks (
+                    id, url, source_kind, title, detail_status, subtitle_options, metadata,
+                    error_message, created_at, updated_at, detail_checked_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, '', ?7, ?8, ?9)
+                ",
+                params![
+                    &id,
+                    &local_url,
+                    TASK_SOURCE_LOCAL,
+                    &title,
+                    DETAIL_STATUS_READY,
+                    &metadata,
+                    &now,
+                    &now,
+                    &now,
+                ],
+            )
+            .map_err(|error| format!("无法添加本地视频任务: {error}"))?;
+        upsert_home_video_download(connection, &id, output, &now)?;
+        read_home_video_task_by_id(connection, &id)
+    });
+
+    match result {
+        Ok(task) => {
+            app_logger.info(
+                "home_tasks",
+                "local_task_add_success",
+                "本地视频任务已添加",
+                json!({
+                    "taskId": &task.id,
+                    "fileName": &file_name,
+                    "format": &format,
+                }),
+            );
+            Ok(task)
+        }
+        Err(error) => {
+            let _ = remove_home_task_dir(&id);
+            app_logger.error(
+                "home_tasks",
+                "local_task_add_failed",
+                "添加本地视频任务失败",
+                json!({ "path": &source_path_string, "error": &error }),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn copy_local_video_to_task_cache(
+    task_id: &str,
+    source_path: &Path,
+    file_name: &str,
+    format: &str,
+) -> Result<VideoDownloadOutput, String> {
+    let task_dir = app_paths::youtube_task_dir(task_id)?;
+    let videos_dir = task_dir.join("videos");
+    fs::create_dir_all(&videos_dir).map_err(|error| format!("无法创建视频目录: {error}"))?;
+    let output_path = videos_dir.join(file_name);
+    fs::copy(source_path, &output_path).map_err(|error| format!("无法复制本地视频: {error}"))?;
+    let file_size = fs::metadata(&output_path)
+        .map_err(|error| format!("无法读取本地视频缓存: {error}"))?
+        .len()
+        .try_into()
+        .map_err(|_| "本地视频文件过大".to_string())?;
+
+    Ok(VideoDownloadOutput {
+        path: output_path,
+        file_name: file_name.to_string(),
+        format: format.to_string(),
+        file_size,
+    })
+}
+
+fn normalize_task_source_kind(value: Option<&str>) -> String {
+    match value
+        .unwrap_or(TASK_SOURCE_YOUTUBE)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        TASK_SOURCE_LOCAL => TASK_SOURCE_LOCAL.to_string(),
+        _ => TASK_SOURCE_YOUTUBE.to_string(),
+    }
+}
+
+fn file_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
 }
 
 #[tauri::command]
@@ -652,6 +857,9 @@ fn refresh_home_video_task_detail_blocking(
     let store = app.state::<SettingsStore>();
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
+    if task.source_kind == TASK_SOURCE_LOCAL {
+        return Ok(task);
+    }
     let settings = store.load()?;
     let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let now = Utc::now().to_rfc3339();
@@ -813,6 +1021,9 @@ pub(crate) fn download_home_video_task_subtitle_internal(
     let store = app.state::<SettingsStore>();
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
+    if task.source_kind == TASK_SOURCE_LOCAL {
+        return Err("本地视频没有可下载字幕".to_string());
+    }
     let source_kind = normalize_subtitle_source_kind(&request.source_kind);
     let option = task
         .subtitle_options
@@ -912,6 +1123,16 @@ pub(crate) fn download_home_video_task_video_internal(
     let store = app.state::<SettingsStore>();
     let task = store
         .with_connection(|connection| read_home_video_task_by_id(connection, &request.task_id))?;
+    if task.source_kind == TASK_SOURCE_LOCAL {
+        if task
+            .downloaded_video
+            .as_ref()
+            .is_some_and(|video| Path::new(&video.file_path).is_file())
+        {
+            return Ok(task);
+        }
+        return Err("本地视频缓存不存在，请重新添加该视频".to_string());
+    }
     let settings = store.load()?;
     let ytdlp_config = ytdlp::YtdlpConfig::new(settings.ytdlp_proxy.clone());
     let task_dir = app_paths::youtube_task_dir(&task.id)?;
@@ -1011,7 +1232,7 @@ fn read_home_video_tasks(connection: &rusqlite::Connection) -> Result<Vec<HomeVi
     let mut statement = connection
         .prepare(
             "
-            SELECT id, url, source_channel_id, source_video_id, external_id, title,
+            SELECT id, url, source_kind, source_channel_id, source_video_id, external_id, title,
                    channel_title, channel_url, thumbnail_url, duration, webpage_url,
                    description, view_count, like_count, comment_count, upload_date,
                    detail_status, subtitle_options, metadata, error_message,
@@ -1044,7 +1265,7 @@ pub(crate) fn read_home_video_task_by_id(
     let mut task = connection
         .query_row(
             "
-            SELECT id, url, source_channel_id, source_video_id, external_id, title,
+            SELECT id, url, source_kind, source_channel_id, source_video_id, external_id, title,
                    channel_title, channel_url, thumbnail_url, duration, webpage_url,
                    description, view_count, like_count, comment_count, upload_date,
                    detail_status, subtitle_options, metadata, error_message,
@@ -1155,8 +1376,8 @@ fn remove_home_task_dir(task_id: &str) -> Result<(), String> {
 }
 
 fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {
-    let subtitle_options_text: String = row.get(17)?;
-    let metadata_text: String = row.get(18)?;
+    let subtitle_options_text: String = row.get(18)?;
+    let metadata_text: String = row.get(19)?;
     let mut subtitle_options =
         serde_json::from_str::<Vec<HomeVideoSubtitleOption>>(&subtitle_options_text)
             .unwrap_or_default();
@@ -1166,27 +1387,28 @@ fn map_home_video_task(row: &Row<'_>) -> rusqlite::Result<HomeVideoTask> {
     Ok(HomeVideoTask {
         id: row.get(0)?,
         url: row.get(1)?,
-        source_channel_id: row.get(2)?,
-        source_video_id: row.get(3)?,
-        external_id: row.get(4)?,
-        title: row.get(5)?,
-        channel_title: row.get(6)?,
-        channel_url: row.get(7)?,
-        thumbnail_url: row.get(8)?,
-        duration: row.get(9)?,
-        webpage_url: row.get(10)?,
-        description: row.get(11)?,
-        view_count: row.get(12)?,
-        like_count: row.get(13)?,
-        comment_count: row.get(14)?,
-        upload_date: row.get(15)?,
-        detail_status: row.get(16)?,
+        source_kind: row.get(2)?,
+        source_channel_id: row.get(3)?,
+        source_video_id: row.get(4)?,
+        external_id: row.get(5)?,
+        title: row.get(6)?,
+        channel_title: row.get(7)?,
+        channel_url: row.get(8)?,
+        thumbnail_url: row.get(9)?,
+        duration: row.get(10)?,
+        webpage_url: row.get(11)?,
+        description: row.get(12)?,
+        view_count: row.get(13)?,
+        like_count: row.get(14)?,
+        comment_count: row.get(15)?,
+        upload_date: row.get(16)?,
+        detail_status: row.get(17)?,
         subtitle_options,
         metadata,
-        error_message: row.get(19)?,
-        created_at: row.get(20)?,
-        updated_at: row.get(21)?,
-        detail_checked_at: row.get(22)?,
+        error_message: row.get(20)?,
+        created_at: row.get(21)?,
+        updated_at: row.get(22)?,
+        detail_checked_at: row.get(23)?,
         downloaded_subtitles: Vec::new(),
         downloaded_video: None,
         partial_video: None,

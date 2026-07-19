@@ -758,6 +758,7 @@ html[data-theme='dark'] .reference-audio-file {
   .reference-audio-actions .settings-action {
     flex: 1 1 0;
   }
+
 }
 
 .language-search-field {
@@ -2233,6 +2234,46 @@ html[data-theme='dark'] .dubbing-danger-action:not(:disabled):hover {
   width: min(560px, calc(100vw - 56px));
 }
 
+.home-add-source-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.home-add-source-button {
+  min-width: 0;
+  height: 40px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.2);
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 850;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+html[data-theme='dark'] .home-add-source-button {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.home-add-source-button:hover,
+.home-add-source-button.active {
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--hairline));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.home-add-source-button svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
 .home-url-field {
   height: 40px;
   min-width: 0;
@@ -2275,6 +2316,68 @@ html[data-theme='dark'] .home-url-field {
 
 .home-url-field input::placeholder {
   color: var(--text-subtle);
+}
+
+.home-local-picker {
+  min-height: 64px;
+  min-width: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.2);
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+}
+
+html[data-theme='dark'] .home-local-picker {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.home-local-picker-icon {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.home-local-picker-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.home-local-picker-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.home-local-picker-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-local-picker-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .home-empty-copy {
@@ -2353,13 +2456,32 @@ html[data-theme='dark'] .home-task-thumb {
 
 .home-task-title {
   min-width: 0;
-  overflow: hidden;
   color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 15px;
   font-weight: 800;
   line-height: 1.2;
+}
+
+.home-task-title-text {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.home-task-source-pill {
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--hairline));
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 850;
+  line-height: 1.1;
 }
 
 .home-task-url,
@@ -2421,6 +2543,116 @@ html[data-theme='dark'] .home-delete-target {
 
 .home-detail-panel {
   padding: 20px;
+}
+
+.home-detail-panel.local {
+  padding: 18px;
+}
+
+.home-local-overview {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.home-local-file-head {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.home-local-file-icon {
+  width: 58px;
+  height: 58px;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.22);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+html[data-theme='dark'] .home-local-file-icon {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.home-local-file-icon svg {
+  width: 26px;
+  height: 26px;
+}
+
+.home-local-file-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.home-local-file-title-line {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.home-local-file-title-line h2 {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 850;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-local-file-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-local-file-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.home-local-file-stat {
+  min-width: 0;
+  min-height: 66px;
+  border-right: 1px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 7px;
+  padding: 11px 12px;
+}
+
+.home-local-file-stat:last-child {
+  border-right: 0;
+}
+
+.home-local-file-stat span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .home-video-overview {
@@ -4780,6 +5012,18 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
     grid-template-columns: 1fr;
   }
 
+  .home-local-file-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .home-local-file-stat:nth-child(even) {
+    border-right: 0;
+  }
+
+  .home-local-file-stat:nth-child(n + 3) {
+    border-top: 1px solid var(--hairline);
+  }
+
   .home-video-title-line {
     flex-direction: column;
   }
@@ -5254,5 +5498,29 @@ html[data-theme='dark'] .youtube-video-task-button:disabled:not(:has(.spinning))
   .dubbing-dialog-actions .settings-action {
     width: 100%;
     justify-self: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .home-add-source-toggle,
+  .home-local-picker {
+    grid-template-columns: 1fr;
+  }
+
+  .home-local-picker-icon {
+    display: none;
+  }
+
+  .home-local-file-head,
+  .home-local-file-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .home-local-file-stat {
+    border-right: 0;
+  }
+
+  .home-local-file-stat + .home-local-file-stat {
+    border-top: 1px solid var(--hairline);
   }
 }

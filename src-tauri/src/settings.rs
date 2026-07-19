@@ -834,6 +834,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             CREATE TABLE IF NOT EXISTS home_video_tasks (
                 id TEXT PRIMARY KEY NOT NULL,
                 url TEXT NOT NULL UNIQUE,
+                source_kind TEXT NOT NULL DEFAULT 'youtube',
                 source_channel_id TEXT NOT NULL DEFAULT '',
                 source_video_id TEXT NOT NULL DEFAULT '',
                 external_id TEXT NOT NULL DEFAULT '',
