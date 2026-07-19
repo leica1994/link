@@ -1084,8 +1084,12 @@
               </span>
               <span class="home-local-picker-copy">
                 <span class="home-local-picker-title">{{ draftLocalVideoName }}</span>
-                <span class="home-local-picker-path" :title="draftLocalVideoPath">
-                  {{ draftLocalVideoPath || '选择 MP4、MOV、MKV、AVI、FLV、WMV、WEBM 或 M4V 视频文件' }}
+                <span class="home-local-picker-path" :title="formatPathForDisplay(draftLocalVideoPath)">
+                  {{
+                    draftLocalVideoPath
+                      ? formatPathForDisplay(draftLocalVideoPath)
+                      : '选择 MP4、MOV、MKV、AVI、FLV、WMV、WEBM 或 M4V 视频文件'
+                  }}
                 </span>
               </span>
               <button class="settings-action youtube-monitor-action" type="button" @click="selectLocalVideoFile">
@@ -1462,6 +1466,7 @@ import {
 } from 'lucide-vue-next'
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
+import { formatPathForDisplay } from '../pathDisplay'
 import {
   AiSubtitleReviewMode,
   aiSubtitleReviewModeOptions,
@@ -1961,8 +1966,12 @@ const addTaskSubmitLabel = computed(() =>
 )
 
 const activeLocalFileName = computed(() => (activeTask.value ? taskLocalFileName(activeTask.value) : '本地视频'))
-const activeLocalCachedPath = computed(() => (activeTask.value ? taskLocalCachedPath(activeTask.value) : ''))
-const activeLocalOriginalPath = computed(() => (activeTask.value ? taskLocalOriginalPath(activeTask.value) : ''))
+const activeLocalCachedPath = computed(() =>
+  activeTask.value ? formatPathForDisplay(taskLocalCachedPath(activeTask.value)) : '',
+)
+const activeLocalOriginalPath = computed(() =>
+  activeTask.value ? formatPathForDisplay(taskLocalOriginalPath(activeTask.value)) : '',
+)
 const activeLocalFormat = computed(() => {
   const task = activeTask.value
   if (!task) {
@@ -3898,7 +3907,7 @@ const taskDisplayTitle = (task: HomeVideoTask) => {
 
 const taskSecondaryText = (task: HomeVideoTask) => {
   if (isLocalTask(task)) {
-    return taskLocalOriginalPath(task) || taskLocalCachedPath(task) || '本地视频'
+    return formatPathForDisplay(taskLocalOriginalPath(task) || taskLocalCachedPath(task)) || '本地视频'
   }
   return task.webpageUrl || task.url
 }
