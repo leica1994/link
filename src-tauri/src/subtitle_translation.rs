@@ -26,7 +26,7 @@ const PROGRESS_EVENT: &str = "subtitle-translation-progress";
 const MAX_TRANSLATION_SERVICE_ATTEMPTS: usize = 5;
 const FALLBACK_TRANSLATION_BATCH_SIZE: usize = 10;
 const MAX_AI_SUBTITLE_REVIEW_ATTEMPTS: usize = 3;
-pub(crate) const SUBTITLE_TRANSLATION_PIPELINE_VERSION: u32 = 3;
+pub(crate) const SUBTITLE_TRANSLATION_PIPELINE_VERSION: u32 = 4;
 pub(crate) const AI_SUBTITLE_REVIEW_PIPELINE_VERSION: u32 = 2;
 const REVIEW_CONTENT_PROGRESS_END: u8 = 35;
 const REVIEW_SOURCE_REFLOW_PROGRESS_END: u8 = 65;
@@ -2365,10 +2365,16 @@ async fn translate_chunk_by_llm(
                 }
             };
 
-        // Key 匹配校验
-        match validate_or_remap_relative_keys(&chunk.entries, parsed)
-            .and_then(|parsed| validate_translation_text_values(&parsed).map(|()| parsed))
-        {
+        // Key、非空和未翻译原文回显校验。
+        match validate_or_remap_relative_keys(&chunk.entries, parsed).and_then(|parsed| {
+            validate_translation_text_values(
+                &chunk.entries,
+                &parsed,
+                &settings.source_language,
+                &settings.target_language,
+            )
+            .map(|()| parsed)
+        }) {
             Ok(parsed) => {
                 let entries = parsed
                     .into_iter()
@@ -2785,7 +2791,8 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
 1. 保持字幕编号一一对应，不合并、不拆分、不新增、不删除。
 2. 完整保留原意、数字、专有名词、术语和语气。
 3. 如果一句话跨多条字幕延续，译文要让相邻字幕读起来顺畅。
-4. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
+4. 有可翻译语义的字幕句子必须翻译为目标语言，禁止仅复制源文。只有 URL、数字或型号、缩写、单独的专有名词可保留原文；包含这些内容的句子仍须翻译其余部分。
+5. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
 </instructions>
 
 <output_format>
@@ -2807,8 +2814,9 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
 1. 保持字幕编号一一对应，不合并、不拆分、不新增、不删除。
 2. 翻译应适合字幕阅读，简洁自然，不要逐词直译。
 3. 专有名词或技术术语按上下文保留原文、音译或采用通行译法。
-4. 如果最后一句不完整，不要擅自补省略号，后续字幕会继续。
-5. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
+4. 有可翻译语义的字幕句子必须翻译为目标语言，禁止仅复制源文。只有 URL、数字或型号、缩写、单独的专有名词可保留原文；包含这些内容的句子仍须翻译其余部分。
+5. 如果最后一句不完整，不要擅自补省略号，后续字幕会继续。
+6. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
 </guidelines>
 
 <terminology_and_requirements>
@@ -2936,7 +2944,7 @@ fn build_translation_key_feedback(
     let output_template = build_translation_output_template(entries, is_reflection);
 
     format!(
-        "上一次结果 key 或译文文本不合法: {error}\n请输出完整 JSON，必须包含原始所有 key，且每个 value 都必须是非空文本。请复制这个 JSON object 的外层结构和全部 key，只改 value: {output_template}"
+        "上一次结果 key 或译文文本不合法: {error}\n请输出完整 JSON，必须包含原始所有 key，且每个 value 都必须是非空文本。若错误提示译文与原文相同，该 key 必须翻译为目标语言；只有 URL、数字或型号、缩写、单独的专有名词可保留原文。请复制这个 JSON object 的外层结构和全部 key，只改 value: {output_template}"
     )
 }
 
@@ -4443,14 +4451,128 @@ fn validate_target_optimization_texts(entries: &BTreeMap<String, String>) -> Res
     Ok(())
 }
 
-fn validate_translation_text_values(entries: &BTreeMap<String, String>) -> Result<(), String> {
-    for (key, text) in entries {
+fn validate_translation_text_values(
+    source_entries: &BTreeMap<String, String>,
+    translated_entries: &BTreeMap<String, String>,
+    source_language: &str,
+    target_language: &str,
+) -> Result<(), String> {
+    for (key, text) in translated_entries {
         if text.trim().is_empty() {
             return Err(format!("key {key} 译文为空"));
+        }
+
+        if let Some(source_text) = source_entries.get(key) {
+            if is_untranslated_source_echo(source_text, text, source_language, target_language) {
+                return Err(format!("key {key} 译文与原文相同，疑似未翻译"));
+            }
         }
     }
 
     Ok(())
+}
+
+fn is_untranslated_source_echo(
+    source_text: &str,
+    translated_text: &str,
+    source_language: &str,
+    target_language: &str,
+) -> bool {
+    if translation_languages_match(source_language, target_language) {
+        return false;
+    }
+
+    let normalized_source = normalize_translation_comparison_text(source_text);
+    let normalized_translation = normalize_translation_comparison_text(translated_text);
+    !normalized_source.is_empty()
+        && normalized_source == normalized_translation
+        && is_translatable_source_text(source_text)
+}
+
+fn translation_languages_match(source_language: &str, target_language: &str) -> bool {
+    let source_language = source_language.trim();
+    let target_language = target_language.trim();
+    !source_language.is_empty()
+        && !source_language.eq_ignore_ascii_case("auto")
+        && source_language.eq_ignore_ascii_case(target_language)
+}
+
+fn normalize_translation_comparison_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+fn is_translatable_source_text(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || is_preserved_literal(text) {
+        return false;
+    }
+
+    let words = text
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphabetic))
+        .collect::<Vec<_>>();
+
+    !words.is_empty() && !words.iter().all(|word| is_preserved_literal(word))
+}
+
+fn is_preserved_literal(text: &str) -> bool {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    if !text.chars().any(char::is_whitespace)
+        && (lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("www.")
+            || text.contains('@')
+            || text.contains('/')
+            || text.contains('\\'))
+    {
+        return true;
+    }
+
+    let token = text.trim_matches(|character: char| !character.is_alphanumeric());
+    if token.is_empty() {
+        return true;
+    }
+
+    if !token.chars().any(char::is_alphabetic) {
+        return true;
+    }
+
+    if !token.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '+' | '#')
+    }) {
+        return false;
+    }
+
+    let has_lowercase = token
+        .chars()
+        .any(|character| character.is_ascii_lowercase());
+    let has_uppercase = token
+        .chars()
+        .any(|character| character.is_ascii_uppercase());
+    if token.chars().any(|character| character.is_ascii_digit())
+        || (has_uppercase && !has_lowercase)
+    {
+        return true;
+    }
+
+    if has_uppercase
+        && token
+            .chars()
+            .skip(1)
+            .any(|character| character.is_ascii_uppercase())
+    {
+        return true;
+    }
+
+    has_uppercase
+        && token
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase())
 }
 
 fn normalize_target_optimized_text(text: &str) -> String {
@@ -5940,8 +6062,38 @@ mod tests {
         actual.insert("2".to_string(), "   ".to_string());
 
         assert!(validate_or_remap_relative_keys(&expected, actual)
-            .and_then(|entries| validate_translation_text_values(&entries).map(|()| entries))
+            .and_then(|entries| {
+                validate_translation_text_values(&expected, &entries, "en", "zh-Hans")
+                    .map(|()| entries)
+            })
             .is_err());
+    }
+
+    #[test]
+    fn translation_rejects_untranslated_sentence_echo() {
+        let mut source = BTreeMap::new();
+        source.insert("1".to_string(), "What I did instead.".to_string());
+
+        let mut translated = BTreeMap::new();
+        translated.insert("1".to_string(), "What I did instead".to_string());
+
+        let error = validate_translation_text_values(&source, &translated, "en", "zh-Hans")
+            .expect_err("unchanged source sentence must be retried");
+
+        assert!(error.contains("译文与原文相同"));
+    }
+
+    #[test]
+    fn translation_allows_unchanged_same_language_and_literals() {
+        let mut source = BTreeMap::new();
+        source.insert("1".to_string(), "This is already English.".to_string());
+        let mut translated = source.clone();
+
+        assert!(validate_translation_text_values(&source, &translated, "en", "en").is_ok());
+
+        source.insert("1".to_string(), "OpenAI GPT-5".to_string());
+        translated.insert("1".to_string(), "OpenAI GPT-5".to_string());
+        assert!(validate_translation_text_values(&source, &translated, "en", "zh-Hans").is_ok());
     }
 
     #[test]
