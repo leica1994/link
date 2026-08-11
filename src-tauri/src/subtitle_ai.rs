@@ -1585,6 +1585,17 @@ async fn correct_chunk_by_llm(
             Ok(parsed) => parsed,
             Err(error) => {
                 feedback = build_correction_json_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "subtitle_correction_validation_failed",
+                    "字幕校正结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "json_parse",
+                        "error": &error,
+                    }),
+                );
                 continue;
             }
         };
@@ -1601,6 +1612,17 @@ async fn correct_chunk_by_llm(
             }
             Err(error) => {
                 feedback = build_correction_key_feedback(&chunk.entries, &error);
+                log_session.warn(
+                    "subtitle_correction_validation_failed",
+                    "字幕校正结果校验失败，准备带反馈重试",
+                    json!({
+                        "attempt": attempt,
+                        "startIndex": chunk.start_index + 1,
+                        "endIndex": chunk.end_index + 1,
+                        "validationType": "key_or_text",
+                        "error": &error,
+                    }),
+                );
             }
         }
     }
@@ -2004,7 +2026,7 @@ fn build_correction_key_feedback(entries: &BTreeMap<String, String>, error: &str
     let output_template = serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string());
 
     format!(
-        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
+        "上一次结果 key 或字幕文本不合法: {error}\n请输出完整 JSON，必须包含原始所有 key，且每个 value 都必须是非空文本。请复制这个 JSON object 的外层结构，只改 value: {output_template}"
     )
 }
 
@@ -2020,7 +2042,7 @@ fn build_source_review_key_feedback(entries: &BTreeMap<String, String>, error: &
     let output_template = source_review_output_template(entries);
 
     format!(
-        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key，不能新增、遗漏或重命名。请复制这个结构: {output_template}"
+        "上一次结果 key 或审核文本不合法: {error}\n请输出完整 JSON，必须包含原始所有 key，不能新增、遗漏或重命名；keep/revise 的 text 必须非空，只有明确 action=remove 时 text 才可以为空。请复制这个结构: {output_template}"
     )
 }
 
@@ -2042,7 +2064,7 @@ fn build_reference_correction_key_feedback(
     let output_template = reference_correction_output_template(entries);
 
     format!(
-        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key，不能新增、遗漏或重命名。请复制这个结构: {output_template}"
+        "上一次结果 key 或校正文本不合法: {error}\n请输出完整 JSON，必须包含原始所有 key，不能新增、遗漏或重命名；keep/revise 的 text 必须非空，只有明确 action=remove 时 text 才可以为空。请复制这个结构: {output_template}"
     )
 }
 
@@ -3288,13 +3310,7 @@ fn parse_reviewed_source_entry(value: &Value) -> Result<ReviewedSourceEntry, Str
         .or_else(|| object.get("status"))
         .and_then(Value::as_str)
         .map(normalize_review_action)
-        .unwrap_or_else(|| {
-            if text.trim().is_empty() {
-                "remove".to_string()
-            } else {
-                "revise".to_string()
-            }
-        });
+        .unwrap_or_else(|| "revise".to_string());
 
     if !matches!(action.as_str(), "keep" | "revise" | "remove") {
         return Err("包含不支持的 action".to_string());
@@ -3387,6 +3403,7 @@ fn validate_correction_keys(
     let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
 
     if expected_keys == actual_keys {
+        validate_correction_text_values(actual)?;
         return Ok(());
     }
 
@@ -3402,6 +3419,16 @@ fn validate_correction_keys(
     Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
 }
 
+fn validate_correction_text_values(entries: &BTreeMap<String, String>) -> Result<(), String> {
+    for (key, text) in entries {
+        if text.trim().is_empty() {
+            return Err(format!("key {key} 校正文本为空"));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_source_review_keys(
     expected: &BTreeMap<String, String>,
     actual: &BTreeMap<String, ReviewedSourceEntry>,
@@ -3410,6 +3437,7 @@ fn validate_source_review_keys(
     let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
 
     if expected_keys == actual_keys {
+        validate_reviewed_source_texts(actual)?;
         return Ok(());
     }
 
@@ -3433,6 +3461,7 @@ fn validate_reference_correction_keys(
     let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
 
     if expected_keys == actual_keys {
+        validate_reviewed_source_texts(actual)?;
         return Ok(());
     }
 
@@ -3446,6 +3475,18 @@ fn validate_reference_correction_keys(
         .collect::<Vec<_>>();
 
     Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
+}
+
+fn validate_reviewed_source_texts(
+    entries: &BTreeMap<String, ReviewedSourceEntry>,
+) -> Result<(), String> {
+    for (key, entry) in entries {
+        if entry.action != "remove" && entry.text.trim().is_empty() {
+            return Err(format!("key {key} 源文为空，但 action 不是 remove"));
+        }
+    }
+
+    Ok(())
 }
 
 fn normalize_content(text: &str) -> String {
@@ -3682,5 +3723,41 @@ mod tests {
             .expect("opening phrase should be completed by following continuation");
 
         assert_eq!(normalized, vec!["Hello and welcome to my channel"]);
+    }
+
+    #[test]
+    fn correction_rejects_empty_text_values() {
+        let mut expected = BTreeMap::new();
+        expected.insert("1".to_string(), "原文一".to_string());
+        expected.insert("2".to_string(), "原文二".to_string());
+
+        let mut actual = BTreeMap::new();
+        actual.insert("1".to_string(), "校正后文本".to_string());
+        actual.insert("2".to_string(), "   ".to_string());
+
+        assert!(validate_correction_keys(&expected, &actual).is_err());
+    }
+
+    #[test]
+    fn source_review_only_allows_empty_text_for_explicit_remove() {
+        let mut expected = BTreeMap::new();
+        expected.insert("1".to_string(), "原文".to_string());
+
+        let mut actual = BTreeMap::new();
+        actual.insert(
+            "1".to_string(),
+            ReviewedSourceEntry {
+                text: String::new(),
+                action: "remove".to_string(),
+            },
+        );
+        assert!(validate_source_review_keys(&expected, &actual).is_ok());
+
+        actual.get_mut("1").unwrap().action = "keep".to_string();
+        assert!(validate_source_review_keys(&expected, &actual).is_err());
+
+        let inferred = parse_reviewed_source_entry(&serde_json::json!({ "text": "" }))
+            .expect("entry should parse");
+        assert_eq!(inferred.action, "revise");
     }
 }

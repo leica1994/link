@@ -2089,7 +2089,9 @@ async fn try_translate_with_validation(
             };
 
         // Key 匹配校验
-        match validate_or_remap_relative_keys(&chunk.entries, parsed) {
+        match validate_or_remap_relative_keys(&chunk.entries, parsed)
+            .and_then(|parsed| validate_translation_text_values(&parsed).map(|()| parsed))
+        {
             Ok(parsed) => {
                 let entries = parsed
                     .into_iter()
@@ -2647,7 +2649,7 @@ fn build_translation_key_feedback(
     let output_template = build_translation_output_template(entries, is_reflection);
 
     format!(
-        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含原始所有 key。请复制这个 JSON object 的外层结构和全部 key，只改 value: {output_template}"
+        "上一次结果 key 或译文文本不合法: {error}\n请输出完整 JSON，必须包含原始所有 key，且每个 value 都必须是非空文本。请复制这个 JSON object 的外层结构和全部 key，只改 value: {output_template}"
     )
 }
 
@@ -2698,7 +2700,7 @@ fn build_translation_review_key_feedback(
     let output_template = translation_review_output_template(source_entries, translated_entries);
 
     format!(
-        "上一次结果 key 不匹配: {error}\n请输出完整 JSON，必须包含当前批次所有真实 key，不能新增、遗漏或重命名。请复制这个结构: {output_template}"
+        "上一次结果 key 或审核文本不合法: {error}\n请输出完整 JSON，必须包含当前批次所有真实 key，不能新增、遗漏或重命名；keep/revise 的 text 必须非空，只有明确 action=remove 时 text 才可以为空。请复制这个结构: {output_template}"
     )
 }
 
@@ -4145,6 +4147,16 @@ fn validate_target_optimization_texts(entries: &BTreeMap<String, String>) -> Res
     Ok(())
 }
 
+fn validate_translation_text_values(entries: &BTreeMap<String, String>) -> Result<(), String> {
+    for (key, text) in entries {
+        if text.trim().is_empty() {
+            return Err(format!("key {key} 译文为空"));
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_target_optimized_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -4489,13 +4501,7 @@ fn parse_reviewed_translation_entry(value: &Value) -> Result<ReviewedTranslation
         .or_else(|| object.get("status"))
         .and_then(Value::as_str)
         .map(normalize_review_action)
-        .unwrap_or_else(|| {
-            if text.trim().is_empty() {
-                "remove".to_string()
-            } else {
-                "revise".to_string()
-            }
-        });
+        .unwrap_or_else(|| "revise".to_string());
 
     if !matches!(action.as_str(), "keep" | "revise" | "remove") {
         return Err("包含不支持的 action".to_string());
@@ -4838,6 +4844,7 @@ fn validate_translation_review_keys(
     let actual_keys = actual.keys().cloned().collect::<HashSet<_>>();
 
     if expected_keys == actual_keys {
+        validate_translation_review_texts(actual)?;
         return Ok(actual.clone());
     }
 
@@ -4851,6 +4858,29 @@ fn validate_translation_review_keys(
         .collect::<Vec<_>>();
 
     Err(format!("缺失 key: {:?}; 多余 key: {:?}", missing, extra))
+}
+
+fn validate_translation_review_texts(
+    entries: &BTreeMap<String, TranslationReviewEntry>,
+) -> Result<(), String> {
+    for (key, entry) in entries {
+        validate_translation_review_text(key, "源文", &entry.source)?;
+        validate_translation_review_text(key, "译文", &entry.target)?;
+    }
+
+    Ok(())
+}
+
+fn validate_translation_review_text(
+    key: &str,
+    label: &str,
+    entry: &ReviewedTranslationEntry,
+) -> Result<(), String> {
+    if entry.action != "remove" && entry.text.trim().is_empty() {
+        return Err(format!("key {key} {label} 为空，但 action 不是 remove"));
+    }
+
+    Ok(())
 }
 
 fn mark_range_status(
@@ -5490,5 +5520,47 @@ mod tests {
 
         entries.insert("2".to_string(), "   ".to_string());
         assert!(validate_target_optimization_texts(&entries).is_err());
+    }
+
+    #[test]
+    fn translation_rejects_empty_text_values() {
+        let mut expected = BTreeMap::new();
+        expected.insert("1".to_string(), "source".to_string());
+        expected.insert("2".to_string(), "source".to_string());
+
+        let mut actual = BTreeMap::new();
+        actual.insert("1".to_string(), "有效译文".to_string());
+        actual.insert("2".to_string(), "   ".to_string());
+
+        assert!(validate_or_remap_relative_keys(&expected, actual)
+            .and_then(|entries| validate_translation_text_values(&entries).map(|()| entries))
+            .is_err());
+    }
+
+    #[test]
+    fn translation_review_only_allows_empty_text_for_explicit_remove() {
+        let mut expected = BTreeMap::new();
+        expected.insert("1".to_string(), "source".to_string());
+
+        let removed_entry = TranslationReviewEntry {
+            source: ReviewedTranslationEntry {
+                text: String::new(),
+                action: "remove".to_string(),
+            },
+            target: ReviewedTranslationEntry {
+                text: String::new(),
+                action: "remove".to_string(),
+            },
+        };
+        let mut actual = BTreeMap::new();
+        actual.insert("1".to_string(), removed_entry);
+        assert!(validate_translation_review_keys(&expected, &actual).is_ok());
+
+        actual.get_mut("1").unwrap().source.action = "keep".to_string();
+        assert!(validate_translation_review_keys(&expected, &actual).is_err());
+
+        let inferred = parse_reviewed_translation_entry(&serde_json::json!({ "text": "" }))
+            .expect("entry should parse");
+        assert_eq!(inferred.action, "revise");
     }
 }

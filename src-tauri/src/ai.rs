@@ -333,6 +333,7 @@ impl AiService {
                     _ => return Err(format!("暂不支持该 LLM 服务: {service}")),
                 }
             };
+            let result = result.and_then(ensure_non_empty_llm_response);
 
             match result {
                 Ok(response) => {
@@ -644,7 +645,7 @@ impl AiService {
             ));
         }
 
-        Ok(body)
+        ensure_non_empty_llm_response(body)
     }
 }
 
@@ -1167,6 +1168,14 @@ fn compact_log_error(error: &str) -> String {
     truncate_text(error, LOG_ERROR_CHARS)
 }
 
+fn ensure_non_empty_llm_response(response: String) -> Result<String, String> {
+    if response.trim().is_empty() {
+        Err("LLM 响应内容为空".to_string())
+    } else {
+        Ok(response)
+    }
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = normalized.chars();
@@ -1192,6 +1201,21 @@ impl NonEmptyString for String {
         } else {
             Some(self)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_or_whitespace_llm_responses() {
+        assert!(ensure_non_empty_llm_response(String::new()).is_err());
+        assert!(ensure_non_empty_llm_response(" \n\t ".to_string()).is_err());
+        assert_eq!(
+            ensure_non_empty_llm_response("OK".to_string()).unwrap(),
+            "OK"
+        );
     }
 }
 
