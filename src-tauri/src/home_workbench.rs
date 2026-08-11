@@ -22,6 +22,7 @@ use crate::subtitle_translation::{
     load_subtitle_segments, run_subtitle_translation_workflow_with_sink,
     SubtitleTranslationProgress, SubtitleTranslationProgressSink, SubtitleTranslationRequest,
     SubtitleTranslationResult, AI_SUBTITLE_REVIEW_PIPELINE_VERSION,
+    SUBTITLE_TRANSLATION_PIPELINE_VERSION,
 };
 use crate::transcription::{
     normalize_subtitle_format, run_transcription_workflow_with_checkpoint,
@@ -2574,6 +2575,7 @@ fn build_translation_checkpoint_input(
         "videoContentType": &options.video_content_type,
         "outputMode": &options.output_mode,
         "subtitleTranslationEnabled": options.is_subtitle_translation_enabled,
+        "subtitleTranslationPipelineVersion": SUBTITLE_TRANSLATION_PIPELINE_VERSION,
         "aiSubtitleReviewEnabled": options.is_ai_subtitle_review_enabled,
         "aiSubtitleReviewMode": &options.ai_subtitle_review_mode,
         "aiSubtitleReviewPipelineVersion": AI_SUBTITLE_REVIEW_PIPELINE_VERSION,
@@ -3042,6 +3044,7 @@ fn is_processing_snapshot_status(status: &str) -> bool {
             | "segmenting"
             | "correcting"
             | "translating"
+            | "retrying"
             | "reviewing"
             | "optimizing"
             | "synthesizing"

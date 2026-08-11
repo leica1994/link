@@ -10,6 +10,13 @@ const CHECKPOINT_STATUS_DONE: &str = "done";
 const CHECKPOINT_STATUS_FAILED: &str = "failed";
 
 #[derive(Debug, Clone)]
+pub(crate) struct WorkbenchCheckpointSnapshot {
+    pub status: String,
+    pub payload: Value,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct WorkbenchCheckpointContext {
     task_id: String,
     scope: String,
@@ -96,6 +103,53 @@ pub(crate) fn load_checkpoint<T: DeserializeOwned>(
         .transpose()
 }
 
+pub(crate) fn load_checkpoint_snapshot(
+    store: &SettingsStore,
+    context: &WorkbenchCheckpointContext,
+    checkpoint_key: &str,
+) -> Result<Option<WorkbenchCheckpointSnapshot>, String> {
+    let row = store.with_connection(|connection| {
+        connection
+            .query_row(
+                "
+                SELECT status, payload, error_message
+                FROM home_workbench_checkpoints
+                WHERE task_id = ?1
+                  AND scope = ?2
+                  AND checkpoint_key = ?3
+                  AND input_key = ?4
+                LIMIT 1
+                ",
+                params![
+                    context.task_id(),
+                    context.scope(),
+                    checkpoint_key,
+                    context.input_key(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取工作台检查点状态: {error}"))
+    })?;
+
+    row.map(|(status, payload, error_message)| {
+        let payload = serde_json::from_str::<Value>(&payload)
+            .map_err(|error| format!("无法解析工作台检查点状态: {error}"))?;
+        Ok(WorkbenchCheckpointSnapshot {
+            status,
+            payload,
+            error_message,
+        })
+    })
+    .transpose()
+}
+
 pub(crate) fn mark_checkpoint_active(
     store: &SettingsStore,
     context: &WorkbenchCheckpointContext,
@@ -107,6 +161,24 @@ pub(crate) fn mark_checkpoint_active(
         checkpoint_key,
         CHECKPOINT_STATUS_ACTIVE,
         Value::Null,
+        "",
+    )
+}
+
+pub(crate) fn mark_checkpoint_active_with_payload<T: Serialize>(
+    store: &SettingsStore,
+    context: &WorkbenchCheckpointContext,
+    checkpoint_key: &str,
+    payload: &T,
+) -> Result<(), String> {
+    let payload =
+        serde_json::to_value(payload).map_err(|error| format!("无法保存工作台检查点: {error}"))?;
+    upsert_checkpoint(
+        store,
+        context,
+        checkpoint_key,
+        CHECKPOINT_STATUS_ACTIVE,
+        payload,
         "",
     )
 }

@@ -784,7 +784,7 @@
                       <span class="translate-subtitle-time translate-subtitle-end translate-translation-end" role="cell">{{ formatSegmentTime(row.endTime) }}</span>
                       <p class="translate-translation-source" role="cell">{{ row.sourceText }}</p>
                       <p class="translate-translation-target" :class="{ empty: !row.targetText }" role="cell">
-                        {{ row.targetText || '等待处理' }}
+                        {{ workbenchTranslationTargetDisplay(row) }}
                       </p>
                     </article>
                   </div>
@@ -4254,6 +4254,7 @@ const normalizeSegmentStatus = (status?: string) => {
     'correcting',
     'corrected',
     'translating',
+    'retrying',
     'translated',
     'optimizing',
     'optimized',
@@ -4287,6 +4288,8 @@ const segmentStatusLabel = (status?: string) => {
       return '已校正'
     case 'translating':
       return '翻译中'
+    case 'retrying':
+      return '重试中'
     case 'translated':
       return '已翻译'
     case 'optimizing':
@@ -4304,6 +4307,19 @@ const segmentStatusLabel = (status?: string) => {
     default:
       return '原文'
   }
+}
+
+const workbenchTranslationTargetDisplay = (row: WorkbenchTranslationRow) => {
+  if (row.targetText) {
+    return row.targetText
+  }
+  if (normalizeSegmentStatus(row.status) === 'failed') {
+    return '翻译失败'
+  }
+  if (normalizeSegmentStatus(row.status) === 'retrying') {
+    return '等待重试'
+  }
+  return '等待处理'
 }
 
 const formatSegmentTime = (ms: number) => {

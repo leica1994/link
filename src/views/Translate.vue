@@ -421,7 +421,7 @@
                   :class="{ empty: !row.targetText }"
                   role="cell"
                 >
-                  {{ row.targetText || '等待处理' }}
+                  {{ translationTargetDisplay(row) }}
                 </p>
               </article>
             </div>
@@ -601,7 +601,9 @@ type TranscriptionSegmentStatus =
   | 'correcting'
   | 'corrected'
   | 'translating'
+  | 'retrying'
   | 'translated'
+  | 'failed'
   | 'optimizing'
   | 'optimized'
   | 'reviewing'
@@ -707,7 +709,9 @@ const transcriptionSegmentStatusLabels: Record<TranscriptionSegmentStatus, strin
   correcting: '校正中',
   corrected: '已校正',
   translating: '翻译中',
+  retrying: '重试中',
   translated: '已翻译',
+  failed: '翻译失败',
   optimizing: '优化中',
   optimized: '已优化',
   reviewing: '审核中',
@@ -808,8 +812,17 @@ const canExportTranscription = computed(() => {
   return transcriptionSegments.value.length > 0 && !isTranscribing.value
 })
 const canStartTranslationProcessing = computed(() => Boolean(activeSubtitlePath.value) && !subtitleInputError.value && !isTranslationProcessing.value)
+const hasFailedTranslationRows = computed(() => {
+  return translatedSubtitleSegments.value.some((segment) => segment.status === 'failed')
+})
 const canExportTranslation = computed(() => {
-  return sourceSubtitleSegments.value.length > 0 && translatedSubtitleSegments.value.length > 0 && !isTranslationProcessing.value
+  return (
+    sourceSubtitleSegments.value.length > 0 &&
+    translatedSubtitleSegments.value.length > 0 &&
+    !isTranslationProcessing.value &&
+    !translationError.value &&
+    !hasFailedTranslationRows.value
+  )
 })
 const hasTranscriptionCache = computed(() => {
   return (
@@ -2005,6 +2018,19 @@ const normalizeSegmentStatus = (status?: string): TranscriptionSegmentStatus => 
 
 const transcriptionSegmentStatusLabel = (status?: TranscriptionSegmentStatus | string) => {
   return transcriptionSegmentStatusLabels[normalizeSegmentStatus(status)]
+}
+
+const translationTargetDisplay = (row: TranslationResultRow) => {
+  if (row.targetText) {
+    return row.targetText
+  }
+  if (row.status === 'failed') {
+    return '翻译失败'
+  }
+  if (row.status === 'retrying') {
+    return '等待重试'
+  }
+  return '等待处理'
 }
 
 const stringifyError = (error: unknown) => {

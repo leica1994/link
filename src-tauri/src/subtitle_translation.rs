@@ -9,22 +9,24 @@ use crate::transcription::{
     TranscriptionSegment,
 };
 use crate::workbench_checkpoint::{
-    load_checkpoint, mark_checkpoint_active, mark_checkpoint_done, mark_checkpoint_failed,
+    load_checkpoint, load_checkpoint_snapshot, mark_checkpoint_active,
+    mark_checkpoint_active_with_payload, mark_checkpoint_done, mark_checkpoint_failed,
     WorkbenchCheckpointContext,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
 const PROGRESS_EVENT: &str = "subtitle-translation-progress";
-const MAX_VALIDATION_ATTEMPTS: usize = 3;
-const MAX_TRANSLATION_ATTEMPTS: usize = 3;
+const MAX_TRANSLATION_SERVICE_ATTEMPTS: usize = 5;
+const FALLBACK_TRANSLATION_BATCH_SIZE: usize = 10;
 const MAX_AI_SUBTITLE_REVIEW_ATTEMPTS: usize = 3;
+pub(crate) const SUBTITLE_TRANSLATION_PIPELINE_VERSION: u32 = 3;
 pub(crate) const AI_SUBTITLE_REVIEW_PIPELINE_VERSION: u32 = 2;
 const REVIEW_CONTENT_PROGRESS_END: u8 = 35;
 const REVIEW_SOURCE_REFLOW_PROGRESS_END: u8 = 65;
@@ -153,6 +155,36 @@ struct TranslationChunk {
     entries: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TranslationWorkLevel {
+    Initial,
+    ReducedBatch,
+    Single,
+}
+
+#[derive(Debug, Clone)]
+struct TranslationWorkItem {
+    chunk: TranslationChunk,
+    root_start_index: usize,
+    root_end_index: usize,
+    level: TranslationWorkLevel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationFallbackPlan {
+    children: Vec<TranslationFallbackRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationFallbackRange {
+    start_index: usize,
+    end_index: usize,
+    level: TranslationWorkLevel,
+}
+
 #[derive(Debug, Clone)]
 struct TranslationReviewChunkResult {
     chunk: TextChunk,
@@ -232,7 +264,6 @@ struct TargetOptimizationResult {
 
 #[derive(Debug, Clone)]
 struct TranslationChunkResult {
-    chunk: TranslationChunk,
     entries: Vec<(usize, String)>,
 }
 
@@ -798,11 +829,11 @@ async fn translate_subtitles<F>(
 where
     F: FnMut(u8, &str, &str, &[TranscriptionSegment], &[String]),
 {
-    let chunks = build_translation_chunks(
+    let root_chunks = build_translation_chunks(
         source_segments,
         settings.translation_batch_size.max(1) as usize,
     );
-    if chunks.is_empty() {
+    if root_chunks.is_empty() {
         return Ok(SubtitleProcessingResult {
             segments: translated_segments,
             warnings: Vec::new(),
@@ -814,8 +845,10 @@ where
         "AI 字幕翻译批次已准备",
         json!({
             "inputSegmentCount": source_segments.len(),
-            "chunkCount": chunks.len(),
+            "chunkCount": root_chunks.len(),
             "batchSize": settings.translation_batch_size.max(1),
+            "fallbackBatchSize": FALLBACK_TRANSLATION_BATCH_SIZE,
+            "serviceAttempts": MAX_TRANSLATION_SERVICE_ATTEMPTS,
             "targetLanguage": &settings.target_language,
             "reflectionEnabled": settings.needs_reflection_translation,
             "videoContentType": &settings.video_content_type,
@@ -823,79 +856,87 @@ where
         }),
     );
 
-    let total = chunks.len().max(1);
     let max_active = active_ai_work_count(settings);
     let mut futures = FuturesUnordered::new();
-    let mut next_chunk_index = 0usize;
-    let mut failed_chunks = 0usize;
+    let mut work_queue = VecDeque::new();
+    let mut restored_or_queued = HashSet::new();
+    let mut completed_root_ranges = HashSet::new();
+    let mut terminal_failures = BTreeMap::new();
     let mut warnings = Vec::new();
-    let mut completed = 0usize;
-    let mut checkpoint_done_chunks = HashSet::new();
 
-    if let Some((store, context)) = checkpoint {
-        for chunk in &chunks {
-            let checkpoint_key = chunk_checkpoint_key(chunk.start_index, chunk.end_index);
-            match load_checkpoint::<TranslationRangeCheckpoint>(store, context, &checkpoint_key) {
-                Ok(Some(payload)) if !payload.segments.is_empty() => {
-                    apply_checkpoint_segments(
-                        &mut translated_segments,
-                        chunk.start_index,
-                        payload.segments,
-                    );
-                    checkpoint_done_chunks.insert(chunk.start_index);
-                    completed += 1;
-                }
-                Ok(_) => {}
-                Err(error) => log_session.warn(
-                    "subtitle_translation_checkpoint_load_failed",
-                    "读取字幕翻译检查点失败，将重新执行批次",
-                    json!({
-                        "startIndex": chunk.start_index + 1,
-                        "endIndex": chunk.end_index + 1,
-                        "error": error,
-                    }),
-                ),
-            }
-        }
-    }
-
-    while next_chunk_index < chunks.len() && futures.len() < max_active {
-        let chunk = chunks[next_chunk_index].clone();
-        if checkpoint_done_chunks.contains(&chunk.start_index) {
-            next_chunk_index += 1;
-            continue;
-        }
-        mark_range_status(
+    for chunk in &root_chunks {
+        restore_or_enqueue_translation_work_item(
+            source_segments,
             &mut translated_segments,
-            chunk.start_index,
-            chunk.end_index,
-            "translating",
+            &mut work_queue,
+            TranslationWorkItem {
+                chunk: chunk.clone(),
+                root_start_index: chunk.start_index,
+                root_end_index: chunk.end_index,
+                level: TranslationWorkLevel::Initial,
+            },
+            checkpoint,
+            log_session,
+            &mut restored_or_queued,
         );
-        if let Some((store, context)) = checkpoint {
-            let _ = mark_checkpoint_active(
-                store,
-                context,
-                &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
-            );
-        }
-        futures.push(run_translation_chunk(
-            settings,
-            ai_service,
-            chunk,
-            log_session.clone(),
-        ));
-        next_chunk_index += 1;
     }
-    report(
-        stage_progress(0, 100, completed, total),
-        "AI 字幕翻译中",
-        "active",
+    mark_completed_translation_root_checkpoints(
+        checkpoint,
+        &root_chunks,
         &translated_segments,
-        &warnings,
+        &mut completed_root_ranges,
     );
 
-    while let Some(result) = futures.next().await {
-        completed += 1;
+    let mut current_message = "AI 字幕翻译中".to_string();
+    loop {
+        let mut submitted_work = false;
+        while futures.len() < max_active {
+            let Some(item) = work_queue.pop_front() else {
+                break;
+            };
+
+            mark_range_status(
+                &mut translated_segments,
+                item.chunk.start_index,
+                item.chunk.end_index,
+                "translating",
+            );
+            if let Some((store, context)) = checkpoint {
+                let _ = mark_checkpoint_active(
+                    store,
+                    context,
+                    &chunk_checkpoint_key(item.chunk.start_index, item.chunk.end_index),
+                );
+            }
+            let item_for_future = item.clone();
+            let request_log_session = log_session.clone();
+            futures.push(async move {
+                let result = run_translation_chunk(
+                    settings,
+                    ai_service,
+                    item_for_future.chunk.clone(),
+                    request_log_session,
+                )
+                .await
+                .map_err(|(_, error)| error);
+                (item_for_future, result)
+            });
+            submitted_work = true;
+        }
+
+        if submitted_work {
+            report(
+                translation_segment_progress(&translated_segments),
+                &current_message,
+                "active",
+                &translated_segments,
+                &warnings,
+            );
+        }
+
+        let Some((item, result)) = futures.next().await else {
+            break;
+        };
 
         match result {
             Ok(result) => {
@@ -906,138 +947,457 @@ where
                 }
                 mark_range_status(
                     &mut translated_segments,
-                    result.chunk.start_index,
-                    result.chunk.end_index,
+                    item.chunk.start_index,
+                    item.chunk.end_index,
                     "translated",
                 );
                 if let Some((store, context)) = checkpoint {
                     let _ = mark_checkpoint_done(
                         store,
                         context,
-                        &chunk_checkpoint_key(result.chunk.start_index, result.chunk.end_index),
+                        &chunk_checkpoint_key(item.chunk.start_index, item.chunk.end_index),
                         &translation_range_checkpoint(
                             &translated_segments,
-                            result.chunk.start_index,
-                            result.chunk.end_index,
+                            item.chunk.start_index,
+                            item.chunk.end_index,
                         ),
                     );
                 }
-            }
-            Err((chunk, error)) => {
-                // 区分错误类型记录日志
-                let error_message = match error {
-                    TranslationChunkError::NetworkError(ref msg) => {
-                        format!("网络/API错误: {}", msg)
-                    }
-                    TranslationChunkError::ValidationError(ref msg) => {
-                        format!(
-                            "校验失败（已重试{}次翻译）: {}",
-                            MAX_TRANSLATION_ATTEMPTS, msg
-                        )
-                    }
-                };
-
-                copy_source_range_to_target(source_segments, &mut translated_segments, &chunk);
-                mark_range_status(
-                    &mut translated_segments,
-                    chunk.start_index,
-                    chunk.end_index,
-                    "kept",
-                );
-                failed_chunks += 1;
-                if let Some((store, context)) = checkpoint {
-                    let _ = mark_checkpoint_failed(
-                        store,
-                        context,
-                        &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
-                        &error_message,
+                if item.level != TranslationWorkLevel::Initial {
+                    log_session.info(
+                        "subtitle_translation_fallback_success",
+                        "字幕翻译降级批次成功",
+                        json!({
+                            "startIndex": item.chunk.start_index + 1,
+                            "endIndex": item.chunk.end_index + 1,
+                            "level": item.level,
+                        }),
                     );
                 }
-                log_session.warn(
-                    "subtitle_translation_chunk_failed",
-                    "字幕翻译批次最终失败，已保留原文",
-                    json!({
-                        "startIndex": chunk.start_index + 1,
-                        "endIndex": chunk.end_index + 1,
-                        "entryCount": chunk.entries.len(),
-                        "error": &error_message,
-                    }),
-                );
+                current_message = "AI 字幕翻译中".to_string();
+            }
+            Err(error) => {
+                let error_message = translation_chunk_error_message(&error);
+                let fallback_items = build_translation_fallback_items(&item, source_segments);
+
+                if fallback_items.is_empty() {
+                    mark_range_status(
+                        &mut translated_segments,
+                        item.chunk.start_index,
+                        item.chunk.end_index,
+                        "failed",
+                    );
+                    for index in item.chunk.start_index..=item.chunk.end_index {
+                        terminal_failures
+                            .entry(index)
+                            .or_insert_with(|| error_message.clone());
+                    }
+                    if let Some((store, context)) = checkpoint {
+                        let _ = mark_checkpoint_failed(
+                            store,
+                            context,
+                            &chunk_checkpoint_key(item.chunk.start_index, item.chunk.end_index),
+                            &error_message,
+                        );
+                    }
+                    current_message = format!(
+                        "第 {} 条字幕翻译失败，继续处理其他字幕",
+                        item.chunk.start_index + 1
+                    );
+                    log_session.error(
+                        "subtitle_translation_line_failed",
+                        "单条字幕翻译最终失败",
+                        json!({
+                            "index": item.chunk.start_index + 1,
+                            "error": &error_message,
+                        }),
+                    );
+                } else {
+                    mark_range_status(
+                        &mut translated_segments,
+                        item.chunk.start_index,
+                        item.chunk.end_index,
+                        "retrying",
+                    );
+                    let fallback_plan = TranslationFallbackPlan {
+                        children: fallback_items
+                            .iter()
+                            .map(|child| TranslationFallbackRange {
+                                start_index: child.chunk.start_index,
+                                end_index: child.chunk.end_index,
+                                level: child.level,
+                            })
+                            .collect(),
+                    };
+                    if let Some((store, context)) = checkpoint {
+                        let _ = mark_checkpoint_active_with_payload(
+                            store,
+                            context,
+                            &chunk_checkpoint_key(item.chunk.start_index, item.chunk.end_index),
+                            &fallback_plan,
+                        );
+                    }
+                    current_message = translation_fallback_message(&item, fallback_items.len());
+                    log_session.warn(
+                        "subtitle_translation_chunk_split",
+                        "字幕翻译批次失败，已拆分为更小批次",
+                        json!({
+                            "startIndex": item.chunk.start_index + 1,
+                            "endIndex": item.chunk.end_index + 1,
+                            "entryCount": item.chunk.entries.len(),
+                            "childCount": fallback_items.len(),
+                            "error": &error_message,
+                        }),
+                    );
+                    for fallback_item in fallback_items {
+                        restore_or_enqueue_translation_work_item(
+                            source_segments,
+                            &mut translated_segments,
+                            &mut work_queue,
+                            fallback_item,
+                            checkpoint,
+                            log_session,
+                            &mut restored_or_queued,
+                        );
+                    }
+                }
             }
         }
 
-        while next_chunk_index < chunks.len() && futures.len() < max_active {
-            let chunk = chunks[next_chunk_index].clone();
-            if checkpoint_done_chunks.contains(&chunk.start_index) {
-                next_chunk_index += 1;
-                continue;
-            }
-            mark_range_status(
-                &mut translated_segments,
-                chunk.start_index,
-                chunk.end_index,
-                "translating",
-            );
-            if let Some((store, context)) = checkpoint {
-                let _ = mark_checkpoint_active(
-                    store,
-                    context,
-                    &chunk_checkpoint_key(chunk.start_index, chunk.end_index),
-                );
-            }
-            futures.push(run_translation_chunk(
-                settings,
-                ai_service,
-                chunk,
-                log_session.clone(),
-            ));
-            next_chunk_index += 1;
-        }
-
-        let progress = stage_progress(0, 100, completed, total);
-        if completed == total && failed_chunks == total {
-            let message = "字幕翻译全部失败，请检查 LLM 配置、网络或模型响应格式";
-            log_session.error(
-                "subtitle_translation_stage_failed",
-                "AI 字幕翻译全部失败",
-                json!({
-                    "failedChunkCount": failed_chunks,
-                    "chunkCount": total,
-                }),
-            );
-            report(progress, message, "failed", &translated_segments, &[]);
-            return Err(message.to_string());
-        }
-
-        warnings = build_processing_warnings("字幕翻译", failed_chunks, "翻译批次");
-        let message = if completed == total {
-            "字幕翻译完成"
-        } else {
-            "字幕翻译中"
-        };
-        let status = if completed == total { "done" } else { "active" };
-        report(progress, message, status, &translated_segments, &warnings);
-    }
-
-    if failed_chunks == total {
-        return Err("字幕翻译全部失败，请检查 LLM 配置、网络或模型响应格式".to_string());
-    }
-
-    if failed_chunks > 0 {
-        log_session.warn(
-            "subtitle_translation_stage_partial",
-            "AI 字幕翻译部分批次失败，已保留原文",
-            json!({
-                "failedChunkCount": failed_chunks,
-                "chunkCount": total,
-            }),
+        mark_completed_translation_root_checkpoints(
+            checkpoint,
+            &root_chunks,
+            &translated_segments,
+            &mut completed_root_ranges,
+        );
+        report(
+            translation_segment_progress(&translated_segments),
+            &current_message,
+            "active",
+            &translated_segments,
+            &warnings,
         );
     }
+
+    if !terminal_failures.is_empty() {
+        let message = format_translation_stage_failure_message(&terminal_failures);
+        log_session.error(
+            "subtitle_translation_stage_failed",
+            "AI 字幕翻译存在最终失败字幕",
+            json!({
+                "failedLineCount": terminal_failures.len(),
+                "failedIndices": terminal_failures.keys().map(|index| index + 1).collect::<Vec<_>>(),
+            }),
+        );
+        report(
+            translation_segment_progress(&translated_segments),
+            &message,
+            "failed",
+            &translated_segments,
+            &warnings,
+        );
+        return Err(message);
+    }
+
+    warnings.clear();
+    report(
+        100,
+        "AI 字幕翻译完成",
+        "done",
+        &translated_segments,
+        &warnings,
+    );
 
     Ok(SubtitleProcessingResult {
         segments: translated_segments,
         warnings,
     })
+}
+
+fn restore_or_enqueue_translation_work_item(
+    source_segments: &[TranscriptionSegment],
+    translated_segments: &mut Vec<TranscriptionSegment>,
+    work_queue: &mut VecDeque<TranslationWorkItem>,
+    item: TranslationWorkItem,
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
+    log_session: &LogSession,
+    restored_or_queued: &mut HashSet<String>,
+) {
+    let item_key = translation_work_item_key(&item);
+    if !restored_or_queued.insert(item_key) {
+        return;
+    }
+
+    if let Some((store, context)) = checkpoint {
+        let checkpoint_key = chunk_checkpoint_key(item.chunk.start_index, item.chunk.end_index);
+        match load_checkpoint::<TranslationRangeCheckpoint>(store, context, &checkpoint_key) {
+            Ok(Some(payload)) if !payload.segments.is_empty() => {
+                apply_checkpoint_segments(
+                    translated_segments,
+                    item.chunk.start_index,
+                    payload.segments,
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => log_session.warn(
+                "subtitle_translation_checkpoint_load_failed",
+                "读取字幕翻译检查点失败，将重新执行批次",
+                json!({
+                    "startIndex": item.chunk.start_index + 1,
+                    "endIndex": item.chunk.end_index + 1,
+                    "error": error,
+                }),
+            ),
+        }
+
+        match load_checkpoint_snapshot(store, context, &checkpoint_key) {
+            Ok(Some(snapshot)) if snapshot.status == "active" || snapshot.status == "failed" => {
+                let has_payload = !snapshot.payload.is_null();
+                match serde_json::from_value::<TranslationFallbackPlan>(snapshot.payload) {
+                    Ok(plan) => {
+                        let fallback_items =
+                            translation_work_items_from_plan(source_segments, &item, &plan);
+                        if !fallback_items.is_empty() {
+                            mark_range_status(
+                                translated_segments,
+                                item.chunk.start_index,
+                                item.chunk.end_index,
+                                "retrying",
+                            );
+                            log_session.info(
+                                "subtitle_translation_checkpoint_fallback_restored",
+                                "已恢复字幕翻译拆分批次",
+                                json!({
+                                    "startIndex": item.chunk.start_index + 1,
+                                    "endIndex": item.chunk.end_index + 1,
+                                    "childCount": fallback_items.len(),
+                                    "checkpointStatus": snapshot.status,
+                                    "lastError": snapshot.error_message,
+                                }),
+                            );
+                            for fallback_item in fallback_items {
+                                restore_or_enqueue_translation_work_item(
+                                    source_segments,
+                                    translated_segments,
+                                    work_queue,
+                                    fallback_item,
+                                    checkpoint,
+                                    log_session,
+                                    restored_or_queued,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                    Err(error) if has_payload => log_session.warn(
+                        "subtitle_translation_checkpoint_plan_invalid",
+                        "字幕翻译拆分检查点无效，将重新执行当前批次",
+                        json!({
+                            "startIndex": item.chunk.start_index + 1,
+                            "endIndex": item.chunk.end_index + 1,
+                            "error": error.to_string(),
+                        }),
+                    ),
+                    Err(_) => {}
+                }
+            }
+            Ok(_) => {}
+            Err(error) => log_session.warn(
+                "subtitle_translation_checkpoint_state_load_failed",
+                "读取字幕翻译检查点状态失败，将重新执行当前批次",
+                json!({
+                    "startIndex": item.chunk.start_index + 1,
+                    "endIndex": item.chunk.end_index + 1,
+                    "error": error,
+                }),
+            ),
+        }
+    }
+
+    work_queue.push_back(item);
+}
+
+fn build_translation_fallback_items(
+    item: &TranslationWorkItem,
+    source_segments: &[TranscriptionSegment],
+) -> Vec<TranslationWorkItem> {
+    let entry_count = item.chunk.entries.len();
+    let (batch_size, level) = if entry_count > FALLBACK_TRANSLATION_BATCH_SIZE {
+        (
+            FALLBACK_TRANSLATION_BATCH_SIZE,
+            TranslationWorkLevel::ReducedBatch,
+        )
+    } else if entry_count > 1 {
+        (1, TranslationWorkLevel::Single)
+    } else {
+        return Vec::new();
+    };
+
+    build_translation_chunks_for_range(
+        source_segments,
+        item.chunk.start_index,
+        item.chunk.end_index,
+        batch_size,
+    )
+    .into_iter()
+    .map(|chunk| TranslationWorkItem {
+        chunk,
+        root_start_index: item.root_start_index,
+        root_end_index: item.root_end_index,
+        level,
+    })
+    .collect()
+}
+
+fn translation_work_items_from_plan(
+    source_segments: &[TranscriptionSegment],
+    parent: &TranslationWorkItem,
+    plan: &TranslationFallbackPlan,
+) -> Vec<TranslationWorkItem> {
+    let parent_len = parent
+        .chunk
+        .end_index
+        .saturating_sub(parent.chunk.start_index)
+        .saturating_add(1);
+
+    plan.children
+        .iter()
+        .filter_map(|range| {
+            let range_len = range
+                .end_index
+                .saturating_sub(range.start_index)
+                .saturating_add(1);
+            if range.start_index < parent.chunk.start_index
+                || range.end_index > parent.chunk.end_index
+                || range.start_index > range.end_index
+                || range_len >= parent_len
+            {
+                return None;
+            }
+
+            build_translation_chunks_for_range(
+                source_segments,
+                range.start_index,
+                range.end_index,
+                range_len,
+            )
+            .into_iter()
+            .next()
+            .map(|chunk| TranslationWorkItem {
+                chunk,
+                root_start_index: parent.root_start_index,
+                root_end_index: parent.root_end_index,
+                level: range.level,
+            })
+        })
+        .collect()
+}
+
+fn mark_completed_translation_root_checkpoints(
+    checkpoint: Option<(&SettingsStore, &WorkbenchCheckpointContext)>,
+    root_chunks: &[TranslationChunk],
+    translated_segments: &[TranscriptionSegment],
+    completed_root_ranges: &mut HashSet<(usize, usize)>,
+) {
+    let Some((store, context)) = checkpoint else {
+        return;
+    };
+
+    for root in root_chunks {
+        let root_range = (root.start_index, root.end_index);
+        if completed_root_ranges.contains(&root_range)
+            || !translation_range_is_complete(translated_segments, root.start_index, root.end_index)
+        {
+            continue;
+        }
+
+        let _ = mark_checkpoint_done(
+            store,
+            context,
+            &chunk_checkpoint_key(root.start_index, root.end_index),
+            &translation_range_checkpoint(translated_segments, root.start_index, root.end_index),
+        );
+        completed_root_ranges.insert(root_range);
+    }
+}
+
+fn translation_range_is_complete(
+    translated_segments: &[TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+) -> bool {
+    if start_index >= translated_segments.len() {
+        return false;
+    }
+
+    let end_index = end_index.min(translated_segments.len().saturating_sub(1));
+    translated_segments[start_index..=end_index]
+        .iter()
+        .all(|segment| segment.status == "translated")
+}
+
+fn translation_segment_progress(translated_segments: &[TranscriptionSegment]) -> u8 {
+    let resolved = translated_segments
+        .iter()
+        .filter(|segment| matches!(segment.status.as_str(), "translated" | "failed"))
+        .count();
+    stage_progress(0, 100, resolved, translated_segments.len())
+}
+
+fn translation_work_item_key(item: &TranslationWorkItem) -> String {
+    format!(
+        "{}-{}:{}-{}:{:?}",
+        item.root_start_index,
+        item.root_end_index,
+        item.chunk.start_index,
+        item.chunk.end_index,
+        item.level,
+    )
+}
+
+fn translation_chunk_error_message(error: &TranslationChunkError) -> String {
+    match error {
+        TranslationChunkError::NetworkError(message) => format!("网络/API错误: {message}"),
+        TranslationChunkError::ValidationError(message) => format!("结果校验失败: {message}"),
+    }
+}
+
+fn translation_fallback_message(item: &TranslationWorkItem, child_count: usize) -> String {
+    if item.chunk.entries.len() > FALLBACK_TRANSLATION_BATCH_SIZE {
+        format!(
+            "第 {}-{} 条翻译失败，拆分为 {} 个每批最多 {} 条的小批重试",
+            item.chunk.start_index + 1,
+            item.chunk.end_index + 1,
+            child_count,
+            FALLBACK_TRANSLATION_BATCH_SIZE,
+        )
+    } else {
+        format!(
+            "第 {}-{} 条小批翻译失败，拆分为 {} 条单条重试",
+            item.chunk.start_index + 1,
+            item.chunk.end_index + 1,
+            child_count,
+        )
+    }
+}
+
+fn format_translation_stage_failure_message(failures: &BTreeMap<usize, String>) -> String {
+    let labels = failures
+        .keys()
+        .take(12)
+        .map(|index| (index + 1).to_string())
+        .collect::<Vec<_>>();
+    let suffix = if failures.len() > labels.len() {
+        format!("等 {} 条", failures.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "字幕翻译失败：第 {} 条字幕在多次尝试后仍未翻译{}",
+        labels.join("、"),
+        suffix,
+    )
 }
 
 async fn review_translated_subtitles<F>(
@@ -1935,90 +2295,6 @@ async fn translate_chunk_by_llm(
     chunk: TranslationChunk,
     log_session: LogSession,
 ) -> Result<TranslationChunkResult, (TranslationChunk, TranslationChunkError)> {
-    // 翻译重试循环（最多3次完整翻译尝试）
-    for translation_attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
-        let validation_result = try_translate_with_validation(
-            settings,
-            ai_service,
-            &chunk,
-            &log_session,
-            translation_attempt,
-        )
-        .await;
-
-        match validation_result {
-            Ok(result) => {
-                if translation_attempt > 1 {
-                    log_session.info(
-                        "subtitle_translation_retry_success",
-                        &format!("字幕翻译第{}次尝试成功", translation_attempt),
-                        json!({
-                            "translationAttempt": translation_attempt,
-                            "startIndex": chunk.start_index + 1,
-                            "endIndex": chunk.end_index + 1,
-                        }),
-                    );
-                }
-                return Ok(result);
-            }
-            Err(error) => {
-                match error {
-                    TranslationChunkError::NetworkError(_) => {
-                        // 网络错误直接返回，不重试翻译
-                        return Err((chunk, error));
-                    }
-                    TranslationChunkError::ValidationError(ref msg) => {
-                        if translation_attempt < MAX_TRANSLATION_ATTEMPTS {
-                            log_session.warn(
-                                "subtitle_translation_retry_translation",
-                                &format!(
-                                    "字幕翻译第{}次尝试校验失败，准备重新翻译",
-                                    translation_attempt
-                                ),
-                                json!({
-                                    "translationAttempt": translation_attempt,
-                                    "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
-                                    "startIndex": chunk.start_index + 1,
-                                    "endIndex": chunk.end_index + 1,
-                                    "error": msg,
-                                }),
-                            );
-                            // 继续下一次翻译尝试
-                        } else {
-                            // 所有翻译尝试都失败
-                            log_session.error(
-                                "subtitle_translation_all_attempts_failed",
-                                &format!("字幕翻译{}次尝试全部失败", MAX_TRANSLATION_ATTEMPTS),
-                                json!({
-                                    "maxAttempts": MAX_TRANSLATION_ATTEMPTS,
-                                    "startIndex": chunk.start_index + 1,
-                                    "endIndex": chunk.end_index + 1,
-                                    "error": msg,
-                                }),
-                            );
-                            return Err((chunk, error));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 理论上不会到这里
-    Err((
-        chunk,
-        TranslationChunkError::ValidationError("未知错误".to_string()),
-    ))
-}
-
-/// 单次翻译尝试（包含最多3次校验重试）
-async fn try_translate_with_validation(
-    settings: &AppSettings,
-    ai_service: &AiService,
-    chunk: &TranslationChunk,
-    log_session: &LogSession,
-    translation_attempt: usize,
-) -> Result<TranslationChunkResult, TranslationChunkError> {
     let system_prompt = build_translation_system_prompt(settings);
     let source_text = chunk
         .entries
@@ -2028,9 +2304,10 @@ async fn try_translate_with_validation(
         .join("\n");
     let max_output_tokens = estimate_max_output_tokens(&source_text);
     let mut feedback = String::new();
+    let mut last_validation_error = String::new();
 
-    // 校验重试循环（最多3次）
-    for validation_attempt in 1..=MAX_VALIDATION_ATTEMPTS {
+    // 调度器只调用一次本服务；结构化结果重试在服务内部完成。
+    for attempt in 1..=MAX_TRANSLATION_SERVICE_ATTEMPTS {
         let user_prompt = build_translation_user_prompt(
             &chunk.entries,
             settings.needs_reflection_translation,
@@ -2052,22 +2329,22 @@ async fn try_translate_with_validation(
                     "subtitle_translation_llm_request_failed",
                     "字幕翻译 LLM 请求失败",
                     json!({
-                        "translationAttempt": translation_attempt,
-                        "validationAttempt": validation_attempt,
+                        "attempt": attempt,
+                        "maxAttempts": MAX_TRANSLATION_SERVICE_ATTEMPTS,
                         "startIndex": chunk.start_index + 1,
                         "endIndex": chunk.end_index + 1,
                         "error": &error,
                     }),
                 );
-                return Err(TranslationChunkError::NetworkError(error));
+                return Err((chunk, TranslationChunkError::NetworkError(error)));
             }
         };
 
-        // JSON 格式校验
         let parsed =
             match parse_translation_response(&response, settings.needs_reflection_translation) {
                 Ok(parsed) => parsed,
                 Err(error) => {
+                    last_validation_error = error.clone();
                     feedback = build_translation_json_feedback(
                         &chunk.entries,
                         settings.needs_reflection_translation,
@@ -2077,8 +2354,8 @@ async fn try_translate_with_validation(
                         "subtitle_translation_json_validation_failed",
                         "字幕翻译 JSON 格式校验失败，准备带反馈重试",
                         json!({
-                            "translationAttempt": translation_attempt,
-                            "validationAttempt": validation_attempt,
+                            "attempt": attempt,
+                            "maxAttempts": MAX_TRANSLATION_SERVICE_ATTEMPTS,
                             "startIndex": chunk.start_index + 1,
                             "endIndex": chunk.end_index + 1,
                             "error": &error,
@@ -2100,25 +2377,23 @@ async fn try_translate_with_validation(
                     })
                     .collect();
 
-                if translation_attempt > 1 || validation_attempt > 1 {
+                if attempt > 1 {
                     log_session.info(
                         "subtitle_translation_chunk_validated",
                         "字幕翻译批次校验成功",
                         json!({
-                            "translationAttempt": translation_attempt,
-                            "validationAttempt": validation_attempt,
+                            "attempt": attempt,
+                            "maxAttempts": MAX_TRANSLATION_SERVICE_ATTEMPTS,
                             "startIndex": chunk.start_index + 1,
                             "endIndex": chunk.end_index + 1,
                         }),
                     );
                 }
 
-                return Ok(TranslationChunkResult {
-                    chunk: chunk.clone(),
-                    entries,
-                });
+                return Ok(TranslationChunkResult { entries });
             }
             Err(error) => {
+                last_validation_error = error.clone();
                 feedback = build_translation_key_feedback(
                     &chunk.entries,
                     settings.needs_reflection_translation,
@@ -2128,8 +2403,8 @@ async fn try_translate_with_validation(
                     "subtitle_translation_key_validation_failed",
                     "字幕翻译 Key 匹配校验失败，准备带反馈重试",
                     json!({
-                        "translationAttempt": translation_attempt,
-                        "validationAttempt": validation_attempt,
+                        "attempt": attempt,
+                        "maxAttempts": MAX_TRANSLATION_SERVICE_ATTEMPTS,
                         "startIndex": chunk.start_index + 1,
                         "endIndex": chunk.end_index + 1,
                         "error": &error,
@@ -2139,11 +2414,23 @@ async fn try_translate_with_validation(
         }
     }
 
-    // 所有校验重试都失败
-    Err(TranslationChunkError::ValidationError(format!(
-        "LLM 翻译结果{}次校验失败",
-        MAX_VALIDATION_ATTEMPTS
-    )))
+    log_session.error(
+        "subtitle_translation_all_attempts_failed",
+        "字幕翻译服务多次尝试后仍未获得有效结果",
+        json!({
+            "maxAttempts": MAX_TRANSLATION_SERVICE_ATTEMPTS,
+            "startIndex": chunk.start_index + 1,
+            "endIndex": chunk.end_index + 1,
+            "error": &last_validation_error,
+        }),
+    );
+    Err((
+        chunk,
+        TranslationChunkError::ValidationError(format!(
+            "LLM 翻译结果{}次校验失败: {}",
+            MAX_TRANSLATION_SERVICE_ATTEMPTS, last_validation_error
+        )),
+    ))
 }
 
 async fn review_translation_chunk_by_llm(
@@ -3905,11 +4192,35 @@ fn build_translation_chunks(
     source_segments: &[TranscriptionSegment],
     batch_size: usize,
 ) -> Vec<TranslationChunk> {
-    source_segments
-        .chunks(batch_size.max(1))
+    if source_segments.is_empty() {
+        return Vec::new();
+    }
+
+    build_translation_chunks_for_range(
+        source_segments,
+        0,
+        source_segments.len().saturating_sub(1),
+        batch_size,
+    )
+}
+
+fn build_translation_chunks_for_range(
+    source_segments: &[TranscriptionSegment],
+    start_index: usize,
+    end_index: usize,
+    batch_size: usize,
+) -> Vec<TranslationChunk> {
+    if start_index >= source_segments.len() || start_index > end_index {
+        return Vec::new();
+    }
+
+    let end_index = end_index.min(source_segments.len().saturating_sub(1));
+    let batch_size = batch_size.max(1);
+    source_segments[start_index..=end_index]
+        .chunks(batch_size)
         .enumerate()
         .map(|(chunk_index, chunk)| {
-            let start_index = chunk_index * batch_size.max(1);
+            let start_index = start_index + chunk_index * batch_size;
             let entries = chunk
                 .iter()
                 .enumerate()
@@ -3924,21 +4235,6 @@ fn build_translation_chunks(
             }
         })
         .collect()
-}
-
-fn copy_source_range_to_target(
-    source_segments: &[TranscriptionSegment],
-    translated_segments: &mut [TranscriptionSegment],
-    chunk: &TranslationChunk,
-) {
-    for index in chunk.start_index..=chunk.end_index {
-        if let (Some(source), Some(target)) = (
-            source_segments.get(index),
-            translated_segments.get_mut(index),
-        ) {
-            target.text = source.text.clone();
-        }
-    }
 }
 
 fn chunk_checkpoint_key(start_index: usize, end_index: usize) -> String {
@@ -5390,6 +5686,117 @@ mod tests {
             status: String::new(),
             words: Vec::new(),
         }
+    }
+
+    fn test_translation_segments(count: usize) -> Vec<TranscriptionSegment> {
+        (0..count)
+            .map(|index| {
+                test_segment(
+                    &format!("source {index}"),
+                    index as u64 * 1_000,
+                    index as u64 * 1_000 + 900,
+                )
+            })
+            .collect()
+    }
+
+    fn test_translation_work_item(
+        segments: &[TranscriptionSegment],
+        start_index: usize,
+        end_index: usize,
+    ) -> TranslationWorkItem {
+        let chunk = build_translation_chunks_for_range(
+            segments,
+            start_index,
+            end_index,
+            end_index.saturating_sub(start_index).saturating_add(1),
+        )
+        .into_iter()
+        .next()
+        .expect("test range should produce one chunk");
+        TranslationWorkItem {
+            chunk,
+            root_start_index: start_index,
+            root_end_index: end_index,
+            level: TranslationWorkLevel::Initial,
+        }
+    }
+
+    fn translation_ranges(items: &[TranslationWorkItem]) -> Vec<(usize, usize)> {
+        items
+            .iter()
+            .map(|item| (item.chunk.start_index, item.chunk.end_index))
+            .collect()
+    }
+
+    #[test]
+    fn translation_fallback_splits_nineteen_lines_into_ten_and_nine() {
+        let segments = test_translation_segments(19);
+        let item = test_translation_work_item(&segments, 0, 18);
+
+        let fallback = build_translation_fallback_items(&item, &segments);
+
+        assert_eq!(translation_ranges(&fallback), vec![(0, 9), (10, 18)]);
+        assert!(fallback
+            .iter()
+            .all(|item| item.level == TranslationWorkLevel::ReducedBatch));
+    }
+
+    #[test]
+    fn translation_fallback_splits_twenty_nine_lines_with_uneven_tail() {
+        let segments = test_translation_segments(29);
+        let item = test_translation_work_item(&segments, 0, 28);
+
+        let fallback = build_translation_fallback_items(&item, &segments);
+
+        assert_eq!(
+            translation_ranges(&fallback),
+            vec![(0, 9), (10, 19), (20, 28)]
+        );
+    }
+
+    #[test]
+    fn translation_fallback_splits_small_batch_into_individual_lines() {
+        let segments = test_translation_segments(9);
+        let item = test_translation_work_item(&segments, 0, 8);
+
+        let fallback = build_translation_fallback_items(&item, &segments);
+
+        assert_eq!(
+            translation_ranges(&fallback),
+            vec![
+                (0, 0),
+                (1, 1),
+                (2, 2),
+                (3, 3),
+                (4, 4),
+                (5, 5),
+                (6, 6),
+                (7, 7),
+                (8, 8)
+            ]
+        );
+        assert!(fallback
+            .iter()
+            .all(|item| item.level == TranslationWorkLevel::Single));
+    }
+
+    #[test]
+    fn translation_fallback_does_not_split_a_single_line_again() {
+        let segments = test_translation_segments(1);
+        let item = test_translation_work_item(&segments, 0, 0);
+
+        assert!(build_translation_fallback_items(&item, &segments).is_empty());
+    }
+
+    #[test]
+    fn translation_progress_counts_translated_and_final_failed_lines() {
+        let mut segments = test_translation_segments(3);
+        segments[0].status = "translated".to_string();
+        segments[1].status = "failed".to_string();
+        segments[2].status = "retrying".to_string();
+
+        assert_eq!(translation_segment_progress(&segments), 66);
     }
 
     #[test]
