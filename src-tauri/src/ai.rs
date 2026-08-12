@@ -22,6 +22,9 @@ const DEFAULT_AI_CONNECT_TIMEOUT_SECONDS: u64 = 60;
 // Normal jobs can request large subtitle/content batches; this is a stuck-request guard.
 const DEFAULT_AI_REQUEST_TIMEOUT_SECONDS: u64 = 10 * 60;
 const CONNECTION_CHECK_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+// 推理模型会先消耗 token 进行思考再产出正文；16 个 token 常被 reasoning 耗尽，
+// 导致 content 为空、finish_reason=length，连接测试被误判失败。设大上限保证能出正文。
+const CONNECTION_CHECK_MAX_TOKENS: u32 = 512;
 const TEST_SYSTEM_PROMPT: &str = "你是一个连接测试助手。";
 const TEST_USER_PROMPT: &str = "请只回复 OK。";
 
@@ -123,7 +126,7 @@ impl AiService {
                 settings,
                 TEST_SYSTEM_PROMPT.to_string(),
                 TEST_USER_PROMPT.to_string(),
-                16,
+                CONNECTION_CHECK_MAX_TOKENS,
             ),
         )
         .await
@@ -763,6 +766,8 @@ fn openai_reasoning_effort(config: &LlmConfig, request: &AiChatRequest) -> Optio
         "medium" => Some("medium"),
         "high" => Some("high"),
         "ultra-high" => Some("xhigh"),
+        "ultra" => Some("ultra"),
+        "max" => Some("max"),
         _ => None,
     }
 }
@@ -777,6 +782,8 @@ fn anthropic_reasoning_effort(config: &LlmConfig, request: &AiChatRequest) -> Op
         "medium" => Some("medium"),
         "high" => Some("high"),
         "ultra-high" => Some("max"),
+        "ultra" => Some("max"),
+        "max" => Some("max"),
         _ => None,
     }
 }

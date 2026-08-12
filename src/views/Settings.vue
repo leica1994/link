@@ -952,6 +952,8 @@ enum LlmService {
 }
 
 enum ReasoningEffort {
+  Max = 'max',
+  Ultra = 'ultra',
   UltraHigh = 'ultra-high',
   High = 'high',
   Medium = 'medium',
@@ -1329,6 +1331,8 @@ const llmServiceOptions = [
 ] as const
 
 const reasoningEffortOptions = [
+  { value: ReasoningEffort.Max, label: '最高' },
+  { value: ReasoningEffort.Ultra, label: 'Ultra' },
   { value: ReasoningEffort.UltraHigh, label: '超高' },
   { value: ReasoningEffort.High, label: '高' },
   { value: ReasoningEffort.Medium, label: '中' },
