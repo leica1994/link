@@ -2793,14 +2793,15 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
 3. 如果一句话跨多条字幕延续，译文要让相邻字幕读起来顺畅。
 4. 有可翻译语义的字幕句子必须翻译为目标语言，禁止仅复制源文。只有 URL、数字或型号、缩写、单独的专有名词可保留原文；包含这些内容的句子仍须翻译其余部分。
 5. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
+6. <output_format> 中的中文占位说明（如“此处填入初译”、“此处填入反思说明”、“此处填入最终译文”）只是字段含义示例，不是真实内容；每个 key 都必须填入对应当前字幕的真实译文与反思，禁止原样保留或复制任何占位说明。
 </instructions>
 
 <output_format>
 {{
   "1": {{
-    "initial_translation": "初译",
-    "reflection": "指出不自然之处和改写理由",
-    "native_translation": "最终自然译文"
+    "initial_translation": "此处填入初译",
+    "reflection": "此处填入反思说明",
+    "native_translation": "此处填入最终译文"
   }}
 }}
 </output_format>"#
@@ -2817,6 +2818,7 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
 4. 有可翻译语义的字幕句子必须翻译为目标语言，禁止仅复制源文。只有 URL、数字或型号、缩写、单独的专有名词可保留原文；包含这些内容的句子仍须翻译其余部分。
 5. 如果最后一句不完整，不要擅自补省略号，后续字幕会继续。
 6. 输出必须是纯 JSON 对象，不要 Markdown、解释或额外文本。
+7. <output_format> 中的中文占位说明（如“此处填入译文字幕 1”）只是格式示例，不是真实内容，必须替换为对应当前字幕的真实译文，禁止原样保留或复制。
 </guidelines>
 
 <terminology_and_requirements>
@@ -2825,8 +2827,8 @@ fn build_translation_system_prompt(settings: &AppSettings) -> String {
 
 <output_format>
 {{
-  "1": "译文字幕 1",
-  "2": "译文字幕 2"
+  "1": "此处填入译文字幕 1",
+  "2": "此处填入译文字幕 2"
 }}
 </output_format>"#
     )
@@ -2882,7 +2884,7 @@ fn build_translation_user_prompt(
         "请翻译以下字幕 JSON。最终必须输出 JSON 对象，key 必须与输入完全一致。\n\
          <input_subtitle>{input_json}</input_subtitle>\n\
          <output_template>{output_template}</output_template>\n\
-         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改 value 内容。</template_rule>\n\
+         <template_rule>最终答案必须复制 output_template 的完整 JSON object 外层结构和全部 key，只改 value 内容。output_template 中的中文占位说明（如“此处填入初译”、“此处填入最终译文”）只是格式示例，不是真实内容，必须全部替换为对应当前字幕的真实译文，绝不能原样保留或复制。</template_rule>\n\
          <final_answer_rule>最终答案第一字符必须是 {{，最后字符必须是 }}，且必须能被 JSON.parse 直接解析。</final_answer_rule>"
     );
 
@@ -2906,9 +2908,9 @@ fn build_translation_output_template(
                 (
                     key.clone(),
                     json!({
-                        "initial_translation": "初译",
-                        "reflection": "指出不自然之处和改写理由",
-                        "native_translation": "最终自然译文"
+                        "initial_translation": "此处填入初译",
+                        "reflection": "此处填入反思说明",
+                        "native_translation": "此处填入最终译文"
                     }),
                 )
             })
@@ -2918,7 +2920,7 @@ fn build_translation_output_template(
 
     let template = entries
         .keys()
-        .map(|key| (key.clone(), "译文".to_string()))
+        .map(|key| (key.clone(), "此处填入译文".to_string()))
         .collect::<BTreeMap<_, _>>();
 
     serde_json::to_string(&template).unwrap_or_else(|_| "{}".to_string())
@@ -3027,13 +3029,13 @@ fn translation_review_output_template(
 
 fn build_source_reflow_system_prompt(settings: &AppSettings) -> String {
     let mode_rule = if settings.ai_subtitle_review_mode == "conservative" {
-        "保守模式：只修复明确的坏断句、孤立词、句尾词跑到下一行、明显不完整短片段；不要改写源文。"
+        "保守模式：只修复明确的坏断句、孤立词、句尾词跑到下一行、明显不完整短片段；完整句子保持原状，不要新增拆分；不要改写源文。"
     } else {
-        "专家模式：以最终字幕阅读质量为目标，积极修复坏断句、孤立短片段、跨行句子和不自然边界；仍然不能改写源文。"
+        "专家模式：以最终字幕阅读质量为目标，修复真正的坏断句、孤立短片段、句尾词错位和不自然边界；完整自然句未超长时保持一整行，宁合并不拆散；仍然不能改写源文。"
     };
     let domain_rule = match settings.video_content_type.as_str() {
-        "trading" => "交易内容：保护价格、百分比、ticker、周期、交易方向、条件关系和术语，不要把一个交易判断拆散。",
-        _ => "通用内容：优先保持完整自然句，一句话尽量一行；过长时只在逗号、分号、转折或自然语义停顿处拆分。",
+        "trading" => "交易内容：保护价格、百分比、ticker、周期、交易方向、条件关系和术语，不要把一个交易判断拆散；完整交易判断保持一整行，未超长时不要拆分。",
+        _ => "通用内容：一句话保持一整行，只有超过单行长度上限（英文约 18 个单词 / 中文约 25 个字）时才允许在自然停顿处拆分。",
     };
 
     format!(
@@ -3044,12 +3046,13 @@ fn build_source_reflow_system_prompt(settings: &AppSettings) -> String {
 
 <rules>
 1. 输出的所有 source 片段按顺序拼接后，必须与 inputSourceText 完全一致；只能改变断句位置。
-2. 一句话最好保持在一条字幕中，不要把主语、宾语、地点、句尾词或短语尾巴单独拆成一行。
-3. 如果句子太长，可以在逗号、分号、连接词、转折、停顿或语义边界拆成多条。
-4. 不要输出单词级碎片或不完整英文短语，除非它本身是完整回答、标题或独立短句。
-5. 不输出时间戳；时间轴会由程序根据词序重建。
-6. 英文短行不要以助动词、介词、连词或疑问词短语结束；遇到这类短行应优先和相邻行合并。
-7. 输出只能是 JSON object，格式为 {{ "segments": ["源文片段1", "源文片段2"] }}。
+2. 一句话必须保持在一条字幕中，不要把主语、宾语、地点、句尾词或短语尾巴单独拆成一行。
+3. 只有当一句话超过单行长度上限（英文约 18 个单词 / 中文约 25 个字）时，才可以在逗号、分号、连接词、转折、停顿或语义边界拆成多条。
+4. 如果某条输入本来就是一句完整的短句且长度未超上限，必须原样保留，不要拆分，也不要与其他行合并。
+5. 不要输出单词级碎片或不完整英文短语，除非它本身是完整回答、标题或独立短句。
+6. 不输出时间戳；时间轴会由程序根据词序重建。
+7. 英文短行不要以助动词、介词、连词或疑问词短语结束；遇到这类短行应优先和相邻行合并。
+8. 输出只能是 JSON object，格式为 {{ "segments": ["源文片段1", "源文片段2"] }}。
 </rules>"#
     )
 }
@@ -3082,7 +3085,8 @@ fn build_source_reflow_user_prompt(
          <inputSourceText>{source_text}</inputSourceText>\n\
          <currentItems>{entries_json}</currentItems>\n\
          <outputTemplate>{{\"segments\":[\"源文片段1\",\"源文片段2\"]}}</outputTemplate>\n\
-         <validationRule>segments 按顺序拼接后必须与 inputSourceText 完全一致，不能改字、加标点、删词或翻译。</validationRule>"
+         <validationRule>segments 按顺序拼接后必须与 inputSourceText 完全一致，不能改字、加标点、删词或翻译。</validationRule>\n\
+         <additionalRule>完整的一句话保持一整行；只有超过单行长度上限（英文约 18 个单词 / 中文约 25 个字）时才允许在自然停顿处拆分，不要把一个完整的短句拆散。</additionalRule>"
     );
 
     if !feedback.is_empty() {
